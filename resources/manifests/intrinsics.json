@@ -1,0 +1,357 @@
+{
+  "name": "gwead_intrinsics",
+  "version": "1.0",
+  "$comment": "The `bind:native_impl:` grants are the manifest half of the two-key binding rule; the operator half is `INTRINSIC_NATIVE_BINDINGS` in kernel/mod.rs (see its doc comment).",
+  "permissions": [
+    "bind:native_impl:gwead.intrinsics.throw_error",
+    "bind:native_impl:gwead.intrinsics.let"
+  ],
+  "description": "The 11 kernel-shipped step type definitions. See the crate-level docs (src/lib.rs) for the native/intrinsic/control-flow split.",
+  "stepTypeDefs": [
+    {
+      "name": "ifs",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "ifs"
+        ],
+        "properties": {
+          "ifs": {
+            "type": "array",
+            "description": "Ordered branches, like a match: the first whose `test` is truthy runs. A branch with no `test` always matches, so an else is a final untested branch; it must be last.",
+            "items": {
+              "type": "object",
+              "required": [
+                "then"
+              ],
+              "properties": {
+                "test": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Bare DSL condition (no surrounding braces). Omit or null for the always-matching final branch."
+                },
+                "then": {
+                  "type": "array",
+                  "items": {
+                    "type": "object"
+                  },
+                  "description": "Steps run when this branch wins."
+                }
+              }
+            }
+          }
+        }
+      },
+      "outputSchema": {
+        "description": "Control-flow step. Surfaces no value of its own; downstream reads the executed branch's inner step results by their ids."
+      }
+    },
+    {
+      "name": "for_each",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "path",
+          "steps"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "DSL reference selecting the array to iterate. Each element is bound to `$item` inside the body."
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Body steps run once per element; may reference `$item`. Inner results are cleared at the top of each iteration."
+          },
+          "collect": {
+            "type": "string",
+            "description": "DSL expression evaluated after each iteration; the assembled array becomes this step's result. Optional — without it the step's result is an empty array."
+          }
+        }
+      },
+      "outputSchema": {
+        "description": "With `collect`, the array of per-iteration collected values; otherwise an empty array (the last iteration's inner step results survive under their own ids)."
+      }
+    },
+    {
+      "name": "repeat",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "count",
+          "steps"
+        ],
+        "properties": {
+          "count": {
+            "type": [
+              "integer",
+              "string"
+            ],
+            "description": "Iteration count (number or template). Acts as the safety cap when `until` is present. `$item` is the 0-based iteration index."
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Body steps run each iteration."
+          },
+          "until": {
+            "type": "string",
+            "description": "DSL do-until condition evaluated after each body run; truthy exits early. Optional."
+          },
+          "collect": {
+            "type": "string",
+            "description": "DSL expression collected per iteration into this step's result array. Optional."
+          }
+        }
+      },
+      "outputSchema": {
+        "description": "With `collect`, the array of per-iteration collected values; otherwise an empty array."
+      }
+    },
+    {
+      "name": "invoke",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "oneOf": [
+          {
+            "required": [
+              "plugin"
+            ]
+          },
+          {
+            "required": [
+              "role"
+            ]
+          }
+        ],
+        "properties": {
+          "plugin": {
+            "type": "string",
+            "description": "Target plugin name (template-resolved). Mutually exclusive with `role`."
+          },
+          "role": {
+            "type": "string",
+            "description": "Target SPI role, e.g. SOME_ROLE (template-resolved); the orchestrator picks the plugin. Mutually exclusive with `plugin`."
+          },
+          "action": {
+            "type": "string",
+            "description": "Action name on the target (template-resolved)."
+          },
+          "input": {
+            "type": "object",
+            "description": "Input resolved against the parent context; stream handles and step results flow through. The callee's config comes from the dispatch orchestrator; its secrets are pulled for its own identity through the kernel's SecretResolver."
+          },
+          "hints": {
+            "type": "object",
+            "description": "Optional hints nudging the dispatch orchestrator, e.g. {\"flavor\": \"fast\"}. Opaque to the kernel."
+          }
+        }
+      },
+      "outputSchema": {
+        "description": "The invoked action's output. Recursion is capped at depth 16."
+      }
+    },
+    {
+      "name": "parallel",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "branches"
+        ],
+        "properties": {
+          "branches": {
+            "type": "array",
+            "description": "List of branches; each branch is a step list run concurrently on its own forked state. Step ids must be unique across branches.",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "array",
+        "description": "Array of each branch's last step result, in declaration order regardless of finish order."
+      }
+    },
+    {
+      "name": "return",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "value"
+        ],
+        "properties": {
+          "value": {
+            "description": "Value resolved (type-preserving) and used as the action's output, unwinding the action in place of resultsPath / resultMapping."
+          }
+        }
+      },
+      "outputSchema": {
+        "description": "Unwinds the action; the resolved `value` becomes the action output."
+      }
+    },
+    {
+      "name": "try",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "try"
+        ],
+        "properties": {
+          "try": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Steps to attempt."
+          },
+          "catch": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Recovery steps; may reference `{{$.error}}`. Absent → failure propagates; `[]` (empty) → failure swallowed, result null; non-empty → runs on failure."
+          },
+          "finally": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Steps that always run; a finally failure supersedes everything. Optional."
+          }
+        }
+      },
+      "outputSchema": {
+        "description": "On success, the last `try` step's result; on caught failure, the last `catch` step's result; with empty `catch`, null."
+      }
+    },
+    {
+      "name": "wasm",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "module"
+        ],
+        "properties": {
+          "module": {
+            "type": "string",
+            "description": "Name of an entry in this manifest's `wasmModules`."
+          },
+          "entry": {
+            "type": "string",
+            "default": "run",
+            "description": "Entry function name. Typed `() -> ()` — no args, no return, no host imports; modules must be self-contained."
+          }
+        }
+      },
+      "outputSchema": {
+        "description": "No value (the entry fn is typed `() -> ()`)."
+      }
+    },
+    {
+      "name": "let",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "value"
+        ],
+        "properties": {
+          "value": {
+            "description": "Value to originate; resolved recursively and type-preserving, then returned as the step result. `storeToVariable` names it if wanted."
+          }
+        }
+      },
+      "outputSchema": {
+        "description": "The resolved `value`."
+      }
+    },
+    {
+      "name": "script",
+      "selector": "language",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "language",
+          "source"
+        ],
+        "properties": {
+          "language": {
+            "type": "string",
+            "description": "Selector routing to the script runtime registered for this language (e.g. `lua`). Required: the kernel ships no runtime and has no default language."
+          },
+          "source": {
+            "type": "string",
+            "description": "Script source. Reads the action context via the runtime's host API (e.g. Lua `args`)."
+          }
+        }
+      },
+      "outputSchema": {
+        "description": "The script's return value."
+      }
+    },
+    {
+      "name": "throw_error",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "default": "PLUGIN_ERROR",
+            "description": "Structured error code callers branch on."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable message (template-resolved). Optional."
+          },
+          "params": {
+            "type": "object",
+            "description": "Structured params attached to the error (template-resolved). Optional."
+          }
+        }
+      },
+      "outputSchema": {
+        "description": "Never produces a value — always raises a structured PluginError."
+      }
+    }
+  ],
+  "stepTypeImpls": [
+    {
+      "stepType": "throw_error",
+      "kind": "native",
+      "implRef": "gwead.intrinsics.throw_error"
+    },
+    {
+      "stepType": "let",
+      "kind": "native",
+      "implRef": "gwead.intrinsics.let"
+    },
+    {
+      "stepType": "invoke",
+      "kind": "intrinsic",
+      "implRef": "gwead.intrinsics.invoke"
+    },
+    {
+      "stepType": "wasm",
+      "kind": "intrinsic",
+      "implRef": "gwead.intrinsics.wasm"
+    },
+    {
+      "stepType": "script",
+      "kind": "intrinsic",
+      "implRef": "gwead.intrinsics.script"
+    }
+  ]
+}

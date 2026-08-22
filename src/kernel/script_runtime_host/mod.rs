@@ -1,0 +1,668 @@
+//! Script-runtime host subsystem.
+//!
+//! The kernel exposes the **script runtime host ABI** — a stable set of
+//! wasmtime host imports (`host_set_result`, `host_log`, `host_invoke`,
+//! `stream_read/write`, …) that any
+//! script-runtime wasm module can target. The wasm module is the
+//! *language interpreter* (a Lua interpreter, a JavaScript engine, …).
+//! The host imports are intentionally language-agnostic so
+//! the kernel never needs to know which language is hosted.
+//!
+//! Module layout:
+//!
+//! - `step_script` — the `script` step type dispatch entry
+//! - `run_script_runtime` — instantiates a script-runtime wasm module
+//!   and runs a script through its `execute` entry point
+//! - `store_data` — `ScriptRuntimeStoreData` + [`wasmtime::ResourceLimiter`]
+//!   impl + per-call helpers (`bail_host_call`, `truncate_for_log`)
+//! - `parent_context` — `ScriptRuntimeParentContext` snapshot the
+//!   sub-instance reads via the `io.*` imports
+//! - `traps` — `SCRIPT_ERR_FUEL` /
+//!   `SCRIPT_ERR_MEMORY` sentinel prefixes +
+//!   `classify_runtime_trap` wasmtime
+//!   trap classifier
+//! - `imports` — host import registration, organised by area (result,
+//!   streams, invoke, call_result).
+//!
+//! What it does NOT know:
+//! - Lua appears in examples because a Lua interpreter is the reference
+//!   guest for this ABI. No script runtime ships in this crate —
+//!   interpreter modules are registered by embedder plugins — and
+//!   swapping the interpreter changes no code here: the imports stay
+//!   the same; only the wasm bytes targeting them change.
+
+mod imports;
+mod parent_context;
+mod store_data;
+mod traps;
+
+use std::future::Future;
+use std::pin::Pin;
+
+use serde_json::Value;
+use wasmtime::{Engine, Module};
+
+use crate::kernel::host_api::{
+    ExecutionState, PluginExecution, ResourceViolation, StepError, StepOutput,
+};
+use crate::kernel::native_impls::IntrinsicStepImplEntry;
+
+pub(crate) use parent_context::ScriptRuntimeParentContext;
+use store_data::ScriptRuntimeStoreData;
+use traps::{SCRIPT_ERR_FUEL, SCRIPT_ERR_MEMORY, classify_runtime_trap};
+
+/// How much fuel a wasm guest burns between forced yields back to the
+/// tokio scheduler (`Store::fuel_async_yield_interval`). Applied to
+/// both the script-runtime sub-store and the `wasm` step type's store.
+/// Without an interval, a CPU-bound guest with no host-import await
+/// points holds its worker thread for the entire fuel budget — seconds
+/// at the default 1e9 units — during which the cancellation token and
+/// wallclock timer on that worker can't even be polled. 100k units is
+/// coarse enough to be free (≤0.01% overhead) and fine enough to keep
+/// cancellation latency in the tens of microseconds.
+pub(crate) const FUEL_ASYNC_YIELD_INTERVAL: u64 = 100_000;
+
+// Submit the `script` intrinsic's impl into the global inventory slice.
+// `script` needs engine internals (`script_runtimes` + `engine`), so it's
+// a kernel-internal [`IntrinsicStepImplEntry`]: the intrinsics
+// manifest references it via `implRef: "gwead.intrinsics.script"` with
+// `kind: "intrinsic"`, the kernel resolves it at boot through
+// `IntrinsicStepImplTable::discover()`, and the body receives a concrete
+// `&mut ExecutionState`.
+inventory::submit! {
+    IntrinsicStepImplEntry {
+        name: "gwead.intrinsics.script",
+        impl_: step_script,
+    }
+}
+
+/// Execute a `script` step — runs the source via a script-runtime
+/// wasm module looked up by the step's `language` selector.
+///
+/// **Dispatch coexistence note.** The `script` step type def carries
+/// `selector: "language"`, but its intrinsic impl registered through
+/// `intrinsics.json` is selector-less (`matches: None`, which the
+/// `kind: "intrinsic"` registration path requires). So the
+/// registry holds **two distinct entries** for `script`:
+///
+/// 1. `(script, None)` → this fn (`step_script`). The intrinsic step
+///    body the wasmtime linker invokes for *every* `script` step
+///    regardless of language.
+/// 2. `(script, Some("lua"))`, `(script, Some("js"))`, … → wasm
+///    modules registered by language-runtime plugins. These provide the
+///    *interpreter* this fn loads at runtime from the `script_runtimes`
+///    map on `ExecutionState`.
+///
+/// The two paths serve different purposes. The trait-step-type entry
+/// is "what runs when you call a `script` step." The language-keyed
+/// entries are "what wasm interpreter is available for language X."
+/// Any reshaping of dispatch that makes the primary path honor
+/// `selector` must keep this coexistence explicit, or the two would
+/// silently mismatch.
+pub(crate) fn step_script<'a>(
+    ex: &'a mut ExecutionState,
+    params: &'a Value,
+) -> Pin<Box<dyn Future<Output = Result<StepOutput, StepError>> + Send + 'a>> {
+    Box::pin(async move {
+        let source = match params.get("source").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                return Err(StepError::Failed(
+                    "Script step missing 'source' field".into(),
+                ));
+            }
+        };
+
+        // Selector value for the `script` step type's `language`
+        // selector. Registration requires it, so its absence here is a
+        // kernel bug, not a manifest one — but the kernel is
+        // language-agnostic and has no default to fall back to.
+        let Some(language) = params.get("language").and_then(|v| v.as_str()) else {
+            return Err(StepError::Failed(
+                "Script step missing 'language' field; registration should have refused the manifest"
+                    .into(),
+            ));
+        };
+        let language = language.to_string();
+
+        // Look up the pre-resolved runtime. The map was built from the
+        // registry at ExecutionState construction time — `step_script`
+        // never touches the registry itself, so this works even when the
+        // kernel was constructed without `into_arc` (no kernel weak ref
+        // available). Tests construct ExecutionState directly with an
+        // empty map; those paths skip script dispatch entirely.
+        // Kernel-internal fields (`script_runtimes`, `engine`, `kernel`,
+        // `resource_violation`) aren't on the public PluginExecution
+        // surface — `step_script` is an `IntrinsicStepFn`, so it
+        // holds the concrete `&mut ExecutionState` and reaches them
+        // directly.
+        let runtime_module = ex.script_runtimes.get(&language).cloned().ok_or_else(|| {
+            StepError::Failed(format!(
+                "no script runtime registered for language '{language}'"
+            ))
+        })?;
+
+        // `passSecrets` — the step's declared secret allowlist.
+        //
+        // The args buffer handed to the interpreter is the plugin's
+        // full resolution context, and `resolution_context()` puts
+        // every secret in it. The interpreter is a wasm module some
+        // *other* plugin supplied, so shipping the whole `secrets`
+        // namespace by default hands one plugin's credentials to
+        // another plugin's code on every script step. The default is
+        // an empty allowlist: a script sees `secrets` as `{}` unless
+        // the step names the keys it needs.
+        //
+        // Absent (the common case) and `[]` mean the same thing — no
+        // secrets — so the default is the safe one and the reach is
+        // visible in the manifest an operator reviews.
+        let pass_secrets: Vec<String> = params
+            .get("passSecrets")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let engine = ex.engine.clone();
+        let mut ctx = ex.resolution_context();
+        filter_secrets(&mut ctx, &pass_secrets);
+        let args_json = serde_json::to_vec(&ctx).unwrap_or_else(|_| b"{}".to_vec());
+        let owner_plugin = ex.plugin_name().to_string();
+        let streams_arc = ex.streams().clone();
+        let limits = ex.limits();
+        let step_id = ex.current_step_id().to_string();
+        // If this script step is marked `long_running` in a
+        // dataflow action, the scheduler pre-provisioned a writable
+        // output for it. Pre-resolve the StreamId once here so the
+        // wasm-side `io.stream.output()` is a constant-time lookup. For
+        // every other script invocation this stays `None`.
+        let dataflow_output = ex.dataflow_outputs().get(&step_id).copied();
+        let cancel = ex.cancel_token();
+        // Snapshot parent context for the sub-instance's `host_invoke`
+        // import (the `io.invoke` a guest runtime wraps it in). Kernel weak ref lets the import dispatch back into
+        // the same kernel; the parent's config is the default the
+        // orchestrator falls back to when no per-callee override
+        // applies, and the parent's secret resolver is what the callee
+        // pulls its own credentials through — matching `step_invoke`.
+        let parent_ctx = ScriptRuntimeParentContext {
+            kernel: ex.kernel.clone(),
+            plugin: ex.plugin_name().to_string(),
+            config: ex.config().clone(),
+            secret_resolver: ex.secret_resolver().cloned(),
+            exec_ctx: ex.exec_ctx().clone(),
+            invoke_depth: ex.invoke_depth(),
+        };
+
+        tracing::debug!(
+            plugin = %owner_plugin,
+            step_id = %step_id,
+            source_len = source.len(),
+            dataflow_output = ?dataflow_output,
+            "script step starting"
+        );
+        let result = run_script_runtime(
+            &engine,
+            &runtime_module,
+            &source,
+            &args_json,
+            &streams_arc,
+            &limits,
+            dataflow_output,
+            cancel,
+            parent_ctx,
+        )
+        .await;
+
+        match result {
+            Ok(result_json) => {
+                let val: Value = serde_json::from_str(&result_json).unwrap_or(Value::Null);
+                Ok(StepOutput::from(val))
+            }
+            Err(e) => {
+                // Map resource-cap sentinels onto the structured
+                // ExecutionState marker so the runtime can surface
+                // `KernelError::FuelExhausted` / `MemoryLimitExceeded`
+                // rather than a generic `PluginExecution(string)`.
+                if let Some(rest) = e.strip_prefix(SCRIPT_ERR_FUEL) {
+                    ex.resource_violation = Some(ResourceViolation::FuelExhausted {
+                        budget: limits.fuel_budget,
+                    });
+                    return Err(StepError::Failed(format!("FuelExhausted: {}", rest.trim())));
+                }
+                if let Some(rest) = e.strip_prefix(SCRIPT_ERR_MEMORY) {
+                    ex.resource_violation = Some(ResourceViolation::MemoryLimit {
+                        bytes: limits.max_memory_bytes,
+                    });
+                    return Err(StepError::Failed(format!(
+                        "MemoryLimitExceeded: {}",
+                        rest.trim()
+                    )));
+                }
+                tracing::warn!(
+                    plugin = %owner_plugin,
+                    step_id = %step_id,
+                    error = %e,
+                    "Script step failed"
+                );
+                Err(StepError::Failed(e))
+            }
+        }
+    })
+}
+
+/// Instantiate a script-runtime wasm module and execute a script.
+///
+/// `streams` is the parent invocation's shared stream registry. Each
+/// `stream_read`/`stream_write`/`stream_close` host import locks
+/// per-call rather than holding the registry lock for the whole script
+/// execution — that's the property that lets the parent step's caller
+/// run another stream op concurrently (e.g. through a host callback
+/// triggered from inside the script) without self-deadlocking.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_script_runtime(
+    engine: &Engine,
+    runtime_module: &Module,
+    source: &str,
+    args_json: &[u8],
+    streams: &crate::kernel::streams::SharedStreamRegistry,
+    limits: &crate::kernel::RuntimeLimits,
+    dataflow_output: Option<crate::kernel::streams::StreamId>,
+    cancel: tokio_util::sync::CancellationToken,
+    parent: ScriptRuntimeParentContext,
+) -> Result<String, String> {
+    let mut linker = wasmtime::Linker::<ScriptRuntimeStoreData>::new(engine);
+
+    // Async-required WASI linker. Pairs with `call_async`
+    // below so the sub-store can host `.await`-ing imports
+    // (`stream_read` / `stream_write`).
+    wasmtime_wasi::p1::add_to_linker_async(&mut linker, |data| &mut data.wasi)
+        .map_err(|e| format!("WASI linker setup failed: {e}"))?;
+
+    imports::register_all(&mut linker)?;
+
+    // Create WASI context (sandboxed: no filesystem, no env, no args)
+    let wasi_p1 = wasmtime_wasi::WasiCtxBuilder::new().build_p1();
+    let store_data = ScriptRuntimeStoreData {
+        wasi: wasi_p1,
+        result: None,
+        error: None,
+        streams: streams.clone(),
+        budget: crate::kernel::resource_budget::ResourceBudget::new(limits),
+        dataflow_output,
+        cancel,
+        kernel: parent.kernel,
+        parent_plugin: parent.plugin,
+        parent_config: parent.config,
+        parent_secret_resolver: parent.secret_resolver,
+        parent_exec_ctx: parent.exec_ctx,
+        parent_invoke_depth: parent.invoke_depth,
+        call_result: None,
+        call_error: None,
+    };
+    let mut store = wasmtime::Store::new(engine, store_data);
+
+    // Apply per-invocation resource caps. The engine itself was
+    // constructed with `consume_fuel(true)`, so this just sets the
+    // budget for THIS invocation. `limiter` installs the
+    // `ResourceLimiter` impl on `ScriptRuntimeStoreData` so `memory.grow`
+    // calls are gated by `max_memory`.
+    store
+        .set_fuel(limits.fuel_budget)
+        .map_err(|e| format!("Failed to set fuel budget: {e}"))?;
+    // Yield back to tokio every ~100k fuel units. Without this, a
+    // CPU-bound guest with no host-import await points pins its tokio
+    // worker for the entire fuel budget (seconds at 1e9 units) — and
+    // the wallclock/cancellation timers that are supposed to catch it
+    // can't get polled on that worker in the meantime.
+    store
+        .fuel_async_yield_interval(Some(FUEL_ASYNC_YIELD_INTERVAL))
+        .map_err(|e| format!("Failed to set fuel yield interval: {e}"))?;
+    store.limiter(|data| data as &mut dyn wasmtime::ResourceLimiter);
+
+    // Instantiate. Memory limiter denials can fire here when the
+    // module's declared minimum memory exceeds the configured cap —
+    // surface that with the sentinel prefix too so the runtime can
+    // map it onto `KernelError::MemoryLimitExceeded`.
+    let instance = linker
+        .instantiate_async(&mut store, runtime_module)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            let chain: String = e
+                .chain()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            if msg.contains("memory minimum size")
+                || chain.contains("memory minimum size")
+                || msg.contains("memory limit")
+                || chain.contains("memory limit")
+            {
+                format!(
+                    "{SCRIPT_ERR_MEMORY} wasm linear memory exceeded {} bytes (at instantiate)",
+                    limits.max_memory_bytes,
+                )
+            } else {
+                format!("script runtime instantiation failed: {e}")
+            }
+        })?;
+
+    // Get the alloc and execute exports
+    let alloc_fn = instance
+        .get_typed_func::<i32, i32>(&mut store, "alloc")
+        .map_err(|e| format!("No 'alloc' export: {e}"))?;
+
+    let execute_fn = instance
+        .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "execute")
+        .map_err(|e| format!("No 'execute' export: {e}"))?;
+
+    let memory = instance
+        .get_memory(&mut store, "memory")
+        .ok_or("No 'memory' export")?;
+
+    // Allocate and write source, then args.
+    //
+    // The guest chooses the offset here — this is the host→guest
+    // direction, where the host trusts a value the *guest* returned.
+    // Every guest→host import bounds-checks its pointers
+    // (`imports::result::read_guest_slice` and friends); this
+    // direction needs the same check: a guest whose `alloc` returns
+    // -1, a huge offset, or an offset that overflows past the end of
+    // linear memory would otherwise panic the host process on the
+    // slice index below. There is no `catch_unwind` anywhere in the
+    // crate, so that panic would be a host kill, not a failed step.
+    // `write_guest_slice` makes it an ordinary step error.
+    let source_bytes = source.as_bytes();
+    let source_ptr = alloc_fn
+        .call_async(&mut store, source_bytes.len() as i32)
+        .await
+        .map_err(|e| format!("alloc source: {e}"))?;
+    write_guest_slice(&memory, &mut store, source_ptr, source_bytes, "source")?;
+
+    let args_ptr = alloc_fn
+        .call_async(&mut store, args_json.len() as i32)
+        .await
+        .map_err(|e| format!("alloc args: {e}"))?;
+    write_guest_slice(&memory, &mut store, args_ptr, args_json, "args")?;
+
+    // Call execute. Resource-cap traps get sentinel-prefixed
+    // error strings so `step_script` can map them into the structured
+    // `KernelError` variants via `ExecutionState::resource_violation`.
+    let success = execute_fn
+        .call_async(
+            &mut store,
+            (
+                source_ptr,
+                source_bytes.len() as i32,
+                args_ptr,
+                args_json.len() as i32,
+            ),
+        )
+        .await
+        .map_err(|e| classify_runtime_trap(&e, limits))?;
+
+    if success == 1 {
+        let result = store.data().result.clone().unwrap_or_else(|| "null".into());
+        Ok(result)
+    } else {
+        let err = store
+            .data()
+            .error
+            .clone()
+            .unwrap_or_else(|| "script runtime reported an error with no message".into());
+        Err(err)
+    }
+}
+
+/// Narrow a resolution context's `secrets` object down to `allowed`.
+///
+/// Keys not named are removed; an empty allowlist leaves an empty
+/// object rather than removing the namespace, so a script's
+/// `args.secrets.foo` reads as absent instead of erroring on a missing
+/// parent. Names in `allowed` that the plugin has no secret for are
+/// simply not present — the allowlist grants reach, it does not
+/// conjure values.
+fn filter_secrets(ctx: &mut Value, allowed: &[String]) {
+    let Some(obj) = ctx.as_object_mut() else {
+        return;
+    };
+    let Some(secrets) = obj.get_mut("secrets") else {
+        return;
+    };
+    let kept = match secrets.as_object() {
+        Some(map) => allowed
+            .iter()
+            .filter_map(|k| map.get(k).map(|v| (k.clone(), v.clone())))
+            .collect(),
+        None => serde_json::Map::new(),
+    };
+    *secrets = Value::Object(kept);
+}
+
+/// Copy `payload` into the guest's linear memory at the offset the
+/// guest's own `alloc` returned, after checking that the whole
+/// destination range is actually inside that memory.
+///
+/// A guest is free to return anything from `alloc`, including a
+/// negative value or an offset near `i32::MAX`. Indexing
+/// `memory.data_mut()` with an unchecked range is a host panic, and
+/// nothing in this crate catches unwinds — so this returns a `String`
+/// error, which surfaces as a failed step, instead.
+fn write_guest_slice(
+    memory: &wasmtime::Memory,
+    store: &mut wasmtime::Store<ScriptRuntimeStoreData>,
+    ptr: i32,
+    payload: &[u8],
+    what: &str,
+) -> Result<(), String> {
+    let data = memory.data_mut(&mut *store);
+    let start = usize::try_from(ptr)
+        .map_err(|_| format!("guest alloc returned a negative {what} pointer ({ptr})"))?;
+    let end = start
+        .checked_add(payload.len())
+        .ok_or_else(|| format!("guest {what} pointer {ptr} + length overflows"))?;
+    if end > data.len() {
+        return Err(format!(
+            "guest alloc returned an out-of-bounds {what} pointer: \
+             {start}..{end} exceeds linear memory of {} bytes",
+            data.len()
+        ));
+    }
+    data[start..end].copy_from_slice(payload);
+    Ok(())
+}
+
+#[cfg(test)]
+mod abi_alignment_tests {
+    //! ABI-alignment guard for the script runtime host imports.
+    //!
+    //! The mock at `tests/common/script_runtime_mock.rs` and every real
+    //! script-runtime wasm module import the host symbols that
+    //! [`imports::register_all`] registers. If a function name or
+    //! signature drifts on either side, the wasm load fails at
+    //! instantiation with a misleading "linker import not found"
+    //! error.
+    //!
+    //! These tests pin the import names that any script runtime is
+    //! entitled to call. They live next to `imports::register_all` so
+    //! a rename refactor touches the test in the same diff.
+    //!
+    //! Adding a new import: add the name to `EXPECTED_HOST_IMPORTS`
+    //! and to `imports/mod.rs::register_all`. CI catches the drift if
+    //! one of the two is forgotten.
+    //!
+    //! Removing an import is an ABI break: every runtime wasm built
+    //! against it must be rebuilt, and this test failing is the signal.
+    use super::*;
+    use wasmtime::{Engine, Linker};
+
+    /// Every host symbol the kernel's script runtime ABI exposes.
+    /// Sorted alphabetically so a stale entry shows up as a clear diff
+    /// rather than as a hard-to-spot insertion in the middle of the
+    /// list.
+    const EXPECTED_HOST_IMPORTS: &[&str] = &[
+        "host_call_result_read",
+        "host_call_result_size",
+        "host_invoke",
+        "host_invoke_streaming",
+        "host_log",
+        "host_set_error",
+        "host_set_result",
+        "is_cancelled",
+        "stream_close",
+        "stream_output",
+        "stream_read",
+        "stream_write",
+    ];
+
+    /// Build a linker, call `register_all`, and hold the result against
+    /// [`EXPECTED_HOST_IMPORTS`] two ways: (1) enumerate the linker's
+    /// ACTUAL registered set via `Linker::iter` and require exact
+    /// equality — an import added to `register_all` without updating
+    /// the list (or vice versa) fails here; (2) instantiate a module
+    /// that imports every name with its ABI-documented signature —
+    /// a signature change in any `imports/*.rs` registration fails
+    /// instantiation. Both checks consult the real linker; neither can
+    /// pass by comparing the test's own constants to themselves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_all_binds_expected_host_imports() {
+        // wasmtime supports async unconditionally (`Config::async_support`
+        // is a deprecated no-op), so the engine accepts async imports
+        // without an explicit Config flag.
+        let engine = Engine::default();
+        let mut linker = Linker::<store_data::ScriptRuntimeStoreData>::new(&engine);
+        // Run the same registration path `run_script_runtime` runs.
+        imports::register_all(&mut linker).expect("register_all binds imports cleanly");
+
+        let store_data = store_data::ScriptRuntimeStoreData {
+            wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
+            result: None,
+            error: None,
+            streams: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::kernel::streams::StreamRegistry::new(),
+            )),
+            budget: crate::kernel::resource_budget::ResourceBudget::new(
+                &crate::kernel::RuntimeLimits::default(),
+            ),
+            dataflow_output: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            kernel: None,
+            parent_plugin: "abi_test".to_string(),
+            parent_config: serde_json::Value::Null,
+            parent_secret_resolver: None,
+            parent_exec_ctx: crate::kernel::exec_context::ExecutionContext::default(),
+            parent_invoke_depth: 0,
+            call_result: None,
+            call_error: None,
+        };
+        let mut store = wasmtime::Store::new(&engine, store_data);
+
+        // Check 1: the linker's actual registered name set.
+        let mut registered: Vec<String> = linker
+            .iter(&mut store)
+            .filter(|(module, _, _)| *module == crate::kernel::abi::ABI_MODULE)
+            .map(|(_, name, _)| name.to_string())
+            .collect();
+        registered.sort();
+        registered.dedup();
+        assert_eq!(
+            registered,
+            EXPECTED_HOST_IMPORTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "if this diff is non-empty, `register_all` and the expected \
+             ABI list disagree — update both the list AND every runtime \
+             wasm that targets this ABI"
+        );
+
+        // Build a minimal wat that imports every name + an exported
+        // `_start` so wasmtime treats it as valid. Each import's
+        // signature here matches the registration in
+        // `imports/{result,streams,invoke,call_result}.rs` —
+        // mismatched signatures fail at linker.instantiate.
+        //
+        // The module name comes from `ABI_MODULE` rather than being
+        // spelled out, so an ABI-version bump that misses a
+        // registration site fails check 1 above instead of leaving this
+        // WAT pinned to a name nothing registers under any more.
+        let m = crate::kernel::abi::ABI_MODULE;
+        let wat = format!(
+            r#"
+            (module
+              (import "{m}" "host_set_result" (func (param i32 i32)))
+              (import "{m}" "host_set_error"  (func (param i32 i32)))
+              (import "{m}" "host_log"        (func (param i32 i32 i32)))
+              (import "{m}" "stream_read"     (func (param i32 i32 i32) (result i32)))
+              (import "{m}" "stream_write"    (func (param i32 i32 i32) (result i32)))
+              (import "{m}" "stream_close"    (func (param i32) (result i32)))
+              (import "{m}" "stream_output"   (func (result i32)))
+              (import "{m}" "is_cancelled"    (func (result i32)))
+              (import "{m}" "host_invoke"
+                (func (param i32 i32 i32 i32 i32 i32) (result i32)))
+              (import "{m}" "host_invoke_streaming"
+                (func (param i32 i32 i32 i32 i32 i32) (result i32)))
+              (import "{m}" "host_call_result_size"
+                (func (result i32)))
+              (import "{m}" "host_call_result_read"
+                (func (param i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "_start")))
+        "#
+        );
+        let wasm = wat::parse_str(&wat).expect("wat parses");
+        let module = wasmtime::Module::new(&engine, &wasm).expect("module compiles");
+        // Check 2: instantiation resolves every import against the
+        // real registrations, so a signature drift in any
+        // `imports/*.rs` file fails here even though the names match.
+        linker.instantiate_async(&mut store, &module).await.expect(
+            "instantiation binds every ABI import with its documented \
+                 signature — a failure here means a host import's \
+                 registration signature drifted from the WAT above",
+        );
+    }
+
+    /// STREAMS_ABI.md is the contract third-party guest authors build
+    /// against, so it has to name the same module and the same imports
+    /// the linker actually registers. Without this the ABI-alignment
+    /// test above can be updated in isolation and the published
+    /// contract would drift from the code.
+    #[test]
+    fn streams_abi_doc_matches_registered_imports() {
+        let doc = include_str!("../STREAMS_ABI.md");
+
+        assert!(
+            doc.contains(crate::kernel::abi::ABI_MODULE),
+            "STREAMS_ABI.md never names the import module `{}` guests \
+             must link against",
+            crate::kernel::abi::ABI_MODULE
+        );
+
+        // The import inventory lives in one fenced `text` block under
+        // the host-functions heading; each line is `name(args) -> ret`.
+        let block = doc
+            .split("## Host functions")
+            .nth(1)
+            .and_then(|s| s.split("```text").nth(1))
+            .and_then(|s| s.split("```").next())
+            .expect("STREAMS_ABI.md has a ```text import block under `## Host functions`");
+
+        let mut documented: Vec<&str> = block
+            .lines()
+            .filter_map(|l| l.trim().split('(').next())
+            .filter(|n| !n.is_empty())
+            .collect();
+        documented.sort_unstable();
+        documented.dedup();
+
+        assert_eq!(
+            documented, EXPECTED_HOST_IMPORTS,
+            "STREAMS_ABI.md's import list and the registered ABI \
+             disagree — a host import was added or removed on one side \
+             only"
+        );
+    }
+}

@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://plethwaith.com/schemas/gwead/spi-definition.schema.json",
+  "title": "Gwead SPI definition",
+  "description": "An SPI role contract: the set of actions a plugin claiming the role must (or may) provide, with JSON Schemas for each action's input and output. Documents are classified as SPI definitions when they carry a top-level `actions` map in which no action has `steps`.",
+  "type": "object",
+  "required": ["name", "actions"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "$id": { "type": "string" },
+    "formatVersion": {
+      "const": 1,
+      "description": "SPI definition format version. Optional; absent means 1 (the only version so far). Declared so future format revisions can be detected up front instead of misparsed."
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$",
+      "description": "SPI role name (SCREAMING_SNAKE_CASE by convention). Registry key; plugins claim it via their `roles` list, and it appears verbatim in `invoke:role:<name>` grants — hence the identifier grammar: ASCII letters, digits, `_` and `-`, not starting with `-`, at most 128 bytes. `/` is reserved as the namespace separator."
+    },
+    "displayName": { "type": ["string", "null"] },
+    "version": {
+      "type": ["string", "null"],
+      "description": "Contract version. Additive minor revisions mark new actions `optional: true` so older plugins stay conformant."
+    },
+    "description": { "type": ["string", "null"] },
+    "actions": {
+      "type": "object",
+      "description": "Action name → contract. Actions here carry input/output schemas and never `steps`.",
+      "additionalProperties": { "$ref": "#/$defs/spiAction" }
+    },
+    "$defs": {
+      "type": "object",
+      "description": "Shared JSON Schema definitions referenced from action schemas via `#/$defs/<Name>`.",
+      "additionalProperties": { "$ref": "#/$defs/schema" }
+    },
+    "streamEventShape": {
+      "description": "For streaming roles: a JSON Schema describing the shape of each streamed event.",
+      "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/schema" }]
+    }
+  },
+  "$defs": {
+    "schema": {
+      "$comment": "A JSON Schema document (Draft 2020-12).",
+      "$ref": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "spiAction": {
+      "type": "object",
+      "required": ["input", "output"],
+      "additionalProperties": false,
+      "properties": {
+        "description": { "type": ["string", "null"] },
+        "input": {
+          "description": "JSON Schema for the action's input.",
+          "$ref": "#/$defs/schema"
+        },
+        "output": {
+          "description": "JSON Schema for the action's output.",
+          "$ref": "#/$defs/schema"
+        },
+        "optional": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, plugins claiming this role may omit the action."
+        }
+      }
+    }
+  }
+}

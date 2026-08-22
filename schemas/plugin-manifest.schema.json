@@ -1,0 +1,863 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://plethwaith.com/schemas/gwead/plugin-manifest.schema.json",
+  "title": "Gwead plugin manifest",
+  "description": "A plugin manifest: actions built from steps, plus optional step-type definitions, step-type implementations, wasm modules, and config schema.\n\nDocuments are classified as plugin manifests when any action has `steps`, or when they have no `actions` but carry `stepTypeDefs`, `stepTypeImpls`, or `wasmModules`.",
+  "type": "object",
+  "required": [
+    "name"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "$id": {
+      "type": "string"
+    },
+    "$comment": {
+      "type": "string",
+      "description": "Free-form note for readers of the document. Never interpreted."
+    },
+    "formatVersion": {
+      "const": 1,
+      "description": "Manifest format version. Optional; absent means 1 (the only version so far). Declared so future format revisions can be detected up front: a v1 kernel rejects a v2 manifest with a clear schema error instead of misparsing it."
+    },
+    "name": {
+      "$ref": "#/$defs/identifier",
+      "description": "The plugin's local name, unique within the namespace it is registered into. Combined with the embedder-supplied namespace to form the registry key."
+    },
+    "displayName": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "description": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "roles": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/identifier"
+      },
+      "description": "SPI roles this plugin fulfils, as bare names. Each resolves to the nearest contract up the plugin's ancestor chain — its own namespace's definition if one exists, else the global one — and every non-optional action of that contract must exist in `actions`. A fulfiller is visible to callers on its own chain and below it only: a tenant plugin fulfilling a global role serves that tenant's callers, never a global or sibling-tenant caller."
+    },
+    "actions": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/action"
+      }
+    },
+    "stepTypes": {
+      "type": "object",
+      "description": "Step-type alias → action name (in this manifest). An alias is a step type this plugin defines, so it is named `<plugin>.<alias>` under this manifest's own name (see `#/$defs/stepTypeName`).",
+      "propertyNames": {
+        "$ref": "#/$defs/stepTypeName"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "configSchema": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/configSchema"
+        }
+      ]
+    },
+    "auth": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/authSpec"
+        }
+      ]
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Opaque embedder-namespaced metadata. The engine never interprets it."
+    },
+    "permissions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/permission"
+      }
+    },
+    "trackingTag": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "stepTypeDefs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/stepTypeDef"
+      }
+    },
+    "wasmModules": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/wasmModule"
+      }
+    },
+    "stepTypeImpls": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/stepTypeImpl"
+      }
+    },
+    "usesSecrets": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "object",
+            "required": [
+              "key"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "key": {
+                "type": "string",
+                "minLength": 1
+              },
+              "overridable": {
+                "type": "boolean",
+                "default": false,
+                "description": "Whether a level BELOW this plugin may supply its own value for this key — how a global plugin holding a default credential lets a tenant bring a better one. When this plugin's step body runs on a tenant's behalf, the embedder's SecretResolver is told which keys are overridable (`SecretRequest::overridable_keys`) and may answer those, and only those, with the tenant's value where one exists. The kernel does not substitute; it surfaces the declaration.\n\nOnly the level that owns a key may mark it: a namespaced manifest marking anything overridable is rejected at load. Mark only keys where a tenant silently changing this plugin's behaviour is the intent — credentials the tenant owns — never endpoints or identifiers: marking `webhookUrl` overridable lets a tenant point a globally-credentialed plugin at themselves."
+              }
+            }
+          }
+        ]
+      },
+      "description": "Secret keys this plugin uses, as they appear in `{{$secrets.<key>}}`. Each entry is a bare key, or `{ \"key\": ..., \"overridable\": true }` to mark it overridable; keys must be unique. A CEILING, not a request: the kernel intersects whatever the embedder's SecretResolver returns with this list, so a plugin can never see a key it did not declare. Declaring nothing means seeing nothing. Keys are embedder-defined strings and are deliberately not held to `#/$defs/identifier` — a secret store may use dotted or slashed paths.\n\nWHOSE secrets a step body sees: the plugin that ships the body. A native step type used from another plugin's action sees the defining plugin's bag (this list), never the caller's; the caller delegates a secret deliberately by resolving it into a param."
+    }
+  },
+  "$defs": {
+    "stepId": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_-]{0,127}$",
+      "description": "A step's `id`, unique within its action. The `#/$defs/identifier` grammar minus a leading digit — exactly the expression DSL's `ident` production — because an id is a reference target: `$steps.<id>` must parse in every expression, template, and dependency edge, and an id the DSL cannot parse would load and then be unreachable, silently."
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$",
+      "description": "A kernel-global identifier: a plugin name, an SPI role, or a step type name. ASCII letters, digits, `_` and `-`, not starting with `-`, at most 128 bytes.\n\nThe grammar exists because these names are registry keys AND appear verbatim inside permission strings. An unconstrained name is an ambiguity in the grammar itself: a plugin named `*` is indistinguishable from the `invoke:plugin:*` wildcard, and a name containing `:` gives `invoke:plugin:a:b` two readings.\n\n`/` is reserved as the separator between a plugin's embedder-supplied namespace and its manifest-declared local name. The root namespace is spelled as the empty string, so a root-namespace identity is the bare local name — which is unambiguous only while no declared name can contain `/`."
+    },
+    "schema": {
+      "$comment": "A JSON Schema document (Draft 2020-12).",
+      "$ref": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "schemaOrNull": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/schema"
+        }
+      ]
+    },
+    "permission": {
+      "type": "string",
+      "description": "`<category>:<value>` capability grant.\n\nKernel categories (dot-free names are RESERVED for the kernel; an unrecognised dot-free category is rejected at load):\n- `network:egress:<host-pattern>` — outbound network. ADVISORY: the kernel has no HTTP client and never checks this; the embedder's step type must call `check_network_egress` itself.\n- `blobs:<op>:<path-pattern>` (op: read|write|delete|list|stat|watch) — blob access. ADVISORY, same as above.\n- `step_type:<name>` — permission to USE a step type another plugin defined. Enforced by the kernel on both dispatch paths: alias steps and direct steps naming a native/wasm step type. Not needed for step types you defined yourself, for the kernel's reserved intrinsics, or for a def whose owner marked it `freelyUsable: true`.\n- `invoke:plugin:<name|*>` / `invoke:role:<name|*>` — permission to dispatch into another plugin's action, via an `invoke` step, `io.invoke`, or `io.invoke_streaming`. Cross-plugin invocation is DEFAULT-DENY: without a matching grant every such call fails. A plugin may always invoke its own actions. Enforced by the kernel.\n- `provide:step_type:<type>[:<selector>]` — declares intent to SUPPLY the implementation behind a step type slot (the counterpart to `step_type:`, which grants use of one). Required for a `stepTypeImpls` entry claiming a step type this manifest does not itself define. For kernel-defined step types such as `script`, the plugin must ALSO be listed in the embedder's `trusted_step_type_providers` — the declaration alone is not authorisation.\n- `bind:native_impl:<implRef>` — declares intent to BIND a native step body that another plugin ships. The mirror image of `provide:`: that one supplies code others run, this one runs code somebody else supplied. NOT needed to bind your own bodies — a plugin may freely bind any implRef whose `<plugin>` segment matches its own name. Required for anything else, and, like `provide:step_type:`, insufficient alone: the embedder must also authorise the exact (plugin, implRef) pair via `KernelConfig::native_impl_bindings`.\n\nEmbedder-defined categories must be dot-namespaced (`acme.events:publish:x`, not `events:publish:x`); those are passed through to the embedder's enforcement layer untouched. The embedder must ALSO declare the category on `KernelConfig` (`defining_app_permission_category`), and a manifest naming an undeclared one is rejected at load. The kernel never enforces such a grant — it checks that the grant is addressed to somebody. A category nobody declared matches nothing for the life of the deployment, and after load it is indistinguishable from a correctly denied one, so `acme.evets` is refused rather than stored. A category may also constrain its own values; the meta-schema cannot, since it does not know the embedder's grammar.\n\nPattern shapes are exactly `*`, `*.suffix` (hosts), and `prefix/*` (paths). The characters `*`, `?` and `[` are reserved for a future glob syntax and are rejected anywhere else.\n\nPlugin and role names inside a grant obey `#/$defs/identifier`, and step-type names obey `#/$defs/stepTypeName`, so a grant can only name something the registry is able to hold. `/` in a grant target is rejected as reserved namespace syntax rather than accepted as a literal — otherwise deployed grants would silently change target the day that syntax is honoured. Grants resolve along the referring plugin's ancestor chain — its own namespace first, then each enclosing one, then root — exactly as the references they authorise do, so a grant and its reference always name the same plugin. `invoke:plugin:*` means any plugin in the plugin's OWN namespace and never reaches a level above it.",
+      "pattern": "^.+:.+$",
+      "allOf": [
+        {
+          "if": {
+            "pattern": "^network:"
+          },
+          "then": {
+            "pattern": "^network:egress:(\\*|\\*\\.[^*?\\[]+|[^*?\\[]+)$",
+            "$comment": "host pattern: '*' alone, '*.suffix', or a glob-free literal"
+          }
+        },
+        {
+          "if": {
+            "pattern": "^blobs:"
+          },
+          "then": {
+            "pattern": "^blobs:(read|write|delete|list|stat|watch):(\\*|[^*?\\[]+/\\*|[^*?\\[]+)$",
+            "$comment": "path pattern: '*' alone, 'prefix/*', or a glob-free literal"
+          }
+        },
+        {
+          "if": {
+            "pattern": "^step_type:"
+          },
+          "then": {
+            "pattern": "^step_type:[A-Za-z0-9_][A-Za-z0-9_-]{0,127}(\\.[A-Za-z0-9_][A-Za-z0-9_-]{0,127})?$",
+            "$comment": "step type names are flat identifiers ($defs/identifier); no wildcard shape applies"
+          }
+        },
+        {
+          "if": {
+            "pattern": "^invoke:"
+          },
+          "then": {
+            "pattern": "^invoke:(plugin|role):(\\*|[A-Za-z0-9_][A-Za-z0-9_-]{0,127})$",
+            "$comment": "invoke:<plugin|role>:<exact-name|*>, name per $defs/identifier; parse_permission rejects any other sub-kind"
+          }
+        },
+        {
+          "if": {
+            "pattern": "^provide:"
+          },
+          "then": {
+            "pattern": "^provide:step_type:[A-Za-z0-9_][A-Za-z0-9_-]{0,127}(\\.[A-Za-z0-9_][A-Za-z0-9_-]{0,127})?(:[A-Za-z0-9_][A-Za-z0-9_-]{0,127})?$",
+            "$comment": "an impl claim names one exact slot, type and selector each per $defs/identifier; no wildcards"
+          }
+        },
+        {
+          "if": {
+            "pattern": "^bind:"
+          },
+          "then": {
+            "pattern": "^bind:native_impl:[A-Za-z0-9_][A-Za-z0-9_-]{0,127}(\\.[A-Za-z0-9_][A-Za-z0-9_-]{0,127})*$",
+            "$comment": "an implRef names one exact native body; dot-separated segments each per $defs/identifier, no wildcards"
+          }
+        },
+        {
+          "if": {
+            "pattern": "^[^.:]+:"
+          },
+          "then": {
+            "pattern": "^(network|blobs|step_type|invoke|provide|bind):",
+            "$comment": "dot-free category names are reserved for the kernel; embedder categories must be namespaced, e.g. acme.events:"
+          }
+        }
+      ]
+    },
+    "action": {
+      "type": "object",
+      "required": [
+        "steps"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "steps": {
+          "$ref": "#/$defs/stepArray"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resultsPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resultMapping": {
+          "type": "object"
+        },
+        "inputSchema": {
+          "$ref": "#/$defs/schemaOrNull"
+        },
+        "outputSchema": {
+          "$ref": "#/$defs/schemaOrNull"
+        },
+        "subscribesTo": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "continuous": {
+          "type": "boolean"
+        },
+        "intervalMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "parallelWaves": {
+          "type": "boolean"
+        },
+        "dataflow": {
+          "type": "boolean",
+          "description": "Run as a streaming-dataflow pipeline: every step is its own task, long-running producers stay alive until their stream closes, and a single result is emitted at termination. A dataflow action MUST contain at least one `longRunning: true` step; the loader rejects one that does not. This schema cannot express that cross-field rule, so a manifest can pass here and still be refused at registration."
+        },
+        "wallclockTimeoutMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "Per-action wallclock cap in ms. 0 is rejected; omit to inherit the embedder default."
+        },
+        "tool": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/toolDef"
+            }
+          ]
+        }
+      },
+      "not": {
+        "$comment": "dataflow and continuous are mutually exclusive.",
+        "allOf": [
+          {
+            "required": [
+              "dataflow"
+            ],
+            "properties": {
+              "dataflow": {
+                "const": true
+              }
+            }
+          },
+          {
+            "required": [
+              "continuous"
+            ],
+            "properties": {
+              "continuous": {
+                "const": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    "toolDef": {
+      "type": "object",
+      "required": [
+        "name",
+        "description",
+        "parameters"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string"
+        },
+        "parameters": {
+          "description": "JSON Schema for the tool's arguments.",
+          "$ref": "#/$defs/schema"
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "required": [
+        "id",
+        "type"
+      ],
+      "additionalProperties": false,
+      "$comment": "The step object is CLOSED: its keys are the step-level keywords the kernel defines, and everything a step type reads lives under `params`. Keeping the two namespaces apart is what lets a future step-level keyword (`retry`, `timeout`, `when`, ...) be added without capturing a deployed manifest's param of the same name.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stepId"
+        },
+        "type": {
+          "$ref": "#/$defs/stepTypeName"
+        },
+        "params": {
+          "type": "object",
+          "description": "Step-type-specific parameters. Absent means `{}`. The bodies of the control-flow intrinsics live here too: `try`/`catch`/`finally` for `try`, `ifs[].then` for `ifs`, `steps` for `for_each` and `repeat`, `branches` for `parallel`."
+        },
+        "storeToVariable": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "longRunning": {
+          "type": "boolean",
+          "description": "This step produces a stream that stays open for the life of the pipeline. Only meaningful inside a `dataflow: true` action; the loader rejects it anywhere else. This schema cannot express that cross-level rule, so a manifest can pass here and still be refused at registration."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "const": "try"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "properties": {
+                  "try": {
+                    "$ref": "#/$defs/stepArray"
+                  },
+                  "catch": {
+                    "$ref": "#/$defs/stepArray"
+                  },
+                  "finally": {
+                    "$ref": "#/$defs/stepArray"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "const": "ifs"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "properties": {
+                  "ifs": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "test": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "then": {
+                          "$ref": "#/$defs/stepArray"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "const": "for_each"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "properties": {
+                  "steps": {
+                    "$ref": "#/$defs/stepArray"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "const": "repeat"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "properties": {
+                  "steps": {
+                    "$ref": "#/$defs/stepArray"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "const": "parallel"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "properties": {
+                  "branches": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/stepArray"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "stepArray": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/step"
+      }
+    },
+    "stepTypeDef": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/stepTypeName"
+        },
+        "inputSchema": {
+          "$ref": "#/$defs/schemaOrNull"
+        },
+        "outputSchema": {
+          "$ref": "#/$defs/schemaOrNull"
+        },
+        "metadataSchema": {
+          "$comment": "The top-level properties key-set is the exact allow-list of emittable metadata keys; `result` is reserved for the step's value slot.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/schemaOrNull"
+            },
+            {
+              "if": {
+                "type": "object"
+              },
+              "then": {
+                "properties": {
+                  "properties": {
+                    "not": {
+                      "required": [
+                        "result"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "selector": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "plugin",
+              "action"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "plugin": {
+                "type": "string",
+                "minLength": 1
+              },
+              "action": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "freelyUsable": {
+          "type": "boolean",
+          "description": "Whether OTHER plugins may use this step type without holding a `step_type:<name>` grant. Default false: using a step type you did not define requires the grant, so forgetting to think about it fails closed. Set true on shared utilities that are safe for anyone to call (a pure-compute transform, a formatter, a codec) — the author of the capability is the one who knows. Leave false on anything holding a credential, performing I/O, or reaching a privileged host resource; the grant is what makes every consumer of that capability greppable in the manifest an operator reviews.\n\nThis is one of three orthogonal axes and they are easy to confuse: `provide:step_type:` governs who may SUPPLY an implementation, `bind:native_impl:` who may BIND a specific native body, and `step_type:` who may USE the type. Only the last is what this waives.\n\nA plugin may always use step types it defined itself, and the kernel's reserved intrinsics (let, ifs, script, …) are usable by everyone regardless of this flag."
+        }
+      }
+    },
+    "stepTypeImpl": {
+      "type": "object",
+      "required": [
+        "stepType"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "stepType": {
+          "$ref": "#/$defs/stepTypeName"
+        },
+        "matches": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/identifier"
+            }
+          ]
+        },
+        "kind": {
+          "enum": [
+            "wasm",
+            "native",
+            "intrinsic"
+          ]
+        },
+        "wasmModule": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "implRef": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "$comment": "kind wasm (the default): wasmModule required, implRef must be absent.",
+          "if": {
+            "anyOf": [
+              {
+                "not": {
+                  "required": [
+                    "kind"
+                  ]
+                }
+              },
+              {
+                "required": [
+                  "kind"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "wasm"
+                  }
+                }
+              }
+            ]
+          },
+          "then": {
+            "required": [
+              "wasmModule"
+            ],
+            "properties": {
+              "wasmModule": {
+                "type": "string",
+                "minLength": 1
+              },
+              "implRef": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "$comment": "kind native/intrinsic: implRef required; wasmModule and matches must be absent (selector-less).",
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "native",
+                  "intrinsic"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "implRef"
+            ],
+            "properties": {
+              "implRef": {
+                "type": "string",
+                "minLength": 1
+              },
+              "wasmModule": {
+                "type": "null"
+              },
+              "matches": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ],
+      "description": "Declares that this plugin supplies the implementation behind a `(stepType, matches)` slot.\n\nIMPORTANT: this is not the same as using a step type. Supplying the implementation means every OTHER plugin's steps of this type execute inside your code, and that code receives the calling plugin's resolution context. The kernel therefore requires, for any step type this manifest does NOT itself define in `stepTypeDefs`:\n  1. a `provide:step_type:<stepType>[:<matches>]` entry in `permissions`, and\n  2. this plugin's name in the embedder's `trusted_step_type_providers` config.\nA plugin implementing a step type it defines itself needs neither."
+    },
+    "wasmModule": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "base64"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "base64": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "path"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "configSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "systemFields": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/configField"
+          }
+        },
+        "userFields": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/configField"
+          }
+        }
+      }
+    },
+    "configField": {
+      "type": "object",
+      "required": [
+        "key",
+        "type"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "displayName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "defaultValue": {},
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "secret": {
+          "type": "boolean"
+        }
+      }
+    },
+    "authSpec": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "headerName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "configKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "stepTypeName": {
+      "type": "string",
+      "pattern": "^([A-Za-z0-9_][A-Za-z0-9_-]{0,127})(\\.([A-Za-z0-9_][A-Za-z0-9_-]{0,127}))?$",
+      "description": "A step type name. Dot-free names (`let`, `ifs`, ...) are the KERNEL's — every bare word, including ones it has not used yet, so a future intrinsic can never collide with a deployed manifest. A plugin-defined step type is `<plugin>.<name>` under the defining plugin's own local name (`vault.sign` is shipped by `vault`); the loader rejects a def or alias under any other prefix. The owner segment resolves along the using plugin's ancestor chain like a plugin reference, so a tenant's own `vault.sign` shadows the global one for that tenant's steps."
+    }
+  }
+}
