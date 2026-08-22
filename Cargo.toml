@@ -2,7 +2,7 @@
 name = "gwead"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.94"
 description = "Gwead — a WebAssembly plugin microkernel: a data-driven engine that loads plugin manifests and executes capability steps in sandboxed wasm."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/plethwaith/gwead"
@@ -27,10 +27,12 @@ thiserror = "2"
 tracing = "0.1"
 regex = "1"
 
-# 44.x is the minimum line that carries the path_open(TRUNCATE) fix
-# from RUSTSEC-2026-0149; 43.x has no backport.
-wasmtime = "44"
-wasmtime-wasi = "44"
+# 47.x is the lowest non-LTS line clear of RUSTSEC-2026-0222 (wasmtime,
+# cross-engine type-index confusion) and RUSTSEC-2026-0188 (wasmtime-wasi,
+# hard-link/rename FilePerms bypass), as well as RUSTSEC-2026-0149. It
+# sets the crate's MSRV: wasmtime 46+ requires Rust 1.94.
+wasmtime = "47"
+wasmtime-wasi = "47"
 base64 = "0.22"
 
 # JSON Schema (Draft 2020-12) validation of manifests against the published
