@@ -549,14 +549,13 @@ async fn caller_cancel_leaves_step_error_untouched() {
 }
 
 /// Dataflow with a step that answers the token with its own error.
-/// The deadline arms two mechanisms at the same instant and either
-/// may win: the outer timeout drops the scheduler mid-flight (its own
-/// terminal emit never runs), or the watchdog's cancel lets the step
-/// fail, the scheduler emit its own `PipelineCompleted { ok: false }`,
-/// and the wrapper remap the `Err`. Either way the caller must see
-/// `ExecutionTimeout` and the handle must deliver exactly ONE
-/// terminator — the substitute emit is for a dropped future only, not
-/// for any `ExecutionTimeout` result.
+/// The watchdog fires first and the backstop only after its grace
+/// window, so the step fails, the scheduler emits its own
+/// `PipelineCompleted { ok: false }` and returns `Err`, and the wrapper
+/// remaps that to `ExecutionTimeout`. The handle must deliver exactly
+/// ONE terminator: the substitute emit is for a dropped future only,
+/// not for any `ExecutionTimeout` result. (Keying the substitute on
+/// the result, as before, delivers two here.)
 #[tokio::test(flavor = "multi_thread")]
 async fn dataflow_deadline_answered_by_step_emits_one_terminator() {
     let mut a = action(vec![{
