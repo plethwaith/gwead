@@ -71,13 +71,15 @@ jobs:
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
-    # The action reports findings as a check run, which needs write
-    # access the default token does not carry.
     permissions:
       contents: read
-      checks: write
     steps:
       - uses: actions/checkout@v5
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Installed with cargo-audit's own lockfile: a fresh release of
+      # one of its dependencies (tinyvec 1.13.0, 2026-09-03) broke its
+      # build when installed unlocked, and the audit-check action has
+      # no way to say otherwise.
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
