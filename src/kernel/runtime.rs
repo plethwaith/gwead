@@ -303,6 +303,12 @@ async fn dispatch_trait_step_core(
         }
     }
 
+    // Typed failure markers belong to one dispatch. A guest that saw a
+    // nested dispatch fail, handled it, and carried on must not have
+    // that dispatch's markers attributed to a later failure.
+    state.cancelled = false;
+    state.callee_error = None;
+
     let result = match body {
         // Host-pluggable bodies see only the narrow plugin surface.
         StepBody::Plugin(func) => {
@@ -391,6 +397,30 @@ async fn dispatch_trait_step_core(
             };
             state.plugin_error = Some(payload);
             state.last_error = Some(formatted);
+            0
+        }
+        Err(StepError::Cancelled) => {
+            // Not a failure: the step stopped because the invocation
+            // was cancelled. The marker makes `step_failure_to_error`
+            // report `Cancelled` and keeps `try` from catching it.
+            tracing::debug!(step_id = %step_id, "Step stopped on cancellation");
+            state.last_error = Some(format!("step '{step_id}' cancelled"));
+            state.cancelled = true;
+            0
+        }
+        Err(StepError::Callee {
+            plugin,
+            action,
+            source,
+        }) => {
+            let msg = format!("step '{step_id}' → {plugin}.{action} failed: {source}");
+            tracing::warn!(step_id = %step_id, error = %msg, "Step failed");
+            state.last_error = Some(msg);
+            state.callee_error = Some(host_api::CalleeError {
+                plugin,
+                action,
+                source,
+            });
             0
         }
     }
@@ -1015,6 +1045,21 @@ async fn run_repeat(
 /// that fires the invocation's token at the deadline, and the checks
 /// here are what observe it. Removing a poll would break the deadline
 /// as well as `cancel`.
+/// After a step returned `false`: if it stopped on the cancellation
+/// token rather than failing, propagate `Cancelled` instead of letting
+/// the enclosing intrinsic treat it as a failure. `try` in particular
+/// must not catch a cancellation — the handler would run under a token
+/// that has already fired, and the action would report a swallowed
+/// error where the caller cancelled it or its deadline expired.
+fn escape_if_cancelled(store: &Store<ExecutionState>, step_id: &str) -> Result<(), KernelError> {
+    if store.data().cancelled {
+        return Err(KernelError::Cancelled {
+            at_step: step_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn check_cancelled(store: &Store<ExecutionState>, step_id: &str) -> Result<(), KernelError> {
     if store.data().cancel.is_cancelled() {
         return Err(KernelError::Cancelled {
@@ -1103,6 +1148,7 @@ async fn run_try(
                 check_cancelled(store, &inner.id)?;
                 let ok = run_step(linker, store, inner, absolute_idx).await?;
                 if !ok {
+                    escape_if_cancelled(store, &inner.id)?;
                     return Ok(false);
                 }
                 last_try_result = store.data().step_results.get(&inner.id).cloned();
@@ -1150,6 +1196,7 @@ async fn run_try(
             state.last_error = None;
             state.plugin_error = None;
             state.resource_violation = None;
+            state.callee_error = None;
         } else {
             // Case 3 — run the catch body.
             let err_msg = store
@@ -1170,6 +1217,7 @@ async fn run_try(
             state.last_error = None;
             state.plugin_error = None;
             state.resource_violation = None;
+            state.callee_error = None;
 
             let inner_offset = store.data().action.steps.len();
             store
@@ -1184,6 +1232,7 @@ async fn run_try(
                     check_cancelled(store, &inner.id)?;
                     let ok = run_step(linker, store, inner, absolute_idx).await?;
                     if !ok {
+                        escape_if_cancelled(store, &inner.id)?;
                         return Ok(false);
                     }
                     last_catch_result = store.data().step_results.get(&inner.id).cloned();
@@ -1216,6 +1265,7 @@ async fn run_try(
                 check_cancelled(store, &inner.id)?;
                 let ok = run_step(linker, store, inner, absolute_idx).await?;
                 if !ok {
+                    escape_if_cancelled(store, &inner.id)?;
                     return Ok(false);
                 }
                 if store.data().return_signal.is_some() {
@@ -1628,6 +1678,7 @@ async fn run_ifs(
             check_cancelled(store, &inner.id)?;
             let ok = run_step(linker, store, inner, absolute_idx).await?;
             if !ok {
+                escape_if_cancelled(store, &inner.id)?;
                 return Ok(false);
             }
             // `return` early-exit from inside a chosen branch.
@@ -1807,6 +1858,7 @@ async fn run_iteration(
                     check_cancelled(store, &inner.id)?;
                     let ok = run_step(linker, store, inner, absolute_idx).await?;
                     if !ok {
+                        escape_if_cancelled(store, &inner.id)?;
                         return Ok(false);
                     }
                     // `return` from inside an iteration body exits the
@@ -2111,10 +2163,10 @@ fn merge_over_budget(state: &ExecutionState) -> Option<KernelError> {
 /// structured `KernelError` variant. Used by both the sequential and
 /// parallel-wave paths so the error mapping rule lives in one place.
 ///
-/// Order matters: a resource-cap violation and a structured
-/// `throw_error` payload both wrap richer information than the
-/// generic `PluginExecution(string)` form, so callers can branch on the code
-/// instead of parsing strings.
+/// Order matters: a resource-cap violation, a cancellation, a failed
+/// callee and a structured `throw_error` payload all wrap richer
+/// information than the generic `Execution(string)` form, so callers
+/// can branch on the variant instead of parsing strings.
 pub(super) fn step_failure_to_error(state: &ExecutionState, step: &StepDef) -> KernelError {
     if let Some(violation) = state.resource_violation.clone() {
         return match violation {
@@ -2135,6 +2187,19 @@ pub(super) fn step_failure_to_error(state: &ExecutionState, step: &StepDef) -> K
                 limit_bytes,
                 attempted_bytes,
             },
+        };
+    }
+    if state.cancelled {
+        return KernelError::Cancelled {
+            at_step: step.id.clone(),
+        };
+    }
+    if let Some(callee) = state.callee_error.clone() {
+        return KernelError::CalleeFailed {
+            step_id: step.id.clone(),
+            plugin: callee.plugin,
+            action: callee.action,
+            source: callee.source,
         };
     }
     if let Some(payload) = state.plugin_error.clone() {

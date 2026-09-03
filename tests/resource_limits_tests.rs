@@ -33,6 +33,14 @@ fn boot_with_limits(limits: RuntimeLimits, manifests: Vec<PluginManifest>) -> Ar
 }
 
 fn boot_with_config(config: KernelConfig, manifests: Vec<PluginManifest>) -> Arc<Kernel> {
+    boot_with_config_and_json(config, manifests, &[])
+}
+
+fn boot_with_config_and_json(
+    config: KernelConfig,
+    manifests: Vec<PluginManifest>,
+    json_manifests: &[&str],
+) -> Arc<Kernel> {
     init_tracing();
     let mut config = common::script_runtime_mock::trusting(config, &["lua"]);
     // Seed the test-only `sleep_async` impl into the
@@ -74,6 +82,9 @@ fn boot_with_config(config: KernelConfig, manifests: Vec<PluginManifest>) -> Arc
     for m in manifests {
         k.register_plugin(m).expect("registration");
     }
+    for j in json_manifests {
+        k.register_plugin_from_json(j).expect("registration");
+    }
     k.into_arc()
 }
 
@@ -93,12 +104,12 @@ fn sleep_async_step<'a>(
 }
 
 /// Test-only step type modelling an embedder's host step that races
-/// its work against the cancellation token and, when the token fires,
-/// answers with its *own* error rather than `KernelError::Cancelled`.
-/// `params.shape` picks the error: `"thrown"` is a structured
-/// `PluginError` with code `host_cancelled` (an embedder's cancel
-/// code), `"failed"` a plain `Execution` failure whose message merely
-/// mentions cancellation (the flattened nested-`invoke` shape).
+/// its work against the cancellation token. `params.shape` picks what
+/// it answers the token with: `"cancelled"` is the typed
+/// `StepError::Cancelled`; `"thrown"` a structured `PluginError` with
+/// code `host_cancelled` and `"failed"` a plain failure whose message
+/// merely mentions cancellation — the two ways a step can misreport
+/// its own cancellation.
 fn fail_on_cancel_step<'a>(
     ex: &'a mut (dyn PluginExecution + Send),
     params: &'a Value,
@@ -112,6 +123,7 @@ fn fail_on_cancel_step<'a>(
             .unwrap_or("thrown");
         tokio::select! {
             _ = cancel.cancelled() => Err(match shape {
+                "cancelled" => StepError::Cancelled,
                 "failed" => StepError::Failed("host step cancelled by token".to_string()),
                 _ => StepError::Thrown(PluginErrorPayload {
                     code: "host_cancelled".to_string(),
@@ -459,20 +471,17 @@ fn fail_on_cancel_action(shape: &str, sleep_ms: u64, wallclock_ms: Option<u64>) 
     a
 }
 
-/// The watchdog fires the token; the host step answers with a
-/// structured `PluginError` carrying its own cancellation code. The
-/// caller must still see `ExecutionTimeout`: the deadline is what
-/// stopped the action, whatever shape the stop took on the way out.
-/// (Gwead issue #1 — before the fix the `PluginError` passed through
-/// and read as a caller-requested cancel.)
+/// The watchdog fires the token; the host step answers with the typed
+/// `StepError::Cancelled`. The caller sees `ExecutionTimeout`: the
+/// deadline is what stopped the action. (Gwead issue #1.)
 #[tokio::test(flavor = "multi_thread")]
-async fn deadline_remaps_structured_step_error_to_execution_timeout() {
+async fn deadline_remaps_typed_cancellation_to_execution_timeout() {
     let kernel = boot_with_limits(
         RuntimeLimits::default(),
         vec![manifest_with_action(
             "p",
             "go",
-            fail_on_cancel_action("thrown", 5_000, Some(80)),
+            fail_on_cancel_action("cancelled", 5_000, Some(80)),
         )],
     );
 
@@ -488,11 +497,38 @@ async fn deadline_remaps_structured_step_error_to_execution_timeout() {
     }
 }
 
-/// Same as above with the plain-failure shape: a step whose error is
-/// an ordinary `Execution` message mentioning cancellation (the
-/// flattened nested-`invoke` shape) is also the watchdog's doing.
+/// A step that answers the token with a `PluginError` of its own is
+/// reporting a failure, and a failure after the deadline is passed
+/// through as what it says it is: the kernel does not guess that a
+/// structured error "really meant" cancellation. The typed variant is
+/// how a step says so.
 #[tokio::test(flavor = "multi_thread")]
-async fn deadline_remaps_plain_step_failure_to_execution_timeout() {
+async fn deadline_passes_through_a_structured_error_that_is_not_typed_as_cancellation() {
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action(
+            "p",
+            "go",
+            fail_on_cancel_action("thrown", 5_000, Some(80)),
+        )],
+    );
+
+    let err = kernel
+        .execute("p", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("the step fails once the token fires");
+    match err {
+        KernelError::PluginError { code, .. } => assert_eq!(code, "host_cancelled"),
+        other => panic!("expected the step's own PluginError, got: {other:?}"),
+    }
+}
+
+/// Same for a plain failure whose message happens to mention
+/// cancellation: text is not a type.
+#[tokio::test(flavor = "multi_thread")]
+async fn deadline_passes_through_a_plain_failure() {
     let kernel = boot_with_limits(
         RuntimeLimits::default(),
         vec![manifest_with_action(
@@ -507,11 +543,150 @@ async fn deadline_remaps_plain_step_failure_to_execution_timeout() {
         .with_config(&Value::Null)
         .run()
         .await
-        .expect_err("declared cap < step sleep must trip the deadline");
+        .expect_err("the step fails once the token fires");
+    match err {
+        KernelError::Execution(msg) => assert!(msg.contains("cancelled by token"), "{msg}"),
+        other => panic!("expected the step's own Execution error, got: {other:?}"),
+    }
+}
+
+/// `try` must not catch a cancellation. With an empty `catch` the
+/// step's failure would be swallowed and the action would report
+/// `Ok`; a typed cancellation escapes the `try` and the deadline is
+/// reported.
+#[tokio::test(flavor = "multi_thread")]
+async fn try_does_not_swallow_a_typed_cancellation() {
+    let mut a = action(vec![step(
+        "guarded",
+        "try",
+        json!({
+            "try": [{
+                "id": "host",
+                "type": "test_resource_limits_fixture.fail_on_cancel",
+                "params": { "sleep_ms": 5_000u64, "shape": "cancelled" }
+            }],
+            "catch": []
+        }),
+    )]);
+    a.wallclock_timeout_ms = Some(80);
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action("p", "go", a)],
+    );
+
+    let err = kernel
+        .execute("p", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("a cancelled step inside try must not be swallowed");
     match err {
         KernelError::ExecutionTimeout { timeout_ms } => assert_eq!(timeout_ms, 80),
         other => panic!("expected ExecutionTimeout, got: {other:?}"),
     }
+}
+
+/// Caller and callee manifests for the invoke-chain tests. The callee
+/// races a host step against its token; the caller's `go` invokes it.
+fn invoke_chain_manifests(callee_action: &str) -> [String; 2] {
+    let callee = String::from(
+        r#"{
+            "name": "callee",
+            "actions": {
+                "go": {
+                    "steps": [{"id": "host", "type": "test_resource_limits_fixture.fail_on_cancel",
+                                "params": {"sleep_ms": 5000, "shape": "cancelled"}}]
+                },
+                "boom": {
+                    "steps": [{"id": "bad", "type": "throw_error",
+                                "params": {"code": "E_CALLEE", "message": "nope"}}]
+                }
+            }
+        }"#,
+    );
+    let caller = format!(
+        r#"{{
+            "name": "caller",
+            "permissions": ["invoke:plugin:callee"],
+            "actions": {{
+                "go": {{
+                    "wallclockTimeoutMs": 80,
+                    "steps": [{{"id": "call", "type": "invoke",
+                                "params": {{"plugin": "callee", "action": "{callee_action}", "input": {{}}}}}}]
+                }}
+            }}
+        }}"#
+    );
+    [callee, caller]
+}
+
+/// The caller's deadline fires; its token propagates to the callee,
+/// whose host step answers with the typed cancellation. The callee
+/// resolves `Cancelled`, the `invoke` step carries that up as the
+/// caller's own cancellation, and the caller's wrapper reports the
+/// deadline — no flattening to text anywhere on the way.
+#[tokio::test(flavor = "multi_thread")]
+async fn callers_deadline_through_an_invoked_callee_is_execution_timeout() {
+    let [callee, caller] = invoke_chain_manifests("go");
+    let kernel = boot_with_config_and_json(
+        KernelConfig::default().with_limits(RuntimeLimits::default()),
+        vec![],
+        &[&callee, &caller],
+    );
+
+    let err = kernel
+        .execute("caller", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("the caller's cap must trip");
+    match err {
+        KernelError::ExecutionTimeout { timeout_ms } => assert_eq!(timeout_ms, 80),
+        other => panic!("expected ExecutionTimeout, got: {other:?}"),
+    }
+}
+
+/// A callee's own failure reaches the caller intact: `CalleeFailed`
+/// names the step and the callee, and `source` is the callee's
+/// structured error, so the caller can branch on its code.
+#[tokio::test(flavor = "multi_thread")]
+async fn callee_failure_reaches_the_caller_typed() {
+    let [callee, caller] = invoke_chain_manifests("boom");
+    let kernel = boot_with_config_and_json(
+        KernelConfig::default().with_limits(RuntimeLimits::default()),
+        vec![],
+        &[&callee, &caller],
+    );
+
+    let err = kernel
+        .execute("caller", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("the callee throws");
+    let text = err.to_string();
+    match err {
+        KernelError::CalleeFailed {
+            step_id,
+            plugin,
+            action,
+            source,
+        } => {
+            assert_eq!(
+                (step_id.as_str(), plugin.as_str(), action.as_str()),
+                ("call", "callee", "boom")
+            );
+            match &*source {
+                KernelError::PluginError { code, .. } => assert_eq!(code, "E_CALLEE"),
+                other => panic!("expected the callee's PluginError as source, got: {other:?}"),
+            }
+        }
+        other => panic!("expected CalleeFailed, got: {other:?}"),
+    }
+    assert!(
+        text.contains("step 'call' → callee.boom failed: Plugin error E_CALLEE: nope"),
+        "the message keeps the flattened shape a catch handler reads: {text}"
+    );
 }
 
 /// The mirror image: the *caller* fires the token well inside the
@@ -562,7 +737,7 @@ async fn dataflow_deadline_answered_by_step_emits_one_terminator() {
         let mut m = step(
             "host",
             "test_resource_limits_fixture.fail_on_cancel",
-            json!({ "sleep_ms": 5_000u64, "shape": "thrown" }),
+            json!({ "sleep_ms": 5_000u64, "shape": "cancelled" }),
         );
         m.long_running = true;
         m
