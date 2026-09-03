@@ -269,12 +269,14 @@ impl<'a> ExecuteActionRequest<'a> {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let secret_resolver = self.secret_resolver();
         let kernel = self.arc()?;
-        let cancel = self.cancel.unwrap_or_default();
-        // A child, not a clone: the watchdog fires this at the deadline,
-        // and a caller's token may be shared with other work that must
-        // not be torn down by this pipeline's cap. `DataflowHandle::cancel`
-        // fires the parent, which reaches the child as before.
-        let driver_cancel = cancel.child_token();
+        // A child of the caller's token, not a clone: the watchdog fires
+        // this at the deadline, and a caller's token may be shared with
+        // other work that must not be torn down by this pipeline's cap.
+        // The handle holds the child too, so `cancel()` reaches every
+        // step and `cancel_token()` observes the deadline; the caller's
+        // own cancel still propagates down.
+        let driver_cancel = self.cancel.unwrap_or_default().child_token();
+        let handle_cancel = driver_cancel.clone();
         let plugin_owned = self.plugin_name.to_string();
         let action_owned = self.action_name.to_string();
         let config_owned = self.config.clone();
@@ -341,7 +343,7 @@ impl<'a> ExecuteActionRequest<'a> {
         Ok(DataflowHandle {
             events: events_rx,
             result: result_rx,
-            cancel,
+            cancel: handle_cancel,
             join,
         })
     }
@@ -447,12 +449,14 @@ impl<'a> ExecuteActionRequest<'a> {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let secret_resolver = self.secret_resolver();
         let kernel = self.arc()?;
-        let cancel = self.cancel.unwrap_or_default();
-        // A child, not a clone: the watchdog fires this at the deadline,
-        // and a caller's token may be shared with other work that must
-        // not be torn down by this pipeline's cap. `DataflowHandle::cancel`
-        // fires the parent, which reaches the child as before.
-        let driver_cancel = cancel.child_token();
+        // A child of the caller's token, not a clone: the watchdog fires
+        // this at the deadline, and a caller's token may be shared with
+        // other work that must not be torn down by this pipeline's cap.
+        // The handle holds the child too, so `cancel()` reaches every
+        // step and `cancel_token()` observes the deadline; the caller's
+        // own cancel still propagates down.
+        let driver_cancel = self.cancel.unwrap_or_default().child_token();
+        let handle_cancel = driver_cancel.clone();
         let plugin_owned = self.plugin_name.to_string();
         let action_owned = self.action_name.to_string();
         let config_owned = self.config.clone();
@@ -525,7 +529,7 @@ impl<'a> ExecuteActionRequest<'a> {
             output,
             events: events_rx,
             result: result_rx,
-            cancel,
+            cancel: handle_cancel,
             join,
         })
     }

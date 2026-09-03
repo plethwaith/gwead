@@ -1045,6 +1045,15 @@ async fn run_repeat(
 /// that fires the invocation's token at the deadline, and the checks
 /// here are what observe it. Removing a poll would break the deadline
 /// as well as `cancel`.
+fn check_cancelled(store: &Store<ExecutionState>, step_id: &str) -> Result<(), KernelError> {
+    if store.data().cancel.is_cancelled() {
+        return Err(KernelError::Cancelled {
+            at_step: step_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// After a step returned `false`: if it stopped on the cancellation
 /// token rather than failing, propagate `Cancelled` instead of letting
 /// the enclosing intrinsic treat it as a failure. `try` in particular
@@ -1053,15 +1062,6 @@ async fn run_repeat(
 /// error where the caller cancelled it or its deadline expired.
 fn escape_if_cancelled(store: &Store<ExecutionState>, step_id: &str) -> Result<(), KernelError> {
     if store.data().cancelled {
-        return Err(KernelError::Cancelled {
-            at_step: step_id.to_string(),
-        });
-    }
-    Ok(())
-}
-
-fn check_cancelled(store: &Store<ExecutionState>, step_id: &str) -> Result<(), KernelError> {
-    if store.data().cancel.is_cancelled() {
         return Err(KernelError::Cancelled {
             at_step: step_id.to_string(),
         });
@@ -1451,6 +1451,11 @@ async fn run_parallel(
                     }
                     Ok(false) => {
                         branch_ok = false;
+                        // A cancelled step is an error for the whole
+                        // `parallel`, not a failed branch: carried in
+                        // `run_err` so it escapes the enclosing `try`
+                        // the same way a top-level cancellation does.
+                        run_err = escape_if_cancelled(&task_store, &inner.id).err();
                         break;
                     }
                     Err(e) => {
@@ -1573,6 +1578,12 @@ fn merge_parallel_branch_state(
     }
     if task_state.resource_violation.is_some() && canonical_state.resource_violation.is_none() {
         canonical_state.resource_violation = task_state.resource_violation;
+    }
+    // `cancelled` is deliberately not merged: a cancelled branch is
+    // carried as the `parallel` step's own error, and the flag would
+    // otherwise outlive the `try` resets that clear every other marker.
+    if task_state.callee_error.is_some() && canonical_state.callee_error.is_none() {
+        canonical_state.callee_error = task_state.callee_error;
     }
     if task_state.return_signal.is_some() && canonical_state.return_signal.is_none() {
         canonical_state.return_signal = task_state.return_signal;

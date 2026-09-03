@@ -113,9 +113,9 @@ pub(crate) struct ExecutionState {
     /// branch on the code field.
     pub(crate) plugin_error: Option<PluginErrorPayload>,
     /// Set when the step stopped on the invocation's cancellation token
-    /// ([`StepError::Cancelled`]). Read ahead of every other marker by
-    /// `step_failure_to_error`: a cancelled step is not a failed one,
-    /// and `try` does not catch it.
+    /// ([`StepError::Cancelled`]). Read by `step_failure_to_error`
+    /// ahead of every marker but a resource violation: a cancelled step
+    /// is not a failed one, and `try` does not catch it.
     pub(crate) cancelled: bool,
     /// Set when a nested invocation the step made failed
     /// ([`StepError::Callee`]): the callee's own error, intact, for
@@ -623,9 +623,10 @@ pub enum StepError {
 
 impl StepError {
     /// Map a callee's error onto the calling step's error, keeping it
-    /// typed. A cancelled callee means the caller was cancelled: the
-    /// callee's token is a child of the caller's, so nothing else could
-    /// have fired it. Everything else is the callee's own failure.
+    /// typed. A cancelled callee means the caller was cancelled: an
+    /// invoked callee runs under the caller's own token, so nothing
+    /// else could have fired it. Everything else is the callee's own
+    /// failure.
     pub fn from_callee(plugin: &str, action: &str, err: super::KernelError) -> Self {
         match err {
             super::KernelError::Cancelled { .. } => StepError::Cancelled,
