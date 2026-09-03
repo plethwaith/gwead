@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gwead::kernel::host_api::{PluginExecution, StepError, StepOutput};
+use gwead::kernel::host_api::{PluginErrorPayload, PluginExecution, StepError, StepOutput};
 use gwead::kernel::types::*;
 use gwead::kernel::{Kernel, KernelConfig, KernelError, RuntimeLimits};
 use indexmap::IndexMap;
@@ -46,6 +46,13 @@ fn boot_with_config(config: KernelConfig, manifests: Vec<PluginManifest>) -> Arc
             sleep_async_step,
         )
         .expect("no collision on a fresh table");
+    config
+        .native_step_impls
+        .insert(
+            "test.test_resource_limits_fixture.fail_on_cancel",
+            fail_on_cancel_step,
+        )
+        .expect("no collision on a fresh table");
     let mut k = Kernel::boot(config).expect("kernel boot");
     common::script_runtime_mock::register(&mut k).expect("mock script runtime registers");
     k.register_plugin_from_json(
@@ -54,10 +61,12 @@ fn boot_with_config(config: KernelConfig, manifests: Vec<PluginManifest>) -> Arc
             "version": "0.0.0",
             "description": "Wires `sleep_async` for the wallclock-timeout tests — real async work that's preemptable by tokio::time::timeout.",
             "stepTypeDefs": [
-                {"name": "test_resource_limits_fixture.sleep_async", "freelyUsable": true}
+                {"name": "test_resource_limits_fixture.sleep_async", "freelyUsable": true},
+                {"name": "test_resource_limits_fixture.fail_on_cancel", "freelyUsable": true}
             ],
             "stepTypeImpls": [
-                {"stepType": "test_resource_limits_fixture.sleep_async", "kind": "native", "implRef": "test.test_resource_limits_fixture.sleep_async"}
+                {"stepType": "test_resource_limits_fixture.sleep_async", "kind": "native", "implRef": "test.test_resource_limits_fixture.sleep_async"},
+                {"stepType": "test_resource_limits_fixture.fail_on_cancel", "kind": "native", "implRef": "test.test_resource_limits_fixture.fail_on_cancel"}
             ]
         }"#,
     )
@@ -80,6 +89,40 @@ fn sleep_async_step<'a>(
         let sleep_ms = params.get("sleep_ms").and_then(|v| v.as_u64()).unwrap_or(0);
         tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         Ok(StepOutput::from(json!({ "slept_ms": sleep_ms })))
+    })
+}
+
+/// Test-only step type modelling an embedder's host step that races
+/// its work against the cancellation token and, when the token fires,
+/// answers with its *own* error rather than `KernelError::Cancelled`.
+/// `params.shape` picks the error: `"thrown"` is a structured
+/// `PluginError` with code `host_cancelled` (an embedder's cancel
+/// code), `"failed"` a plain `Execution` failure whose message merely
+/// mentions cancellation (the flattened nested-`invoke` shape).
+fn fail_on_cancel_step<'a>(
+    ex: &'a mut (dyn PluginExecution + Send),
+    params: &'a Value,
+) -> Pin<Box<dyn Future<Output = Result<StepOutput, StepError>> + Send + 'a>> {
+    let cancel = ex.cancel_token();
+    Box::pin(async move {
+        let sleep_ms = params.get("sleep_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+        let shape = params
+            .get("shape")
+            .and_then(|v| v.as_str())
+            .unwrap_or("thrown");
+        tokio::select! {
+            _ = cancel.cancelled() => Err(match shape {
+                "failed" => StepError::Failed("host step cancelled by token".to_string()),
+                _ => StepError::Thrown(PluginErrorPayload {
+                    code: "host_cancelled".to_string(),
+                    message: "host step observed the cancellation token".to_string(),
+                    params: json!({}),
+                }),
+            }),
+            _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {
+                Ok(StepOutput::from(json!({ "slept_ms": sleep_ms })))
+            }
+        }
     })
 }
 
@@ -399,6 +442,169 @@ async fn cancellation_stops_wave_scheduler_between_steps() {
         }
         other => panic!("expected KernelError::Cancelled, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Deadline vs caller cancel: what the wrapper reports
+// ---------------------------------------------------------------------------
+
+/// Build the one-step `fail_on_cancel` action used by the remap tests.
+fn fail_on_cancel_action(shape: &str, sleep_ms: u64, wallclock_ms: Option<u64>) -> Action {
+    let mut a = action(vec![step(
+        "host",
+        "test_resource_limits_fixture.fail_on_cancel",
+        json!({ "sleep_ms": sleep_ms, "shape": shape }),
+    )]);
+    a.wallclock_timeout_ms = wallclock_ms;
+    a
+}
+
+/// The watchdog fires the token; the host step answers with a
+/// structured `PluginError` carrying its own cancellation code. The
+/// caller must still see `ExecutionTimeout`: the deadline is what
+/// stopped the action, whatever shape the stop took on the way out.
+/// (Gwead issue #1 — before the fix the `PluginError` passed through
+/// and read as a caller-requested cancel.)
+#[tokio::test(flavor = "multi_thread")]
+async fn deadline_remaps_structured_step_error_to_execution_timeout() {
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action(
+            "p",
+            "go",
+            fail_on_cancel_action("thrown", 5_000, Some(80)),
+        )],
+    );
+
+    let err = kernel
+        .execute("p", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("declared cap < step sleep must trip the deadline");
+    match err {
+        KernelError::ExecutionTimeout { timeout_ms } => assert_eq!(timeout_ms, 80),
+        other => panic!("expected ExecutionTimeout, got: {other:?}"),
+    }
+}
+
+/// Same as above with the plain-failure shape: a step whose error is
+/// an ordinary `Execution` message mentioning cancellation (the
+/// flattened nested-`invoke` shape) is also the watchdog's doing.
+#[tokio::test(flavor = "multi_thread")]
+async fn deadline_remaps_plain_step_failure_to_execution_timeout() {
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action(
+            "p",
+            "go",
+            fail_on_cancel_action("failed", 5_000, Some(80)),
+        )],
+    );
+
+    let err = kernel
+        .execute("p", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("declared cap < step sleep must trip the deadline");
+    match err {
+        KernelError::ExecutionTimeout { timeout_ms } => assert_eq!(timeout_ms, 80),
+        other => panic!("expected ExecutionTimeout, got: {other:?}"),
+    }
+}
+
+/// The mirror image: the *caller* fires the token well inside the
+/// deadline. The step's own error must pass through untouched — the
+/// remap is keyed on the watchdog having fired, not on the token.
+#[tokio::test(flavor = "multi_thread")]
+async fn caller_cancel_leaves_step_error_untouched() {
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action(
+            "p",
+            "go",
+            fail_on_cancel_action("thrown", 5_000, Some(10_000)),
+        )],
+    );
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        trigger.cancel();
+    });
+
+    let err = kernel
+        .execute("p", "go", json!({}))
+        .with_config(&Value::Null)
+        .with_cancel(cancel)
+        .run()
+        .await
+        .expect_err("caller cancel must not run to completion");
+    match err {
+        KernelError::PluginError { code, .. } => assert_eq!(code, "host_cancelled"),
+        other => panic!("expected the step's own PluginError, got: {other:?}"),
+    }
+}
+
+/// Dataflow with a step that answers the token with its own error.
+/// The deadline arms two mechanisms at the same instant and either
+/// may win: the outer timeout drops the scheduler mid-flight (its own
+/// terminal emit never runs), or the watchdog's cancel lets the step
+/// fail, the scheduler emit its own `PipelineCompleted { ok: false }`,
+/// and the wrapper remap the `Err`. Either way the caller must see
+/// `ExecutionTimeout` and the handle must deliver exactly ONE
+/// terminator — the substitute emit is for a dropped future only, not
+/// for any `ExecutionTimeout` result.
+#[tokio::test(flavor = "multi_thread")]
+async fn dataflow_deadline_answered_by_step_emits_one_terminator() {
+    let mut a = action(vec![{
+        let mut m = step(
+            "host",
+            "test_resource_limits_fixture.fail_on_cancel",
+            json!({ "sleep_ms": 5_000u64, "shape": "thrown" }),
+        );
+        m.long_running = true;
+        m
+    }]);
+    a.dataflow = true;
+    a.wallclock_timeout_ms = Some(80);
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action("p", "pipeline", a)],
+    );
+
+    let mut handle = kernel
+        .execute("p", "pipeline", json!({}))
+        .with_config(&json!({}))
+        .into_dataflow_handle()
+        .expect("handle returned");
+
+    let err = handle
+        .result
+        .await
+        .expect("result delivered")
+        .expect_err("declared cap on dataflow action must still apply");
+    match err {
+        KernelError::ExecutionTimeout { timeout_ms } => assert_eq!(timeout_ms, 80),
+        other => panic!("expected ExecutionTimeout, got: {other:?}"),
+    }
+
+    // Every sender is gone once the pipeline task exits, so the drain
+    // ends on channel close; the outer timeout is a hang guard only.
+    let mut terminators = 0;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(ev) = handle.events.recv().await {
+            if let gwead::kernel::DataflowEvent::PipelineCompleted { ok } = ev {
+                assert!(!ok, "a deadline-stopped pipeline is not ok");
+                terminators += 1;
+            }
+        }
+    })
+    .await
+    .expect("events channel closes after the pipeline task exits");
+    assert_eq!(terminators, 1, "exactly one PipelineCompleted per pipeline");
 }
 
 // ---------------------------------------------------------------------------

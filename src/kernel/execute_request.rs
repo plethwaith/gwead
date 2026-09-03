@@ -23,8 +23,9 @@ use tokio_util::sync::CancellationToken;
 use super::secrets::SecretResolver;
 use super::{
     ContinuousHandle, DataflowHandle, DataflowStreamingHandle, Kernel, KernelError,
-    exec_context::ExecutionContext, runtime::InvocationContext, streams::SharedStreamRegistry,
-    types::ActionResult, with_wallclock_timeout,
+    WallclockOutcome, exec_context::ExecutionContext, run_with_wallclock_timeout,
+    runtime::InvocationContext, streams::SharedStreamRegistry, types::ActionResult,
+    with_wallclock_timeout,
 };
 
 /// `Value::Null` as a `'static` reference so the builder can default
@@ -325,22 +326,26 @@ impl<'a> ExecuteActionRequest<'a> {
                 ctx,
                 kernel.limits.clone(),
             );
-            let result = with_wallclock_timeout(fut, wallclock_timeout, watchdog_cancel).await;
-            // A wallclock timeout drops the scheduler future mid-flight,
-            // so the scheduler's own terminal emit never runs. Without
-            // this, an events subscriber keyed on `PipelineCompleted`
-            // would wait forever on a timed-out pipeline even though
-            // `handle.result` had resolved `Err`.
+            let WallclockOutcome { result, abandoned } =
+                run_with_wallclock_timeout(fut, wallclock_timeout, watchdog_cancel).await;
+            // The outer wallclock timeout drops the scheduler future
+            // mid-flight, so the scheduler's own terminal emit never
+            // runs. Without this, an events subscriber keyed on
+            // `PipelineCompleted` would wait forever on a timed-out
+            // pipeline even though `handle.result` had resolved `Err`.
             //
-            // **Only on the timeout path.** Guarding on `result.is_err()`
+            // **Only on the abandoned path.** Guarding on the result
             // would be wrong: an ordinary step failure emits the
             // terminator *and* returns `Err`, so every failing pipeline
-            // would deliver two. And a raw `send().await` on the bounded
-            // channel would mean that on a full, undrained events channel
-            // the second one blocks forever, so `result_tx` never fires
-            // and `handle.result` never resolves: precisely the hang
-            // `emit_terminal_event` exists to prevent.
-            if matches!(result, Err(super::KernelError::ExecutionTimeout { .. })) {
+            // would deliver two — and so would a pipeline whose step
+            // answered the watchdog's cancel with its own error, which
+            // the wrapper reports as `ExecutionTimeout` too. And a raw
+            // `send().await` on the bounded channel would mean that on
+            // a full, undrained events channel the second one blocks
+            // forever, so `result_tx` never fires and `handle.result`
+            // never resolves: precisely the hang `emit_terminal_event`
+            // exists to prevent.
+            if abandoned {
                 super::runtime_dataflow::emit_terminal_event(
                     Some(&events_tx_for_timeout),
                     super::DataflowEvent::PipelineCompleted { ok: false },
@@ -518,22 +523,26 @@ impl<'a> ExecuteActionRequest<'a> {
                 ctx,
                 kernel.limits.clone(),
             );
-            let result = with_wallclock_timeout(fut, wallclock_timeout, watchdog_cancel).await;
-            // A wallclock timeout drops the scheduler future mid-flight,
-            // so the scheduler's own terminal emit never runs. Without
-            // this, an events subscriber keyed on `PipelineCompleted`
-            // would wait forever on a timed-out pipeline even though
-            // `handle.result` had resolved `Err`.
+            let WallclockOutcome { result, abandoned } =
+                run_with_wallclock_timeout(fut, wallclock_timeout, watchdog_cancel).await;
+            // The outer wallclock timeout drops the scheduler future
+            // mid-flight, so the scheduler's own terminal emit never
+            // runs. Without this, an events subscriber keyed on
+            // `PipelineCompleted` would wait forever on a timed-out
+            // pipeline even though `handle.result` had resolved `Err`.
             //
-            // **Only on the timeout path.** Guarding on `result.is_err()`
+            // **Only on the abandoned path.** Guarding on the result
             // would be wrong: an ordinary step failure emits the
             // terminator *and* returns `Err`, so every failing pipeline
-            // would deliver two. And a raw `send().await` on the bounded
-            // channel would mean that on a full, undrained events channel
-            // the second one blocks forever, so `result_tx` never fires
-            // and `handle.result` never resolves: precisely the hang
-            // `emit_terminal_event` exists to prevent.
-            if matches!(result, Err(super::KernelError::ExecutionTimeout { .. })) {
+            // would deliver two — and so would a pipeline whose step
+            // answered the watchdog's cancel with its own error, which
+            // the wrapper reports as `ExecutionTimeout` too. And a raw
+            // `send().await` on the bounded channel would mean that on
+            // a full, undrained events channel the second one blocks
+            // forever, so `result_tx` never fires and `handle.result`
+            // never resolves: precisely the hang `emit_terminal_event`
+            // exists to prevent.
+            if abandoned {
                 super::runtime_dataflow::emit_terminal_event(
                     Some(&events_tx_for_timeout),
                     super::DataflowEvent::PipelineCompleted { ok: false },
