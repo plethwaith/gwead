@@ -402,8 +402,17 @@ async fn dispatch_trait_step_core(
         Err(StepError::Cancelled) => {
             // Not a failure: the step stopped because the invocation
             // was cancelled. The marker makes `step_failure_to_error`
-            // report `Cancelled` and keeps `try` from catching it.
-            tracing::debug!(step_id = %step_id, "Step stopped on cancellation");
+            // report `Cancelled` and keeps `try` from catching it. A
+            // step claiming cancellation while the token has not fired
+            // is misreporting itself, and that is worth a warning.
+            if state.cancel.is_cancelled() {
+                tracing::debug!(step_id = %step_id, "Step stopped on cancellation");
+            } else {
+                tracing::warn!(
+                    step_id = %step_id,
+                    "Step reported cancellation but the invocation's token has not fired"
+                );
+            }
             state.last_error = Some(format!("step '{step_id}' cancelled"));
             state.cancelled = true;
             0
@@ -1545,8 +1554,10 @@ async fn run_parallel(
 /// rejects the collision at register time, mirroring the
 /// step-id check above.
 ///
-/// Error fields and the `return` signal take first-non-`None` in merge
-/// (declaration) order.
+/// The `return` signal takes first-non-`None` in merge (declaration)
+/// order. Failure markers come from the first failed branch only
+/// (`takes_failure`), overwriting the canonical state; a resource
+/// violation merges from any branch.
 fn merge_parallel_branch_state(
     canonical: &mut Store<ExecutionState>,
     task_state: ExecutionState,
@@ -1589,8 +1600,7 @@ fn merge_parallel_branch_state(
     // them the way a direct step would. A later branch's richer marker
     // cannot outrank the first branch's plainer one this way. The one
     // exception is a resource violation, merged from any branch and
-    // preferred by `step_failure_to_error`: a later branch's fuel
-    // exhaustion reports with the first failed branch's message.
+    // preferred by `step_failure_to_error`.
     if takes_failure {
         canonical_state.last_error = task_state.last_error;
         canonical_state.plugin_error = task_state.plugin_error;

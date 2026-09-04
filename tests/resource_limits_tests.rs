@@ -1210,14 +1210,11 @@ async fn handle_driven_dataflow_parent_invoking_a_dataflow_callee_winds_down() {
     assert_eq!(sequence, ["completed:call:false", "pipeline:false"]);
 }
 
-/// A `parallel` inside a `finally` supersedes the failure the `try`
-/// body left behind, the way a direct step in the `finally` does. The
-/// merge must take the first failed branch's markers over whatever the
-/// canonical state already held.
-#[tokio::test(flavor = "multi_thread")]
-async fn parallel_in_finally_supersedes_the_try_bodys_failure() {
-    let [callee, _] = invoke_chain_manifests("boom");
-    let caller = r#"{
+/// Caller manifest for the finally-supersedes tests: each action's
+/// `try` body throws, and its `finally` runs a `parallel` whose one
+/// branch fails in a different way.
+fn finally_parallel_caller() -> &'static str {
+    r#"{
         "name": "caller",
         "permissions": ["invoke:plugin:callee"],
         "actions": {
@@ -1242,11 +1239,20 @@ async fn parallel_in_finally_supersedes_the_try_bodys_failure() {
                 }}]
             }
         }
-    }"#;
+    }"#
+}
+
+/// A `parallel` inside a `finally` supersedes the failure the `try`
+/// body left behind, the way a direct step in the `finally` does: the
+/// merge must take the first failed branch's markers over whatever the
+/// canonical state already held. Here the branch throws.
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_in_finally_supersedes_the_try_bodys_failure_with_a_thrown_error() {
+    let [callee, _] = invoke_chain_manifests("boom");
     let kernel = boot_with_config_and_json(
         KernelConfig::default().with_limits(RuntimeLimits::default()),
         vec![],
-        &[&callee, caller],
+        &[&callee, finally_parallel_caller()],
     );
 
     let err = kernel
@@ -1259,6 +1265,18 @@ async fn parallel_in_finally_supersedes_the_try_bodys_failure() {
         KernelError::PluginError { code, .. } => assert_eq!(code, "E_FIN"),
         other => panic!("expected the finally branch's PluginError, got: {other:?}"),
     }
+}
+
+/// Same, with the branch's failure being a callee's: the typed error
+/// must survive the merge too.
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_in_finally_supersedes_the_try_bodys_failure_with_a_callee_error() {
+    let [callee, _] = invoke_chain_manifests("boom");
+    let kernel = boot_with_config_and_json(
+        KernelConfig::default().with_limits(RuntimeLimits::default()),
+        vec![],
+        &[&callee, finally_parallel_caller()],
+    );
 
     let err = kernel
         .execute("caller", "callee", json!({}))
