@@ -3553,7 +3553,8 @@ impl Kernel {
     /// logged at `warn` as well. A callee its caller cancels ends the
     /// stream with a plain EOF — except at the very end of an inherited
     /// budget, where the caller's cancel and the callee's own watchdog
-    /// race and the stream may end with the deadline item instead.
+    /// race and the stream may instead end with an error item that
+    /// reports the callee's deadline.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_action_invoked_streaming(
         self: &Arc<Self>,
@@ -3654,14 +3655,14 @@ impl Kernel {
         // once the channel is exhausted. Written before the held
         // sender drops, so the channel's close orders it ahead of the
         // read that finds it.
-        //
-        // Fused: a consumer that takes this source out of the registry polls
-        // it directly, and an `Unfold` panics if polled past its end. Reads
-        // through the registry are guarded separately, in `read_async`, and
-        // that guard also covers sources an embedder registers unfused — so
-        // neither guard makes the other redundant.
         let outcome: Arc<std::sync::Mutex<Option<std::io::Error>>> = Default::default();
         let outcome_for_reader = Arc::clone(&outcome);
+        // Fused: a consumer that takes this source out of the parent's
+        // registry polls it directly, and an `Unfold` panics if polled
+        // past its end. Reads through the registry are guarded
+        // separately, in `read_async`, and that guard also covers
+        // sources an embedder registers unfused — so neither guard
+        // makes the other redundant.
         let recv_source: self::streams::ReadableSource =
             Box::pin(futures::StreamExt::fuse(futures::stream::unfold(
                 (receiver, outcome_for_reader),
@@ -3759,6 +3760,8 @@ impl Kernel {
             // and the caller may return before the callee ends.
             let result = with_wallclock_timeout(fut, wallclock.cap(), callee_cancel).await;
             match result {
+                // Ended cleanly: nothing to record. The drop below ends
+                // the stream with a plain EOF.
                 Ok(_) => {}
                 // A cancelled callee is the caller's doing, not a
                 // failure worth a warning.
@@ -4839,7 +4842,6 @@ impl WallclockCap {
 /// Whose wallclock bound applies to a callee — see
 /// [`Kernel::callee_wallclock`] for the decision and what each arm
 /// means for enforcement.
-#[derive(Debug, Clone, Copy)]
 pub(crate) enum CalleeWallclock {
     /// The callee's own cap ends first (or its caller is uncapped):
     /// armed as its own watchdog.
@@ -6147,7 +6149,8 @@ mod wallclock_timeout_tests {
     }
 
     /// Everything a relay's readable yields until EOF, within two
-    /// seconds.
+    /// seconds — and one poll past it, which the readable's fuse keeps
+    /// at `None`.
     async fn drain_relay(
         source: &mut streams::ReadableSource,
     ) -> Vec<Result<bytes::Bytes, std::io::Error>> {
@@ -6168,8 +6171,7 @@ mod wallclock_timeout_tests {
     }
 
     /// Spawn `budget.relay` as a streaming callee under `parent_deadline`
-    /// and hand back the parent's readable end. The resolver handed on
-    /// is the kernel's, as a real parent invocation would.
+    /// with no parent token, and hand back the parent's readable end.
     async fn spawn_relay(
         kernel: &Arc<Kernel>,
         parent_deadline: Option<tokio::time::Instant>,
@@ -6177,7 +6179,9 @@ mod wallclock_timeout_tests {
         spawn_relay_under(kernel, parent_deadline, None).await
     }
 
-    /// [`spawn_relay`] with a parent token as well.
+    /// Spawn `budget.relay` as a streaming callee under `parent_deadline`
+    /// and `parent_cancel`, handing on the kernel's resolver as a real
+    /// parent invocation would, and hand back the parent's readable end.
     async fn spawn_relay_under(
         kernel: &Arc<Kernel>,
         parent_deadline: Option<tokio::time::Instant>,

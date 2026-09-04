@@ -158,10 +158,13 @@ workload — if you run manifests you did not author, set them:
   manifest declaring `wallclockTimeoutMs` replaces it in either direction, and
   a top-level `dataflow: true` action runs unbounded. That default exists
   because a streaming pipeline legitimately runs for days and the kernel cannot
-  tell which of your actions those are. (An action reached as a *callee* is
-  bounded by its caller's remaining budget whatever it declares, so the
-  unbounded case is only ever a pipeline the embedder started itself.) Set the
-  ceiling and a manifest may still lower its own deadline but not raise it.
+  tell which of your actions those are. A callee is bounded by its caller's
+  remaining budget when the caller has one — but a callee of an *unbounded*
+  pipeline has nothing to inherit and is bounded as at top level, so an
+  undeclared dataflow callee under it is unbounded too: one unbounded pipeline
+  can hold an unbounded tree of them. The ceiling clamps all of it, the dataflow
+  uncap included; that is the reason to set it. A manifest under the ceiling
+  may still lower its own deadline but not raise it.
 - **`RuntimeLimits::max_step_results_bytes`** — default 64 MiB. Step results
   are host memory, not wasm memory, and they compose: a chain of steps each
   referencing the previous result twice doubles per line. The bound is

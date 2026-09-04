@@ -364,8 +364,9 @@ impl StreamRegistry {
     /// EOF means the outcome is known (the outcome itself travels
     /// beside the channel, not through this). Drop it when the stream
     /// may end. `None` for an unknown handle, a readable, or a closed
-    /// stream.
-    pub fn writable_sender(&self, id: StreamId) -> Option<WritableSender> {
+    /// stream. Crate-private: an embedder holding senders would defer
+    /// every EOF it forgot to drop, and nothing outside needs one.
+    pub(crate) fn writable_sender(&self, id: StreamId) -> Option<WritableSender> {
         let state = self.streams.get(&id)?;
         let inner = state.lock_inner();
         if inner.closed {
@@ -1325,6 +1326,10 @@ mod tests {
             while let Some(item) = src.next().await {
                 buf.extend_from_slice(&item.unwrap());
             }
+            // A taken branch is polled directly, past the read path's
+            // guard: its fuse is what keeps one poll past the end from
+            // panicking.
+            assert!(src.next().await.is_none(), "fused: stays None past the end");
             buf
         };
 

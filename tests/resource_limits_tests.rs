@@ -1600,10 +1600,11 @@ async fn callee_failure_stays_typed_through_two_hops() {
     }
 }
 
-/// The shape the docs promise for a deadline two levels down: the
-/// leaf's own cap fires, and each level above wraps it in its own
-/// `CalleeFailed` rather than the remap collapsing it — neither the
-/// middle nor the root had reached its deadline.
+/// The shape `Kernel::callee_wallclock` promises for a deadline two
+/// levels down: the leaf's own cap fires, and each level above wraps
+/// it in its own `CalleeFailed` rather than the wrapper's remap
+/// collapsing it — neither the middle nor the root had reached its
+/// deadline.
 #[tokio::test(flavor = "multi_thread")]
 async fn callee_deadline_stays_typed_through_two_hops() {
     let kernel = boot_callee_budget();
@@ -1653,7 +1654,8 @@ async fn callee_deadline_stays_typed_through_two_hops() {
 
 /// The streaming handle path — the one whose long-running step's bytes
 /// flow out to the embedder — passes its cap to a callee like the
-/// other handle path does.
+/// other handle path does. Its output is also polled once past the
+/// end, which its fuse keeps at `None`.
 #[tokio::test(flavor = "multi_thread")]
 async fn capped_pipeline_on_the_streaming_handle_path_bounds_its_callee() {
     let kernel = boot_callee_budget();
