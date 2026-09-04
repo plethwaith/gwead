@@ -151,6 +151,7 @@ pub(super) fn register(
                         exec_ctx,
                         parent_depth,
                         parent_cancel,
+                        parent_deadline,
                     ) = {
                         let d = caller.data();
                         (
@@ -160,6 +161,7 @@ pub(super) fn register(
                             d.parent_exec_ctx.clone(),
                             d.parent_invoke_depth,
                             d.cancel.clone(),
+                            d.parent_deadline,
                         )
                     };
 
@@ -264,6 +266,7 @@ pub(super) fn register(
                             &exec_ctx,
                             parent_depth,
                             Some(parent_cancel),
+                            parent_deadline,
                         )
                         .await;
 
@@ -450,6 +453,7 @@ pub(super) fn register(
                         parent_depth,
                         streams_arc,
                         parent_cancel,
+                        parent_deadline,
                     ) = {
                         let d = caller.data();
                         (
@@ -460,6 +464,7 @@ pub(super) fn register(
                             d.parent_invoke_depth,
                             d.streams.clone(),
                             d.cancel.clone(),
+                            d.parent_deadline,
                         )
                     };
 
@@ -564,6 +569,7 @@ pub(super) fn register(
                             streams_arc,
                             parent_depth,
                             Some(parent_cancel),
+                            parent_deadline,
                         )
                         .await;
 

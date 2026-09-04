@@ -72,6 +72,16 @@ pub struct InvocationContext {
     /// action returns — an embedder that pulls a body stream handle out
     /// of the result after the action completes relies on this.
     pub drain_streams: bool,
+    /// The end of this invocation's wallclock budget, if it has one:
+    /// when its watchdog fires, or — for a callee bounded by its
+    /// caller — when the caller's does. Set by the entry point that
+    /// arms the watchdog (see `Kernel::wallclock_cap` and
+    /// `Kernel::callee_wallclock`) and read by the `invoke`
+    /// paths to bound a callee by the caller's *remaining* budget: a
+    /// callee cannot outlive the invocation that asked for it. `None`
+    /// is an uncapped invocation — a top-level dataflow pipeline with
+    /// no declaration and no operator ceiling.
+    pub deadline: Option<tokio::time::Instant>,
     /// External cancellation surface. `None` means "no
     /// external cancel" — the runtime makes a fresh never-cancelled
     /// token internally. `Some(token)` is the form
@@ -129,6 +139,7 @@ impl InvocationContext {
             kernel,
             trigger: None,
             drain_streams: true,
+            deadline: None,
             cancel: None,
             dataflow_events: None,
             pre_allocated_outputs: None,
@@ -634,6 +645,7 @@ impl WasmRuntime {
             step_type_access: ctx.step_type_access,
             secret_resolver: ctx.secret_resolver,
             limits: limits.clone(),
+            deadline: ctx.deadline,
             cancel: ctx.cancel,
             dataflow_events: ctx.dataflow_events,
         });
@@ -2487,6 +2499,7 @@ mod dispatch_trait_step_tests {
             kernel,
             trigger: None,
             limits: RuntimeLimits::default(),
+            deadline: None,
             cancel: None,
             dataflow_events: None,
         })

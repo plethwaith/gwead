@@ -306,6 +306,17 @@ fn parent_state(
     caller_config: Value,
     exec_ctx: ExecutionContext,
 ) -> ExecutionState {
+    parent_state_with_deadline(kernel, caller_config, exec_ctx, None)
+}
+
+/// [`parent_state`] under a wallclock deadline, for the tests that
+/// check the callee inherits it.
+fn parent_state_with_deadline(
+    kernel: &Arc<Kernel>,
+    caller_config: Value,
+    exec_ctx: ExecutionContext,
+    deadline: Option<tokio::time::Instant>,
+) -> ExecutionState {
     let parent_action: Action = serde_json::from_value(json!({ "steps": [] })).unwrap();
     let engine = wasmtime::Engine::new(wasmtime::Config::new().consume_fuel(true))
         .expect("engine constructs");
@@ -326,9 +337,90 @@ fn parent_state(
         kernel: Some(Arc::downgrade(kernel)),
         trigger: None,
         limits: RuntimeLimits::default(),
+        deadline,
         cancel: None,
         dataflow_events: None,
     })
+}
+
+/// Test-only step type reporting the deadline its invocation runs
+/// under, so a dispatched callee can say what it inherited.
+fn report_deadline_step<'a>(
+    ex: &'a mut (dyn super::host_api::PluginExecution + Send),
+    _params: &'a Value,
+) -> Pin<
+    Box<
+        dyn Future<Output = Result<super::host_api::StepOutput, super::host_api::StepError>>
+            + Send
+            + 'a,
+    >,
+> {
+    let deadline = ex.wallclock_deadline();
+    Box::pin(async move {
+        let remaining_ms = deadline.map(|d| {
+            d.saturating_duration_since(tokio::time::Instant::now())
+                .as_millis() as u64
+        });
+        Ok(super::host_api::StepOutput::from(json!({
+            "has_deadline": deadline.is_some(),
+            "remaining_ms": remaining_ms,
+        })))
+    })
+}
+
+/// A `dispatch_role` callee is bounded by the dispatching invocation's
+/// remaining budget, the same as an `invoke` step's: the snapshot
+/// carries the caller's deadline across the seam and the callee's
+/// step sees it.
+#[tokio::test(flavor = "multi_thread")]
+async fn dispatched_callee_inherits_the_callers_deadline() {
+    let mut config = KernelConfig::default();
+    config
+        .native_step_impls
+        .insert("test.probe.report_deadline", report_deadline_step)
+        .expect("fresh table");
+    let mut k = Kernel::boot(config).expect("kernel boots");
+    let mut caller = manifest("test_caller", &[], IndexMap::new());
+    caller.permissions = vec!["invoke:role:*".to_string()];
+    k.register_plugin(caller).expect("caller registers");
+    k.register_plugin_from_json(
+        r#"{
+            "name": "probe",
+            "version": "0.0.0",
+            "roles": ["PROBE"],
+            "stepTypeDefs": [{"name": "probe.report_deadline", "freelyUsable": true}],
+            "stepTypeImpls": [{"stepType": "probe.report_deadline", "kind": "native",
+                               "implRef": "test.probe.report_deadline"}],
+            "actions": {
+                "report": {"steps": [{"id": "r", "type": "probe.report_deadline", "params": {}}]}
+            }
+        }"#,
+    )
+    .expect("probe registers");
+    let kernel = k.into_arc();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let state = parent_state_with_deadline(
+        &kernel,
+        Value::Null,
+        ExecutionContext::default(),
+        Some(deadline),
+    );
+    let result = kernel
+        .dispatch_role(&state, "PROBE", "report", json!({}), json!(null))
+        .await
+        .expect("dispatch succeeds");
+    assert_eq!(
+        result.output["has_deadline"],
+        json!(true),
+        "{}",
+        result.output
+    );
+    let remaining = result.output["remaining_ms"].as_u64().expect("a number");
+    assert!(
+        (2_500..=5_000).contains(&remaining),
+        "the callee's budget is the caller's 5 s less what dispatch spent: {remaining}"
+    );
 }
 
 /// Extract the message from a [`KernelError::PluginError`] or panic
@@ -674,6 +766,7 @@ async fn trait_dispatch_role_without_kernel_back_ref_errors_cleanly() {
         kernel: None, // ← the case under test
         trigger: None,
         limits: RuntimeLimits::default(),
+        deadline: None,
         cancel: None,
         dataflow_events: None,
     });

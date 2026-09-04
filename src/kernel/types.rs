@@ -571,7 +571,8 @@ pub struct Action {
     /// or the `defaultWallclockTimeoutMs` key of `KernelConfig::settings`
     /// when the embedder supplies one.
     ///
-    /// Precedence at every `Kernel::execute_action*` entry point:
+    /// Precedence for a top-level invocation (an `ExecuteActionRequest`
+    /// terminal, or an event dispatch):
     ///
     /// 0. `RuntimeLimits::max_wallclock_timeout`, when the operator set
     ///    one, clamps whatever the rest of this list produces.
@@ -589,6 +590,19 @@ pub struct Action {
     /// (e.g. "this transcoding should never legitimately take more
     /// than 2 hours; if it does, kill it") declare the cap here
     /// explicitly. The two-hour case is `wallclockTimeoutMs: 7200000`.
+    ///
+    /// **Invoked as a callee** — reached through an `invoke` or alias
+    /// step, `dispatch_role`, or a guest's `io.invoke` or
+    /// `io.invoke_streaming` — and the caller
+    /// has a deadline, the action is bounded by the caller's
+    /// *remaining* budget instead of cases 2 and 3: a declaration still
+    /// applies (clamped to what the caller has left), but a dataflow
+    /// callee is not uncapped and an undeclared callee is not cut to
+    /// the deployment default. A callee of an *uncapped* caller has no
+    /// budget to inherit and is bounded exactly as at top level. A
+    /// callee's own deadline surfaces in the caller as a failed step
+    /// (`CalleeFailed` wrapping `ExecutionTimeout`), not as the
+    /// caller's cancellation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wallclock_timeout_ms: Option<u64>,
 

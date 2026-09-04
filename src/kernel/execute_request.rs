@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use super::secrets::SecretResolver;
 use super::{
     ContinuousHandle, DataflowEvent, DataflowHandle, DataflowStreamingHandle, Kernel, KernelError,
-    WallclockOutcome, exec_context::ExecutionContext, run_with_wallclock_timeout,
+    WallclockCap, WallclockOutcome, exec_context::ExecutionContext, run_with_wallclock_timeout,
     runtime::InvocationContext, runtime_dataflow::emit_terminal_event,
     streams::SharedStreamRegistry, types::ActionResult, with_wallclock_timeout,
 };
@@ -206,6 +206,9 @@ impl<'a> ExecuteActionRequest<'a> {
             .await?;
         ctx.secret_resolver = secret_resolver;
 
+        let wallclock = kernel.wallclock_cap(&registration.action);
+        ctx.deadline = wallclock.map(|cap| cap.deadline);
+
         let fut = kernel.runtime.execute_dag(
             self.plugin_name,
             &registration.action,
@@ -218,12 +221,7 @@ impl<'a> ExecuteActionRequest<'a> {
             ctx,
             kernel.limits.clone(),
         );
-        with_wallclock_timeout(
-            fut,
-            kernel.effective_wallclock_timeout(&registration.action),
-            invocation_cancel,
-        )
-        .await
+        with_wallclock_timeout(fut, wallclock, invocation_cancel).await
     }
 
     /// Spawn a streaming-dataflow pipeline and return a
@@ -282,12 +280,6 @@ impl<'a> ExecuteActionRequest<'a> {
         let config_owned = self.config.clone();
         let exec_ctx_owned = self.exec_ctx.unwrap_or_default();
 
-        // Per-action wallclock decision. Dataflow actions with no
-        // declared `wallclock_timeout_ms` run uncapped and rely on
-        // cooperative cancellation via the action's `CancellationToken`.
-        let wallclock_timeout = self
-            .kernel
-            .effective_wallclock_timeout(&registration.action);
         let join = tokio::spawn(async move {
             let mut ctx = InvocationContext::top_level(Some(Arc::downgrade(&kernel)));
             ctx.step_type_access = kernel.step_type_access_for(&plugin_owned);
@@ -318,6 +310,13 @@ impl<'a> ExecuteActionRequest<'a> {
                 }
             };
 
+            // Per-action wallclock decision, armed after the pre-flight
+            // awaits so the budget starts with the action. Dataflow
+            // actions with no declared `wallclock_timeout_ms` run
+            // uncapped and rely on cooperative cancellation via the
+            // action's `CancellationToken`.
+            let wallclock = kernel.wallclock_cap(&registration.action);
+            ctx.deadline = wallclock.map(|cap| cap.deadline);
             let fut = kernel.runtime.execute_dag(
                 &plugin_owned,
                 &registration.action,
@@ -332,7 +331,7 @@ impl<'a> ExecuteActionRequest<'a> {
             );
             let result = run_dataflow_under_wallclock(
                 fut,
-                wallclock_timeout,
+                wallclock,
                 watchdog_cancel,
                 &events_tx_for_timeout,
             )
@@ -436,10 +435,17 @@ impl<'a> ExecuteActionRequest<'a> {
                 super::streams::STREAM_FANOUT_CAPACITY,
             )
         };
-        let output: super::streams::ReadableSource =
-            Box::pin(futures::stream::unfold(receiver, |mut rx| async move {
+        // Fused: this readable never enters a registry — it is built from
+        // the raw receiver and moved straight into the handle — so the
+        // sticky-EOF guard in `read_async` can never apply to it, and the
+        // embedder polls it directly. An `Unfold` panics if polled past
+        // its end; the fuse is the only thing standing between a
+        // one-poll-too-many and a panic in the embedder.
+        let output: super::streams::ReadableSource = Box::pin(futures::StreamExt::fuse(
+            futures::stream::unfold(receiver, |mut rx| async move {
                 rx.recv().await.map(|item| (item, rx))
-            }));
+            }),
+        ));
 
         let mut pre_allocated = std::collections::HashMap::new();
         pre_allocated.insert(producer_step_id, writable_id);
@@ -462,11 +468,8 @@ impl<'a> ExecuteActionRequest<'a> {
         let config_owned = self.config.clone();
         let exec_ctx_owned = self.exec_ctx.unwrap_or_default();
 
-        let wallclock_timeout = self
-            .kernel
-            .effective_wallclock_timeout(&registration.action);
         let join = tokio::spawn(async move {
-            let ctx = InvocationContext {
+            let mut ctx = InvocationContext {
                 step_type_access: kernel.step_type_access_for(&plugin_owned),
                 streams: Some(streams),
                 invoke_depth: 0,
@@ -474,6 +477,8 @@ impl<'a> ExecuteActionRequest<'a> {
                 kernel: kernel.self_weak.get().cloned(),
                 trigger: None,
                 drain_streams: true,
+                // Set once the cap is armed, below.
+                deadline: None,
                 cancel: Some(driver_cancel.clone()),
                 dataflow_events: Some(events_tx.clone()),
                 pre_allocated_outputs: Some(pre_allocated),
@@ -503,6 +508,13 @@ impl<'a> ExecuteActionRequest<'a> {
                 }
             };
 
+            // Per-action wallclock decision, armed after the pre-flight
+            // awaits so the budget starts with the action. Dataflow
+            // actions with no declared `wallclock_timeout_ms` run
+            // uncapped and rely on cooperative cancellation via the
+            // action's `CancellationToken`.
+            let wallclock = kernel.wallclock_cap(&registration.action);
+            ctx.deadline = wallclock.map(|cap| cap.deadline);
             let fut = kernel.runtime.execute_dag(
                 &plugin_owned,
                 &registration.action,
@@ -517,7 +529,7 @@ impl<'a> ExecuteActionRequest<'a> {
             );
             let result = run_dataflow_under_wallclock(
                 fut,
-                wallclock_timeout,
+                wallclock,
                 watchdog_cancel,
                 &events_tx_for_timeout,
             )
@@ -675,7 +687,7 @@ impl<'a> ExecuteActionRequest<'a> {
 /// resolve — precisely the hang that helper exists to prevent.
 async fn run_dataflow_under_wallclock<F>(
     fut: F,
-    wallclock_timeout: Option<std::time::Duration>,
+    cap: Option<WallclockCap>,
     watchdog_cancel: CancellationToken,
     events_tx: &tokio::sync::mpsc::Sender<DataflowEvent>,
 ) -> Result<ActionResult, KernelError>
@@ -683,7 +695,7 @@ where
     F: std::future::Future<Output = Result<ActionResult, KernelError>>,
 {
     let WallclockOutcome { result, abandoned } =
-        run_with_wallclock_timeout(fut, wallclock_timeout, watchdog_cancel).await;
+        run_with_wallclock_timeout(fut, cap, watchdog_cancel).await;
     if abandoned {
         emit_terminal_event(
             Some(events_tx),

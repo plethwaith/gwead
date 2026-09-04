@@ -173,6 +173,7 @@ pub(super) async fn execute_dag_dataflow(
         trigger: ctx.trigger,
         secret_resolver: ctx.secret_resolver,
         limits: limits.clone(),
+        deadline: ctx.deadline,
         cancel: Some(cancel.clone()),
         dataflow_events: dataflow_events.clone(),
         step_type_access: ctx.step_type_access.clone(),
@@ -670,10 +671,16 @@ fn provision_dataflow_streams(
         // The unfolded stream resolves to None when the writable sender's
         // refcount drops to zero — i.e. when the producer drops its handle —
         // signalling EOF to downstream consumers naturally.
-        let recv_source: ReadableSource =
-            Box::pin(futures::stream::unfold(receiver, |mut rx| async move {
+        // Fused: a consumer that takes this source out of the registry polls
+        // it directly, and an `Unfold` panics if polled past its end. Reads
+        // through the registry are guarded separately, in `read_async`, and
+        // that guard also covers sources an embedder registers unfused — so
+        // neither guard makes the other redundant.
+        let recv_source: ReadableSource = Box::pin(futures::StreamExt::fuse(
+            futures::stream::unfold(receiver, |mut rx| async move {
                 rx.recv().await.map(|item| (item, rx))
-            }));
+            }),
+        ));
 
         // Step 3: register the readable. Reads against this handle drain
         // chunks the producer pushed via `stream_write` on `writable_id`.

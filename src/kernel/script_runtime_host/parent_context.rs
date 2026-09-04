@@ -24,4 +24,7 @@ pub(crate) struct ScriptRuntimeParentContext {
     pub(crate) secret_resolver: Option<std::sync::Arc<dyn crate::kernel::secrets::SecretResolver>>,
     pub(crate) exec_ctx: crate::kernel::exec_context::ExecutionContext,
     pub(crate) invoke_depth: u32,
+    /// The parent's wallclock deadline, so a callee `io.invoke`
+    /// dispatches is bounded by the parent's remaining budget.
+    pub(crate) deadline: Option<tokio::time::Instant>,
 }

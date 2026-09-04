@@ -356,6 +356,28 @@ impl StreamRegistry {
         (id, rx)
     }
 
+    /// A sender of your own for a writable stream — a clone of the one
+    /// the stream's owner writes through. The paired receiver sees EOF
+    /// only once *every* sender is gone, so holding this keeps the
+    /// stream open past the owner's `close`: the kernel holds one for
+    /// a spawned streaming callee until the callee has ended, so that
+    /// EOF means the outcome is known (the outcome itself travels
+    /// beside the channel, not through this). Drop it when the stream
+    /// may end. `None` for an unknown handle, a readable, or a closed
+    /// stream. Crate-private: an embedder holding senders would defer
+    /// every EOF it forgot to drop, and nothing outside needs one.
+    pub(crate) fn writable_sender(&self, id: StreamId) -> Option<WritableSender> {
+        let state = self.streams.get(&id)?;
+        let inner = state.lock_inner();
+        if inner.closed {
+            return None;
+        }
+        match &inner.direction {
+            StreamDirection::Writable { sink } => Some(sink.clone()),
+            StreamDirection::Readable { .. } => None,
+        }
+    }
+
     /// Mark a stream closed and drop its direction state. Subsequent
     /// lookups still find the state (so handle errors map to `CLOSED`
     /// rather than `INVALID_HANDLE`), but the underlying source /
@@ -534,10 +556,17 @@ impl StreamRegistry {
         let mut branch_ids: Vec<StreamId> = Vec::with_capacity(n_branches);
         for _ in 0..n_branches {
             let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(channel_capacity);
-            let recv_source: ReadableSource =
-                Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            // Fused: a consumer that takes this branch out of the
+            // registry polls it directly, and an `Unfold` panics if
+            // polled past its end. Reads through the registry are
+            // guarded separately, in `read_async`, and that guard also
+            // covers sources an embedder registers unfused — so
+            // neither guard makes the other redundant.
+            let recv_source: ReadableSource = Box::pin(futures::StreamExt::fuse(
+                futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv().await.map(|item| (item, rx))
-                }));
+                }),
+            ));
             let id = self.next_handle();
             let state = StreamState::new(
                 id,
@@ -807,7 +836,25 @@ impl StreamState {
             None
         };
 
-        // Step 4: put source + leftover back unless closed.
+        // Step 4: put source + leftover back unless closed. EOF is
+        // sticky: an exhausted source is replaced by an empty one, so a
+        // guest that reads past EOF gets `STREAM_EOF` again rather than
+        // polling a finished stream. A source an embedder registers
+        // through `register_readable` may be anything — a bare
+        // `Unfold` panics when polled past its end — and a guest must
+        // not be able to panic its host with a loop that reads one
+        // time too many. The kernel's own channel-backed readables are
+        // fused at construction for the consumers that *take* the
+        // source and poll it directly, bypassing this path; that does
+        // not make this guard redundant, nor this guard those fuses.
+        //
+        // Only EOF sticks. After an IO error the source goes back as it
+        // is, on purpose: an error item does not end a source, and the
+        // `None` that follows it is what ends the stream — the guest
+        // sees the error code once and then EOF, which
+        // `read_reports_an_error_item_once_and_then_eof` pins. Making
+        // the error sticky too would turn one failed read into a
+        // stream that can never report its EOF.
         {
             let mut inner = self.lock_inner();
             if !inner.closed
@@ -816,7 +863,11 @@ impl StreamState {
                     leftover: cur_leftover,
                 } = &mut inner.direction
             {
-                *cur_source = source;
+                *cur_source = if eof {
+                    Box::pin(futures::stream::empty())
+                } else {
+                    source
+                };
                 *cur_leftover = new_leftover;
             }
         }
@@ -1141,6 +1192,52 @@ mod tests {
         assert_eq!(state.read_async(&mut buf).await, STREAM_CLOSED);
     }
 
+    /// EOF sticks. An embedder may register any source, and a bare
+    /// `Unfold` — used here on purpose, unfused — panics if polled
+    /// after it finishes; a guest reading one time too many must get
+    /// `STREAM_EOF` again, not a host panic.
+    #[tokio::test]
+    async fn read_past_eof_returns_eof_again_without_polling_the_source() {
+        let mut reg = StreamRegistry::new();
+        let source: ReadableSource = Box::pin(futures::stream::unfold(
+            Some(Bytes::from_static(b"hi")),
+            |state| async move { state.map(|chunk| (Ok(chunk), None)) },
+        ));
+        let id = reg.register_readable("application/octet-stream", source);
+        let state = reg.streams.get(&id).unwrap().clone();
+        let mut buf = [0u8; 8];
+        assert_eq!(state.read_async(&mut buf).await, 2);
+        assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
+        assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
+        assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
+    }
+
+    /// What a guest sees of a producer that fails: the error code once,
+    /// then EOF, and EOF again — an error item does not end the source,
+    /// so it is the following `None` that sticks.
+    #[tokio::test]
+    async fn read_reports_an_error_item_once_and_then_eof() {
+        let mut reg = StreamRegistry::new();
+        // An unfused `Unfold`, like the sibling test above, so the
+        // reads past its end are load-bearing: without the sticky EOF
+        // the fourth read would panic rather than return `STREAM_EOF`.
+        let items = vec![
+            Ok(Bytes::from_static(b"ab")),
+            Err(std::io::Error::other("upstream fell over")),
+        ];
+        let source: ReadableSource = Box::pin(futures::stream::unfold(
+            items.into_iter(),
+            |mut items| async move { items.next().map(|item| (item, items)) },
+        ));
+        let id = reg.register_readable("application/octet-stream", source);
+        let state = reg.streams.get(&id).unwrap().clone();
+        let mut buf = [0u8; 8];
+        assert_eq!(state.read_async(&mut buf).await, 2);
+        assert_eq!(state.read_async(&mut buf).await, STREAM_IO_ERROR);
+        assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
+        assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
+    }
+
     #[tokio::test]
     async fn write_async_sends_bytes_to_paired_receiver() {
         let mut reg = StreamRegistry::new();
@@ -1166,6 +1263,28 @@ mod tests {
         drop(rx);
         let state = reg.get(id).unwrap();
         assert_eq!(state.write_async(b"late").await, STREAM_CLOSED);
+    }
+
+    /// The property the kernel's streaming-callee EOF contract relies
+    /// on: a held sender keeps the receiver from EOF past the owner's
+    /// close, and the channel stays usable until it is dropped.
+    #[tokio::test]
+    async fn held_writable_sender_outlives_close_and_delivers() {
+        let mut reg = StreamRegistry::new();
+        let (id, mut rx) = reg.register_writable("application/octet-stream", 4);
+        let held = reg.writable_sender(id).expect("a writable has a sender");
+        reg.close(id);
+        assert!(reg.writable_sender(id).is_none(), "none after close");
+        assert!(held.send(Err(std::io::Error::other("boom"))).await.is_ok());
+        match rx.recv().await {
+            Some(Err(e)) => assert_eq!(e.to_string(), "boom"),
+            other => panic!("expected the error item, got: {other:?}"),
+        }
+        drop(held);
+        assert!(
+            rx.recv().await.is_none(),
+            "EOF once the last sender is gone"
+        );
     }
 
     #[test]
@@ -1208,6 +1327,10 @@ mod tests {
             while let Some(item) = src.next().await {
                 buf.extend_from_slice(&item.unwrap());
             }
+            // A taken branch is polled directly, past the read path's
+            // guard: its fuse is what keeps one poll past the end from
+            // panicking.
+            assert!(src.next().await.is_none(), "fused: stays None past the end");
             buf
         };
 
