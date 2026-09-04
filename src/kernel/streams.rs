@@ -845,6 +845,14 @@ impl StreamState {
         // fused at construction for the consumers that *take* the
         // source and poll it directly, bypassing this path; that does
         // not make this guard redundant, nor this guard those fuses.
+        //
+        // Only EOF sticks. After an IO error the source goes back as it
+        // is, on purpose: an error item does not end a source, and the
+        // `None` that follows it is what ends the stream — the guest
+        // sees the error code once and then EOF, which
+        // `read_reports_an_error_item_once_and_then_eof` pins. Making
+        // the error sticky too would turn one failed read into a
+        // stream that can never report its EOF.
         {
             let mut inner = self.lock_inner();
             if !inner.closed
@@ -1208,10 +1216,17 @@ mod tests {
     #[tokio::test]
     async fn read_reports_an_error_item_once_and_then_eof() {
         let mut reg = StreamRegistry::new();
-        let source: ReadableSource = Box::pin(futures::stream::iter(vec![
+        // An unfused `Unfold`, like the sibling test above, so the
+        // reads past its end are load-bearing: without the sticky EOF
+        // the fourth read would panic rather than return `STREAM_EOF`.
+        let items = vec![
             Ok(Bytes::from_static(b"ab")),
             Err(std::io::Error::other("upstream fell over")),
-        ]));
+        ];
+        let source: ReadableSource = Box::pin(futures::stream::unfold(
+            items.into_iter(),
+            |mut items| async move { items.next().map(|item| (item, items)) },
+        ));
         let id = reg.register_readable("application/octet-stream", source);
         let state = reg.streams.get(&id).unwrap().clone();
         let mut buf = [0u8; 8];

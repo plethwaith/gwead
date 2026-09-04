@@ -1252,10 +1252,10 @@ async fn handle_driven_dataflow_parent_invoking_a_dataflow_callee_winds_down() {
 /// then ignores the token for 5 s), `patient` (declares a generous cap
 /// and ignores the token for 5 s) and `boom` (throws). `mid` invokes
 /// the callee from an undeclared action, for the two-level chains. The
-/// caller's actions each reach one of them from under a different
-/// budget — directly, through `mid`, or from a pipeline on the handle
-/// paths — and one reaches the caller's own `probe_self` through an
-/// alias of its own.
+/// caller's actions reach them from under different budgets —
+/// directly, through `mid`, or from a pipeline on the handle paths —
+/// except `probe_self`, the caller's own report, which one action
+/// reaches through an alias of its own.
 fn callee_budget_manifests() -> [&'static str; 3] {
     let callee = r#"{
         "name": "callee",
@@ -1399,7 +1399,8 @@ fn boot_callee_budget() -> Arc<Kernel> {
 
 /// The remaining budget a `report_deadline` step recorded, from
 /// whichever value carries its output — an action's `output`, or the
-/// step result of the invoke that reached it.
+/// step result of the invoke that reached it. Asserts the step saw a
+/// deadline at all; an uncapped report is a test failure here.
 fn remaining_ms(report: &Value) -> u64 {
     assert_eq!(report["has_deadline"], json!(true), "report: {report}");
     report["remaining_ms"].as_u64().expect("a number")
@@ -1749,13 +1750,13 @@ fn slow_resolver_manifests() -> [&'static str; 2] {
         "usesSecrets": ["k"],
         "actions": {
             "probe_capped": {
-                "wallclockTimeoutMs": 1000,
+                "wallclockTimeoutMs": 2000,
                 "steps": [{"id": "report", "type": "test_resource_limits_fixture.report_deadline",
                             "params": {}}]
             },
             "pipeline_capped": {
                 "dataflow": true,
-                "wallclockTimeoutMs": 1000,
+                "wallclockTimeoutMs": 2000,
                 "steps": [{"id": "report", "type": "test_resource_limits_fixture.report_deadline",
                             "params": {}, "longRunning": true}]
             }
@@ -1787,8 +1788,9 @@ fn boot_slow_resolver() -> Arc<Kernel> {
 }
 
 /// The wallclock budget starts when the action does, after its
-/// secrets are pulled: a resolver that takes 300 ms of a 1 s cap does
-/// not eat into what the action's steps get. Pinned here at `run`, an
+/// secrets are pulled: a resolver that takes 300 ms of a 2 s cap does
+/// not eat into what the action's steps get (they see at least 1.8 s,
+/// never the 1.7 s a cap armed before the pull would leave). Pinned here at `run`, an
 /// inline invoke, and the dataflow handle, since each arms its cap
 /// separately; the spawned streaming path is pinned beside its own
 /// harness in the kernel's unit tests.
@@ -1804,8 +1806,8 @@ async fn resolver_latency_is_not_charged_to_the_budget() {
         .expect("runs");
     let remaining = remaining_ms(&top_level.output);
     assert!(
-        remaining >= 900,
-        "run(): the step sees the whole 1 s cap, not 1 s less the resolver: {remaining}"
+        remaining >= 1800,
+        "run(): the step sees the whole 2 s cap, not 2 s less the resolver: {remaining}"
     );
 
     let inline = kernel
@@ -1816,8 +1818,8 @@ async fn resolver_latency_is_not_charged_to_the_budget() {
         .expect("runs");
     let remaining = remaining_ms(&inline.step_results["call"]);
     assert!(
-        remaining >= 900,
-        "invoke: the callee's own 1 s cap starts after its secret pull: {remaining}"
+        remaining >= 1800,
+        "invoke: the callee's own 2 s cap starts after its secret pull: {remaining}"
     );
 
     let mut handle = kernel
@@ -1833,7 +1835,7 @@ async fn resolver_latency_is_not_charged_to_the_budget() {
     while handle.events.recv().await.is_some() {}
     let remaining = remaining_ms(&pipeline.step_results["report"]);
     assert!(
-        remaining >= 900,
+        remaining >= 1800,
         "dataflow handle: the cap is armed after the pull: {remaining}"
     );
 }

@@ -435,11 +435,12 @@ impl<'a> ExecuteActionRequest<'a> {
                 super::streams::STREAM_FANOUT_CAPACITY,
             )
         };
-        // Fused: a consumer that takes this source out of the registry polls
-        // it directly, and an `Unfold` panics if polled past its end. Reads
-        // through the registry are guarded separately, in `read_async`, and
-        // that guard also covers sources an embedder registers unfused — so
-        // neither guard makes the other redundant.
+        // Fused: this readable never enters a registry — it is built from
+        // the raw receiver and moved straight into the handle — so the
+        // sticky-EOF guard in `read_async` can never apply to it, and the
+        // embedder polls it directly. An `Unfold` panics if polled past
+        // its end; the fuse is the only thing standing between a
+        // one-poll-too-many and a panic in the embedder.
         let output: super::streams::ReadableSource = Box::pin(futures::StreamExt::fuse(
             futures::stream::unfold(receiver, |mut rx| async move {
                 rx.recv().await.map(|item| (item, rx))

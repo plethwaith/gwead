@@ -5992,7 +5992,9 @@ mod wallclock_timeout_tests {
     }
 
     /// A producer that writes `params.chunks` one-byte chunks and then
-    /// fails, without ever yielding to a consumer.
+    /// fails. Up to the channel's capacity, every write fits without a
+    /// consumer taking anything, so the chunks are all queued when the
+    /// failure is recorded.
     fn write_n_then_fail<'a>(
         ex: &'a mut (dyn host_api::PluginExecution + Send),
         params: &'a Value,
@@ -6166,7 +6168,8 @@ mod wallclock_timeout_tests {
     }
 
     /// Spawn `budget.relay` as a streaming callee under `parent_deadline`
-    /// and hand back the parent's readable end.
+    /// and hand back the parent's readable end. The resolver handed on
+    /// is the kernel's, as a real parent invocation would.
     async fn spawn_relay(
         kernel: &Arc<Kernel>,
         parent_deadline: Option<tokio::time::Instant>,
@@ -6174,8 +6177,7 @@ mod wallclock_timeout_tests {
         spawn_relay_under(kernel, parent_deadline, None).await
     }
 
-    /// [`spawn_relay`] with a parent token as well. The resolver is the
-    /// kernel's, as a real parent invocation would hand on.
+    /// [`spawn_relay`] with a parent token as well.
     async fn spawn_relay_under(
         kernel: &Arc<Kernel>,
         parent_deadline: Option<tokio::time::Instant>,
@@ -6280,17 +6282,20 @@ mod wallclock_timeout_tests {
         }
     }
 
-    /// The failure survives a full channel behind a slow consumer: the
-    /// producer fills the channel to capacity and fails; nobody reads
-    /// for longer than any delivery window; the consumer then drains
-    /// every chunk and still finds the failure after them. Recorded
-    /// beside the channel, the report has no window to miss.
+    /// The failure survives a full channel: the producer fills the
+    /// channel to capacity and fails while nobody is reading, and a
+    /// consumer that starts late still drains every chunk and finds
+    /// the failure after them. Recorded beside the channel rather than
+    /// sent through it, the report cannot be crowded out by the chunks
+    /// or by how late the consumer is.
     #[tokio::test(flavor = "multi_thread")]
     async fn spawned_streaming_callee_failure_survives_a_full_channel() {
         let capacity = streams::STREAM_FANOUT_CAPACITY;
         let kernel = kernel_with_relay(write_n_then_fail, &format!(r#"{{"chunks": {capacity}}}"#));
         let mut source = spawn_relay(&kernel, None).await;
-        tokio::time::sleep(WALLCLOCK_DROP_GRACE * 3).await;
+        // Late enough that the producer has filled the channel and
+        // failed before the first read.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let items = drain_relay(&mut source).await;
         let (chunks, rest) = items.split_at(capacity);
         assert!(
@@ -6339,7 +6344,8 @@ mod wallclock_timeout_tests {
 
     /// The spawned path pulls the callee's secrets before arming its
     /// cap, like every other entry point: a resolver that takes 300 ms
-    /// of a 1 s declared cap leaves the producer with the whole second.
+    /// of a 2 s declared cap leaves the producer with the whole two
+    /// seconds, not 1.7 s.
     #[tokio::test(flavor = "multi_thread")]
     async fn spawned_streaming_callee_budget_starts_after_its_secret_pull() {
         let config = KernelConfig::default().with_secret_resolver(Arc::new(SlowResolver(
@@ -6350,7 +6356,7 @@ mod wallclock_timeout_tests {
             write_remaining_budget,
             "{}",
             r#""usesSecrets": ["k"],"#,
-            r#""wallclockTimeoutMs": 1000,"#,
+            r#""wallclockTimeoutMs": 2000,"#,
         );
         let started = std::time::Instant::now();
         let mut source = spawn_relay(&kernel, None).await;
@@ -6367,7 +6373,7 @@ mod wallclock_timeout_tests {
             other => panic!("expected one chunk then EOF, got: {other:?}"),
         };
         assert!(
-            remaining >= 900,
+            remaining >= 1800,
             "the cap is armed after the 300 ms pull, not before: {remaining}"
         );
     }
