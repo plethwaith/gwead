@@ -1570,11 +1570,16 @@ fn merge_parallel_branch_state(
         }
     }
 
-    if task_state.last_error.is_some() && canonical_state.last_error.is_none() {
+    // The first failed branch in declaration order is the `parallel`
+    // step's failure, as a unit: its message, its structured payload
+    // and its callee error travel together, so a later branch's richer
+    // marker cannot outrank an earlier branch's plainer one in
+    // `step_failure_to_error`. Every failure kind sets `last_error`, so
+    // that is the "this branch failed" signal.
+    if canonical_state.last_error.is_none() && task_state.last_error.is_some() {
         canonical_state.last_error = task_state.last_error;
-    }
-    if task_state.plugin_error.is_some() && canonical_state.plugin_error.is_none() {
         canonical_state.plugin_error = task_state.plugin_error;
+        canonical_state.callee_error = task_state.callee_error;
     }
     if task_state.resource_violation.is_some() && canonical_state.resource_violation.is_none() {
         canonical_state.resource_violation = task_state.resource_violation;
@@ -1582,9 +1587,6 @@ fn merge_parallel_branch_state(
     // `cancelled` is deliberately not merged: a cancelled branch is
     // carried as the `parallel` step's own error, and the flag would
     // otherwise outlive the `try` resets that clear every other marker.
-    if task_state.callee_error.is_some() && canonical_state.callee_error.is_none() {
-        canonical_state.callee_error = task_state.callee_error;
-    }
     if task_state.return_signal.is_some() && canonical_state.return_signal.is_none() {
         canonical_state.return_signal = task_state.return_signal;
     }

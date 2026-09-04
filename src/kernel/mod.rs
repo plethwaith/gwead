@@ -192,8 +192,10 @@ impl ContinuousHandle {
 pub enum DataflowEvent {
     /// A step task has been spawned and started executing.
     StepStarted { step_id: String },
-    /// A step task has finished normally; `ok` is `true`. A failure
-    /// is reported as [`Self::StepFailed`] instead.
+    /// A step task has finished without failing. `ok` is `true` for a
+    /// normal finish and `false` for a step that stopped on the
+    /// pipeline's own cancel (a `StepError::Cancelled` while winding
+    /// down). A failure is reported as [`Self::StepFailed`] instead.
     StepCompleted { step_id: String, ok: bool },
     /// A step task failed in a way the scheduler did NOT tolerate.
     /// Pipeline tear-down is in progress.
@@ -223,11 +225,13 @@ pub enum DataflowEvent {
     /// scheduler on a full channel would deadlock it against the
     /// subscriber that drains it.
     ///
-    /// It covers the panic and wallclock-timeout paths as well as the
-    /// ordinary exit: a panicked step task and a timeout that drops the
-    /// scheduler future mid-flight both still emit it. Otherwise
-    /// `result` would resolve `Err` while a subscriber keyed on this
-    /// event waited for channel-close or forever.
+    /// It covers the panic, wallclock-timeout and pre-flight paths as
+    /// well as the ordinary exit: a panicked step task, a timeout that
+    /// drops the scheduler future mid-flight, and a failure before the
+    /// scheduler ran (action lookup, secrets pull, stream provisioning,
+    /// linker setup) all still emit it. Otherwise `result` would
+    /// resolve `Err` while a subscriber keyed on this event waited for
+    /// channel-close or forever.
     ///
     /// **Do not treat it as guaranteed.** If the events receiver is
     /// dropped, or the process is killed, nothing arrives. Treat

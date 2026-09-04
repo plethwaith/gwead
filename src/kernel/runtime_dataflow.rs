@@ -328,6 +328,15 @@ pub(super) async fn execute_dag_dataflow(
                 };
                 let task_state = task_store.into_data();
                 let body_ok = matches!(run_result, Ok(true));
+                // Only a pipeline driven through a handle has the
+                // wind-down contract: the caller is listening for
+                // `PipelineCompleted` and inspects per-step state. The
+                // `run()`, `invoke` and role-dispatch paths have no
+                // events channel and no such contract, and a success
+                // there would carry the pre-provisioned stream handle
+                // id as the output — so a cancelled pipeline on those
+                // paths is `Err(Cancelled)` like any other action.
+                let winding_down = cancel.is_cancelled() && dataflow_events.is_some();
                 let candidate_error = match run_result {
                     // A step that stopped on the pipeline's own cancel
                     // is winding down, not failing. The handle's
@@ -337,8 +346,8 @@ pub(super) async fn execute_dag_dataflow(
                     // sidecar on an `Ok` or with `StepError::Cancelled`.
                     // (Under the wallclock deadline the wrapper turns
                     // that `Ok` into `ExecutionTimeout`.)
-                    Err(KernelError::Cancelled { .. }) if cancel.is_cancelled() => None,
-                    Ok(false) if task_state.cancelled && cancel.is_cancelled() => None,
+                    Err(KernelError::Cancelled { .. }) if winding_down => None,
+                    Ok(false) if task_state.cancelled && winding_down => None,
                     Err(e) => Some(e),
                     Ok(true) => None,
                     // Any failure in the dataflow scheduler
@@ -349,8 +358,9 @@ pub(super) async fn execute_dag_dataflow(
                 // Emit the per-step lifecycle event. `StepFailed` carries
                 // the textual error so a UI can show it without waiting
                 // for the pipeline-final ActionResult; `StepCompleted`
-                // carries `ok`, which on this path is always `true`
-                // since any failure is reported as `StepFailed`.
+                // carries `ok`: `true` for a normal finish, `false` for
+                // a step that wound down on the pipeline's own cancel.
+                // Any failure is reported as `StepFailed` instead.
                 match &candidate_error {
                     Some(err) => emit_event(
                         dataflow_events.as_ref(),
