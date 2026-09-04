@@ -1246,10 +1246,11 @@ async fn handle_driven_dataflow_parent_invoking_a_dataflow_callee_winds_down() {
 /// Caller and callee manifests for the callee-budget tests.
 ///
 /// The callee offers `probe` (a dataflow action whose one long-running
-/// step reports the deadline it runs under), `slow` (declares an 80 ms
-/// cap and then ignores the token for 5 s) and `patient` (declares a
-/// generous cap and ignores the token for 5 s). Each caller action
-/// invokes one of them from under a different budget.
+/// step reports the deadline it runs under), `probe_plain` (the same
+/// report from an ordinary action), `slow` (declares an 80 ms cap and
+/// then ignores the token for 5 s) and `patient` (declares a generous
+/// cap and ignores the token for 5 s). Each caller action invokes one
+/// of them from under a different budget.
 fn callee_budget_manifests() -> [&'static str; 2] {
     let callee = r#"{
         "name": "callee",
@@ -1258,6 +1259,10 @@ fn callee_budget_manifests() -> [&'static str; 2] {
                 "dataflow": true,
                 "steps": [{"id": "report", "type": "test_resource_limits_fixture.report_deadline",
                             "params": {}, "longRunning": true}]
+            },
+            "probe_plain": {
+                "steps": [{"id": "report", "type": "test_resource_limits_fixture.report_deadline",
+                            "params": {}}]
             },
             "slow": {
                 "wallclockTimeoutMs": 80,
@@ -1288,6 +1293,11 @@ fn callee_budget_manifests() -> [&'static str; 2] {
                 "dataflow": true,
                 "steps": [{"id": "call", "type": "invoke", "longRunning": true,
                             "params": {"plugin": "callee", "action": "probe", "input": {}}}]
+            },
+            "plain_probe_from_pipeline": {
+                "dataflow": true,
+                "steps": [{"id": "call", "type": "invoke", "longRunning": true,
+                            "params": {"plugin": "callee", "action": "probe_plain", "input": {}}}]
             },
             "slow_under_ten_seconds": {
                 "wallclockTimeoutMs": 10000,
@@ -1420,6 +1430,34 @@ async fn callee_of_an_uncapped_caller_is_uncapped() {
     let report = &result.step_results["call"];
     assert_eq!(report["has_deadline"], json!(false), "report: {report}");
     assert_eq!(report["remaining_ms"], Value::Null);
+}
+
+/// The other half of the uncapped-caller rule: with no budget to
+/// inherit, a callee is bounded as it would be at top level. A plain
+/// callee therefore gets the deployment default (60 s here), which is
+/// what the same action would get if it were run directly.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_callee_of_an_uncapped_caller_gets_the_deployment_default() {
+    let kernel = boot_callee_budget();
+
+    let mut handle = kernel
+        .execute("caller", "plain_probe_from_pipeline", json!({}))
+        .with_config(&json!({}))
+        .into_dataflow_handle()
+        .expect("handle returned");
+    let result = handle
+        .result
+        .await
+        .expect("result delivered")
+        .expect("pipeline completes");
+    while handle.events.recv().await.is_some() {}
+    let report = &result.step_results["call"];
+    assert_eq!(report["has_deadline"], json!(true), "report: {report}");
+    let remaining = report["remaining_ms"].as_u64().expect("a number");
+    assert!(
+        (30_000..=60_000).contains(&remaining),
+        "the deployment default of 60 s applies: {remaining}"
+    );
 }
 
 /// A callee's own `wallclockTimeoutMs` is enforced by a watchdog of

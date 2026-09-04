@@ -849,6 +849,27 @@ impl StreamState {
             Err(_) => STREAM_CLOSED,
         }
     }
+
+    /// Deliver an error to this writable's consumer in place of the
+    /// bytes that will not come. The readable end yields it as its next
+    /// item — a guest's `stream_read` sees `STREAM_IO_ERROR` — which is
+    /// how a consumer tells a truncated stream from a complete one;
+    /// dropping the sender alone reads as a clean EOF. Returns `false`
+    /// when the stream is closed, readable, or its receiver is gone:
+    /// nothing was delivered.
+    pub async fn fail_async(&self, err: std::io::Error) -> bool {
+        let sink = {
+            let inner = self.lock_inner();
+            if inner.closed {
+                return false;
+            }
+            match &inner.direction {
+                StreamDirection::Readable { .. } => return false,
+                StreamDirection::Writable { sink } => sink.clone(),
+            }
+        };
+        sink.send(Err(err)).await.is_ok()
+    }
 }
 
 /// Shared-registry entry point for the wasm `stream_read` host
@@ -894,6 +915,25 @@ pub async fn write_async_shared(arc: &SharedStreamRegistry, id: StreamId, data: 
         }
     };
     state.write_async(data).await
+}
+
+/// Shared-registry entry point for [`StreamState::fail_async`]: the
+/// producer's side of a stream reporting that it failed, so the
+/// consumer sees an error rather than an early EOF. `false` when the
+/// handle is unknown or nothing could be delivered.
+pub async fn fail_writable_shared(
+    arc: &SharedStreamRegistry,
+    id: StreamId,
+    err: std::io::Error,
+) -> bool {
+    let state = {
+        let reg = lock_shared(arc);
+        match reg.streams.get(&id) {
+            Some(s) => s.clone(),
+            None => return false,
+        }
+    };
+    state.fail_async(err).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1166,6 +1206,23 @@ mod tests {
         drop(rx);
         let state = reg.get(id).unwrap();
         assert_eq!(state.write_async(b"late").await, STREAM_CLOSED);
+    }
+
+    #[tokio::test]
+    async fn fail_async_delivers_the_error_to_the_paired_receiver() {
+        let mut reg = StreamRegistry::new();
+        let (id, mut rx) = reg.register_writable("application/octet-stream", 4);
+        let state = reg.streams.get(&id).unwrap().clone();
+        assert!(state.fail_async(std::io::Error::other("boom")).await);
+        match rx.recv().await {
+            Some(Err(e)) => assert_eq!(e.to_string(), "boom"),
+            other => panic!("expected the error item, got: {other:?}"),
+        }
+        reg.close(id);
+        assert!(
+            !state.fail_async(std::io::Error::other("late")).await,
+            "nothing is delivered on a closed stream"
+        );
     }
 
     #[test]
