@@ -3476,9 +3476,12 @@ impl Kernel {
                 None => CalleeWallclock::Uncapped,
             };
         };
-        // A declaration under the operator ceiling is already below
-        // the caller's remaining budget whenever it ends first, so the
-        // ceiling has nothing to clamp on this path.
+        // The operator ceiling is not applied here, on an invariant:
+        // every caller deadline was itself produced under the ceiling
+        // (by `wallclock_cap`, or by this function one level up), so
+        // a cap that ends sooner than the caller's is under it too. A
+        // new producer of `InvocationContext::deadline` values must
+        // keep that, or clamp here.
         let own = action
             .wallclock_timeout_ms
             .map(|ms| WallclockCap::after(std::time::Duration::from_millis(ms)));
@@ -3538,12 +3541,14 @@ impl Kernel {
     ///
     /// The returned `StreamId` is registered in the parent's stream
     /// registry (passed as `parent_streams`). The caller reads from it
-    /// like any other readable; when the callee finishes, the writable
-    /// side drops and the stream surfaces EOF. A callee-side failure is
-    /// logged at `warn` and put on the stream as an error item, so the
-    /// caller's next read sees `STREAM_IO_ERROR` rather than an EOF it
-    /// could mistake for the end of the data. A callee cancelled by its
-    /// caller ends the stream with a plain EOF.
+    /// like any other readable. EOF on it means the callee has *ended*,
+    /// not merely that its producer closed its handle: the kernel holds
+    /// a sender of its own until then, so that a callee-side failure
+    /// can always be put on the stream as an error item — the caller's
+    /// next read sees `STREAM_IO_ERROR` rather than an EOF it could
+    /// mistake for the end of the data. The failure is logged at `warn`
+    /// as well. A callee cancelled by its caller ends the stream with a
+    /// plain EOF.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_action_invoked_streaming(
         self: &Arc<Self>,
@@ -3622,12 +3627,20 @@ impl Kernel {
         // other's — which is the whole point of per-execution tables,
         // and this is the one path that legitimately crosses them.
         let callee_streams: self::streams::SharedStreamRegistry = Default::default();
-        let (writable_id, receiver) = {
+        let (writable_id, receiver, failure_sender) = {
             let mut reg = self::streams::lock_shared(&callee_streams);
-            reg.register_writable(
+            let (id, receiver) = reg.register_writable(
                 "application/octet-stream",
                 self::streams::STREAM_FANOUT_CAPACITY,
-            )
+            );
+            // The kernel's own sender, held until the callee has ended:
+            // the producer closing its handle must not end the stream
+            // before the callee's outcome is known, or a failure after
+            // the close could only ever read as a clean EOF.
+            let sender = reg
+                .writable_sender(id)
+                .expect("a writable registered a moment ago has a sender");
+            (id, receiver, sender)
         };
         let recv_source: self::streams::ReadableSource =
             Box::pin(futures::stream::unfold(receiver, |mut rx| async move {
@@ -3652,23 +3665,25 @@ impl Kernel {
         let exec_ctx_owned = exec_ctx.clone();
         // Pull the callee's secrets before the spawn, so a resolver
         // failure surfaces to the caller as an error rather than as a
-        // stream that silently hits EOF.
+        // stream that silently hits EOF — and before the wallclock
+        // decision, so the resolver's latency is not charged to the
+        // callee's budget.
         let secrets_owned = self
             .pull_secrets(plugin_name, secret_resolver.as_ref(), exec_ctx)
             .await?;
-        // Bounded by the caller's remaining budget like any callee, and
-        // this is the path where that matters most: the callee runs on
-        // its own task, so the caller's backstop dropping the *caller*
-        // never reaches it, and the caller may return before the callee
-        // ends. The cap is armed here even when it is the caller's,
-        // unlike the inline path. A child token, so the callee's
-        // deadline — and its scheduler's first-error cancel — do not
-        // reach the caller.
-        let wallclock = self.callee_wallclock(&registration.action, parent_deadline);
-        let callee_cancel = parent_cancel.unwrap_or_default().child_token();
-        // Kept past the callee's execution so a failure can be put on
-        // the stream after the callee's own state is gone.
-        let failure_sink = callee_streams.clone();
+        let (wallclock, callee_cancel, mut ctx) = self.callee_invocation(
+            plugin_name,
+            &registration.action,
+            parent_depth,
+            parent_cancel,
+            parent_deadline,
+            secret_resolver,
+        );
+        // The callee's own table, holding the writable end and nothing
+        // else. `pre_allocated_outputs` names a handle in *this* table,
+        // not in the parent's.
+        ctx.streams = Some(callee_streams);
+        ctx.pre_allocated_outputs = Some(pre_allocated);
 
         tokio::spawn(async move {
             let Some(registration) = kernel.registry.get_action(&plugin_owned, &action_owned)
@@ -3679,25 +3694,6 @@ impl Kernel {
                     "io.invoke_streaming: action unregistered between spawn and run"
                 );
                 return;
-            };
-            let ctx = self::runtime::InvocationContext {
-                // Resolved for the CALLEE, not the caller: step types
-                // resolve by the executing plugin's identity.
-                step_type_access: kernel.step_type_access_for(&plugin_owned),
-                // The callee's own table, holding the writable end and
-                // nothing else. `pre_allocated_outputs` names a handle
-                // in *this* table, not in the parent's.
-                streams: Some(callee_streams),
-                invoke_depth: parent_depth + 1,
-                dispatch_depth: 0,
-                kernel: kernel.self_weak.get().cloned(),
-                trigger: None,
-                drain_streams: false,
-                deadline: wallclock.deadline(),
-                cancel: Some(callee_cancel.clone()),
-                dataflow_events: None,
-                pre_allocated_outputs: Some(pre_allocated),
-                secret_resolver,
             };
             let fut = kernel.runtime.execute_dag(
                 &plugin_owned,
@@ -3711,6 +3707,10 @@ impl Kernel {
                 ctx,
                 kernel.limits.clone(),
             );
+            // The cap is armed here even when it is the caller's, unlike
+            // the inline path: this callee runs on its own task, so the
+            // caller's backstop dropping the caller never reaches it,
+            // and the caller may return before the callee ends.
             let result = with_wallclock_timeout(fut, wallclock.cap(), callee_cancel).await;
             match result {
                 Ok(_) => {}
@@ -3732,26 +3732,35 @@ impl Kernel {
                     );
                     // The consumer cannot tell a truncated stream from
                     // a complete one by EOF alone, so the failure goes
-                    // on the stream as an error item. Not delivered
-                    // when the producer already closed its writable:
-                    // the bytes were complete and the failure was
-                    // somewhere after them.
-                    let delivered = self::streams::fail_writable_shared(
-                        &failure_sink,
-                        writable_id,
-                        std::io::Error::other(format!("{plugin_owned}.{action_owned} failed: {e}")),
-                    )
-                    .await;
+                    // on the stream as an error item, through the
+                    // sender held for exactly this. Delivery is
+                    // bounded — the consumer has until the callee's
+                    // budget ends, or one grace from now if it already
+                    // has — because this task has nothing left to wait
+                    // on and a consumer that has stopped reading would
+                    // park it for good. A consumer that cannot take the
+                    // item by then reads EOF instead.
+                    let now = tokio::time::Instant::now();
+                    let latest =
+                        wallclock.deadline().map_or(now, |d| d.max(now)) + WALLCLOCK_DROP_GRACE;
+                    let item = Err(std::io::Error::other(format!(
+                        "{plugin_owned}.{action_owned} failed: {e}"
+                    )));
+                    let delivered = tokio::time::timeout_at(latest, failure_sender.send(item))
+                        .await
+                        .is_ok_and(|sent| sent.is_ok());
                     if !delivered {
                         tracing::debug!(
                             plugin = %plugin_owned,
                             action = %action_owned,
-                            "io.invoke_streaming: writable already closed; \
-                             the failure is not on the stream"
+                            "io.invoke_streaming: consumer did not take the failure \
+                             report in time; it reads EOF"
                         );
                     }
                 }
             }
+            // Last sender gone: the parent's readable reaches EOF.
+            drop(failure_sender);
         });
 
         Ok(readable_id)
@@ -3777,11 +3786,12 @@ impl Kernel {
     /// [`StreamRegistry::take`](self::streams::StreamRegistry::take) and
     /// [`adopt`](self::streams::StreamRegistry::adopt).
     ///
-    /// `parent_cancel` propagates the parent action's cancellation
-    /// signal into the child's `InvocationContext`, so a parent-side
-    /// cancel fired mid-invoke tears the child down too. `None` means
-    /// "parent has no cancel surface" — the runtime allocates a
-    /// fresh never-cancelled token internally.
+    /// The child runs under a *child* of `parent_cancel`, so a
+    /// parent-side cancel fired mid-invoke tears the child down too,
+    /// while nothing the child fires reaches the parent. `None` means
+    /// "parent has no cancel surface" — the child of a fresh
+    /// never-cancelled token. `parent_deadline` is the parent's
+    /// remaining budget, the bound on the child's ([`Self::callee_wallclock`]).
     ///
     /// Kernel-internal: external plugin crates dispatch through
     /// [`Self::dispatch_role`] instead, which derives `parent_depth`
@@ -3820,37 +3830,14 @@ impl Kernel {
         let secrets = self
             .pull_secrets(plugin_name, secret_resolver.as_ref(), exec_ctx)
             .await?;
-
-        let wallclock = self.callee_wallclock(&registration.action, parent_deadline);
-        // A child of the caller's token, not the token itself: the
-        // caller's cancel still reaches the callee, but neither the
-        // callee's own watchdog nor its dataflow scheduler's
-        // first-error cancel tears down the caller — a callee's
-        // deadline or failure is a failed step there, not a
-        // cancellation.
-        let callee_cancel = parent_cancel.unwrap_or_default().child_token();
-
-        // The callee's own handle table. `None` makes the runtime
-        // allocate a fresh one; see this method's docs for why it is not
-        // the parent's.
-        let ctx = self::runtime::InvocationContext {
-            // The callee's set, not the caller's.
-            step_type_access: self.step_type_access_for(plugin_name),
-            streams: None,
-            invoke_depth: parent_depth + 1,
-            dispatch_depth: 0,
-            kernel: self.self_weak.get().cloned(),
-            trigger: None,
-            // The callee's table is dropped with its execution, and
-            // the runtime's `invoke_depth == 0` guard would suppress a
-            // drain here anyway; `false` states the intent explicitly.
-            drain_streams: false,
-            deadline: wallclock.deadline(),
-            cancel: Some(callee_cancel.clone()),
-            dataflow_events: None,
-            pre_allocated_outputs: None,
-            secret_resolver: secret_resolver.clone(),
-        };
+        let (wallclock, callee_cancel, ctx) = self.callee_invocation(
+            plugin_name,
+            &registration.action,
+            parent_depth,
+            parent_cancel,
+            parent_deadline,
+            secret_resolver,
+        );
 
         let fut = self.runtime.execute_dag(
             plugin_name,
@@ -3874,12 +3861,64 @@ impl Kernel {
         }
     }
 
+    /// What every callee execution takes from its caller's context:
+    /// whose wallclock bound applies ([`Self::callee_wallclock`]), the
+    /// token it runs under, and an [`InvocationContext`] for a handle
+    /// table of its own. Shared by the inline and the spawned invoke
+    /// paths so the two cannot drift.
+    ///
+    /// The token is a *child* of the caller's, not the caller's itself:
+    /// the caller's cancel still reaches the callee, but neither the
+    /// callee's own watchdog nor its dataflow scheduler's first-error
+    /// cancel tears down the caller — a callee's deadline or failure
+    /// is a failed step there, not a cancellation.
+    fn callee_invocation(
+        &self,
+        plugin_name: &str,
+        action: &Action,
+        parent_depth: u32,
+        parent_cancel: Option<tokio_util::sync::CancellationToken>,
+        parent_deadline: Option<tokio::time::Instant>,
+        secret_resolver: Option<Arc<dyn SecretResolver>>,
+    ) -> (
+        CalleeWallclock,
+        tokio_util::sync::CancellationToken,
+        self::runtime::InvocationContext,
+    ) {
+        let wallclock = self.callee_wallclock(action, parent_deadline);
+        let callee_cancel = parent_cancel.unwrap_or_default().child_token();
+        let ctx = self::runtime::InvocationContext {
+            // The callee's set, not the caller's.
+            step_type_access: self.step_type_access_for(plugin_name),
+            // The callee's own handle table — `None` makes the runtime
+            // allocate a fresh one; see `execute_action_invoked` for
+            // why it is not the parent's.
+            streams: None,
+            invoke_depth: parent_depth + 1,
+            dispatch_depth: 0,
+            kernel: self.self_weak.get().cloned(),
+            trigger: None,
+            // The callee's table is dropped with its execution, and
+            // the runtime's `invoke_depth == 0` guard would suppress a
+            // drain here anyway; `false` states the intent explicitly.
+            drain_streams: false,
+            deadline: wallclock.deadline(),
+            cancel: Some(callee_cancel.clone()),
+            dataflow_events: None,
+            pre_allocated_outputs: None,
+            secret_resolver,
+        };
+        (wallclock, callee_cancel, ctx)
+    }
+
     /// Dispatch to whichever plugin is bound to `role`, calling `action`
     /// with `input`, from inside a step body. The child gets its own
     /// stream registry (a callee cannot reach its caller's handles),
-    /// inherits the caller's `invoke_depth` (so the
-    /// recursion cap applies), and its cancellation token (so a parent-side cancel
-    /// tears the child down).
+    /// inherits the caller's `invoke_depth` (so the recursion cap
+    /// applies), a child of its cancellation token (so a parent-side
+    /// cancel or deadline tears the child down, and nothing the child
+    /// does reaches the parent's token), and its remaining wallclock
+    /// budget as a bound.
     ///
     /// This is the constrained seam external plugin crates use when a
     /// step body needs to call another plugin through the SPI surface:
@@ -4686,8 +4725,8 @@ impl Kernel {
 /// cancelled you" are different facts the caller acts on. The shapes
 /// are typed all the way down — the wave scheduler's cooperative exit
 /// and a host step's [`StepError::Cancelled`](host_api::StepError)
-/// are `Cancelled`; a callee cancelled through the caller's token,
-/// which it runs under, is the caller's own `Cancelled`; a callee
+/// are `Cancelled`; a callee cancelled through the child of the
+/// caller's token it runs under is the caller's own `Cancelled`; a callee
 /// reporting its own deadline is `CalleeFailed` over `ExecutionTimeout`
 /// ([`stopped_by_cancellation`]). An `Ok` resolved after the watchdog
 /// fired is the deadline too: the scheduler winding down with partial
@@ -4739,7 +4778,7 @@ where
 /// `deadline` (what a step body sees through
 /// `PluginExecution::wallclock_deadline`), so the two agree exactly;
 /// computed separately they were apart by whatever ran in between.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct WallclockCap {
     /// When the watchdog fires the token. The backstop drops the
     /// future one [`WALLCLOCK_DROP_GRACE`] later.
@@ -4773,7 +4812,7 @@ impl WallclockCap {
 /// Whose wallclock bound applies to a callee — see
 /// [`Kernel::callee_wallclock`] for the decision and what each arm
 /// means for enforcement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum CalleeWallclock {
     /// The callee's own cap ends first (or its caller is uncapped):
     /// armed as its own watchdog.
@@ -5575,9 +5614,10 @@ pub enum KernelError {
     /// parsing the message, which keeps the flattened shape so a
     /// `try.catch` handler's `{{$.error}}` reads as before. Shared
     /// rather than boxed because it travels through the `Clone` step
-    /// error. (A *cancelled* callee is not this: it runs under the
-    /// caller's own token, so it surfaces as the caller's own
-    /// [`Self::Cancelled`].)
+    /// error. (A callee cancelled *by its caller* is not this: it runs
+    /// under a child of the caller's token, and the caller's cancel
+    /// surfaces as the caller's own [`Self::Cancelled`]. A callee's own
+    /// deadline is this, over [`Self::ExecutionTimeout`].)
     #[error("step '{step_id}' → {plugin}.{action} failed: {source}")]
     CalleeFailed {
         step_id: String,
@@ -5935,9 +5975,9 @@ mod wallclock_timeout_tests {
     /// callee that ignores the token would run until its source ended.
     /// The callee therefore arms the caller's remaining budget as a cap
     /// of its own. Here the callee would sleep five seconds; the caller
-    /// has 80 ms left; the callee is dropped, its writable with it, and
-    /// the parent's readable reaches EOF within the drop grace rather
-    /// than after five seconds.
+    /// has 80 ms left; the callee is dropped within the drop grace, and
+    /// the parent's readable carries its deadline as an error item,
+    /// then EOF — long before five seconds.
     #[tokio::test(flavor = "multi_thread")]
     async fn spawned_streaming_callee_is_bounded_by_the_callers_remaining_budget() {
         let kernel = kernel_with_relay(sleep_ignoring_token, r#"{"sleep_ms": 5000}"#);
@@ -5947,15 +5987,26 @@ mod wallclock_timeout_tests {
         let mut source = spawn_relay(&kernel, parent_deadline).await;
 
         use futures::StreamExt as _;
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while source.next().await.is_some() {}
+        let items = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut items = Vec::new();
+            while let Some(item) = source.next().await {
+                items.push(item);
+            }
+            items
         })
         .await
-        .expect("the callee's own backstop ends it; EOF arrives long before its 5 s sleep");
+        .expect("the callee's own backstop ends it long before its 5 s sleep");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "ended by the caller's remaining budget, not the sleep"
         );
+        match items.as_slice() {
+            [Err(err)] => assert!(
+                err.to_string().contains("wallclock timeout exceeded"),
+                "the item reports the deadline: {err}"
+            ),
+            other => panic!("expected exactly one error item then EOF, got: {other:?}"),
+        }
     }
 
     /// A spawned callee that fails mid-stream says so on the stream: the

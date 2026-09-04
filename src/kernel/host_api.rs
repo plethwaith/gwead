@@ -630,10 +630,11 @@ pub enum StepError {
 
 impl StepError {
     /// Map a callee's error onto the calling step's error, keeping it
-    /// typed. A cancelled callee means the caller was cancelled: an
-    /// invoked callee runs under the caller's own token, so nothing
-    /// else could have fired it. Everything else is the callee's own
-    /// failure.
+    /// typed. A cancelled callee means the caller was cancelled: a
+    /// callee runs under a child of the caller's token, which only the
+    /// caller's cancel or deadline fires — the callee's own watchdog
+    /// reports `ExecutionTimeout`, not `Cancelled`. Everything else is
+    /// the callee's own failure.
     pub fn from_callee(plugin: &str, action: &str, err: super::KernelError) -> Self {
         match err {
             super::KernelError::Cancelled { .. } => StepError::Cancelled,

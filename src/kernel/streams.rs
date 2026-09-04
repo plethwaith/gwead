@@ -356,6 +356,25 @@ impl StreamRegistry {
         (id, rx)
     }
 
+    /// A sender of your own for a writable stream — a clone of the one
+    /// the stream's owner writes through. The paired receiver sees EOF
+    /// only once *every* sender is gone, so holding this keeps the
+    /// stream open past the owner's `close`: the kernel uses it to put
+    /// a producer's failure on the stream after the producer has
+    /// closed its handle. Drop it when there is nothing more to say.
+    /// `None` for an unknown handle, a readable, or a closed stream.
+    pub fn writable_sender(&self, id: StreamId) -> Option<WritableSender> {
+        let state = self.streams.get(&id)?;
+        let inner = state.lock_inner();
+        if inner.closed {
+            return None;
+        }
+        match &inner.direction {
+            StreamDirection::Writable { sink } => Some(sink.clone()),
+            StreamDirection::Readable { .. } => None,
+        }
+    }
+
     /// Mark a stream closed and drop its direction state. Subsequent
     /// lookups still find the state (so handle errors map to `CLOSED`
     /// rather than `INVALID_HANDLE`), but the underlying source /
@@ -849,27 +868,6 @@ impl StreamState {
             Err(_) => STREAM_CLOSED,
         }
     }
-
-    /// Deliver an error to this writable's consumer in place of the
-    /// bytes that will not come. The readable end yields it as its next
-    /// item — a guest's `stream_read` sees `STREAM_IO_ERROR` — which is
-    /// how a consumer tells a truncated stream from a complete one;
-    /// dropping the sender alone reads as a clean EOF. Returns `false`
-    /// when the stream is closed, readable, or its receiver is gone:
-    /// nothing was delivered.
-    pub async fn fail_async(&self, err: std::io::Error) -> bool {
-        let sink = {
-            let inner = self.lock_inner();
-            if inner.closed {
-                return false;
-            }
-            match &inner.direction {
-                StreamDirection::Readable { .. } => return false,
-                StreamDirection::Writable { sink } => sink.clone(),
-            }
-        };
-        sink.send(Err(err)).await.is_ok()
-    }
 }
 
 /// Shared-registry entry point for the wasm `stream_read` host
@@ -915,25 +913,6 @@ pub async fn write_async_shared(arc: &SharedStreamRegistry, id: StreamId, data: 
         }
     };
     state.write_async(data).await
-}
-
-/// Shared-registry entry point for [`StreamState::fail_async`]: the
-/// producer's side of a stream reporting that it failed, so the
-/// consumer sees an error rather than an early EOF. `false` when the
-/// handle is unknown or nothing could be delivered.
-pub async fn fail_writable_shared(
-    arc: &SharedStreamRegistry,
-    id: StreamId,
-    err: std::io::Error,
-) -> bool {
-    let state = {
-        let reg = lock_shared(arc);
-        match reg.streams.get(&id) {
-            Some(s) => s.clone(),
-            None => return false,
-        }
-    };
-    state.fail_async(err).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,20 +1187,25 @@ mod tests {
         assert_eq!(state.write_async(b"late").await, STREAM_CLOSED);
     }
 
+    /// The property the kernel's streaming-callee failure report
+    /// relies on: a held sender keeps the receiver from EOF past the
+    /// owner's close, and can still deliver an error item.
     #[tokio::test]
-    async fn fail_async_delivers_the_error_to_the_paired_receiver() {
+    async fn held_writable_sender_outlives_close_and_delivers() {
         let mut reg = StreamRegistry::new();
         let (id, mut rx) = reg.register_writable("application/octet-stream", 4);
-        let state = reg.streams.get(&id).unwrap().clone();
-        assert!(state.fail_async(std::io::Error::other("boom")).await);
+        let held = reg.writable_sender(id).expect("a writable has a sender");
+        reg.close(id);
+        assert!(reg.writable_sender(id).is_none(), "none after close");
+        assert!(held.send(Err(std::io::Error::other("boom"))).await.is_ok());
         match rx.recv().await {
             Some(Err(e)) => assert_eq!(e.to_string(), "boom"),
             other => panic!("expected the error item, got: {other:?}"),
         }
-        reg.close(id);
+        drop(held);
         assert!(
-            !state.fail_async(std::io::Error::other("late")).await,
-            "nothing is delivered on a closed stream"
+            rx.recv().await.is_none(),
+            "EOF once the last sender is gone"
         );
     }
 

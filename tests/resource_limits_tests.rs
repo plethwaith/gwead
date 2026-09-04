@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gwead::kernel::host_api::{PluginErrorPayload, PluginExecution, StepError, StepOutput};
+use gwead::kernel::secrets::{SecretError, SecretRequest, SecretResolver};
 use gwead::kernel::types::*;
 use gwead::kernel::{Kernel, KernelConfig, KernelError, RuntimeLimits};
 use indexmap::IndexMap;
@@ -1251,7 +1252,7 @@ async fn handle_driven_dataflow_parent_invoking_a_dataflow_callee_winds_down() {
 /// then ignores the token for 5 s) and `patient` (declares a generous
 /// cap and ignores the token for 5 s). Each caller action invokes one
 /// of them from under a different budget.
-fn callee_budget_manifests() -> [&'static str; 2] {
+fn callee_budget_manifests() -> [&'static str; 3] {
     let callee = r#"{
         "name": "callee",
         "actions": {
@@ -1276,10 +1277,48 @@ fn callee_budget_manifests() -> [&'static str; 2] {
             }
         }
     }"#;
-    let caller = r#"{
-        "name": "caller",
+    let mid = r#"{
+        "name": "mid",
         "permissions": ["invoke:plugin:callee"],
         "actions": {
+            "hop": {
+                "steps": [{"id": "call", "type": "invoke",
+                            "params": {"plugin": "callee", "action": "probe_plain", "input": {}}}]
+            }
+        }
+    }"#;
+    let caller = r#"{
+        "name": "caller",
+        "permissions": ["invoke:plugin:callee", "invoke:plugin:mid"],
+        "stepTypes": {"caller.hop": "probe_self"},
+        "actions": {
+            "probe_self": {
+                "steps": [{"id": "report", "type": "test_resource_limits_fixture.report_deadline",
+                            "params": {}}]
+            },
+            "probe_via_alias": {
+                "wallclockTimeoutMs": 10000,
+                "steps": [
+                    {"id": "work", "type": "test_resource_limits_fixture.sleep_async",
+                     "params": {"sleep_ms": 100}},
+                    {"id": "hop", "type": "caller.hop", "params": {}}
+                ]
+            },
+            "probe_two_levels_down": {
+                "wallclockTimeoutMs": 10000,
+                "steps": [
+                    {"id": "work", "type": "test_resource_limits_fixture.sleep_async",
+                     "params": {"sleep_ms": 100}},
+                    {"id": "call", "type": "invoke",
+                     "params": {"plugin": "mid", "action": "hop", "input": {}}}
+                ]
+            },
+            "probe_from_capped_pipeline": {
+                "dataflow": true,
+                "wallclockTimeoutMs": 10000,
+                "steps": [{"id": "call", "type": "invoke", "longRunning": true,
+                            "params": {"plugin": "callee", "action": "probe", "input": {}}}]
+            },
             "probe_after_work": {
                 "wallclockTimeoutMs": 10000,
                 "steps": [
@@ -1320,16 +1359,23 @@ fn callee_budget_manifests() -> [&'static str; 2] {
             }
         }
     }"#;
-    [callee, caller]
+    [callee, mid, caller]
 }
 
 fn boot_callee_budget() -> Arc<Kernel> {
-    let [callee, caller] = callee_budget_manifests();
+    let [callee, mid, caller] = callee_budget_manifests();
     boot_with_config_and_json(
         KernelConfig::default().with_limits(RuntimeLimits::default()),
         vec![],
-        &[callee, caller],
+        &[callee, mid, caller],
     )
+}
+
+/// The remaining budget a `report_deadline` step recorded, from the
+/// step result that carries the callee's output.
+fn remaining_ms(report: &Value) -> u64 {
+    assert_eq!(report["has_deadline"], json!(true), "report: {report}");
+    report["remaining_ms"].as_u64().expect("a number")
 }
 
 /// The decision tree's own two automatic cases, seen from inside the
@@ -1457,6 +1503,184 @@ async fn plain_callee_of_an_uncapped_caller_gets_the_deployment_default() {
     assert!(
         (30_000..=60_000).contains(&remaining),
         "the deployment default of 60 s applies: {remaining}"
+    );
+}
+
+/// The budget passes through every nesting level: a root with ten
+/// seconds invokes `mid`, which invokes the probe; the probe's budget is
+/// the root's, less what the root spent, not a fresh default at each
+/// hop.
+#[tokio::test(flavor = "multi_thread")]
+async fn budget_is_inherited_two_levels_down() {
+    let kernel = boot_callee_budget();
+
+    let result = kernel
+        .execute("caller", "probe_two_levels_down", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect("all three complete");
+    let remaining = remaining_ms(&result.step_results["call"]);
+    assert!(
+        (5_000..=9_900).contains(&remaining),
+        "the leaf sees the root's budget less the 100 ms spent: {remaining}"
+    );
+}
+
+/// An alias step is an invoke by another name, and its callee is
+/// bounded the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn alias_callee_inherits_the_callers_remaining_budget() {
+    let kernel = boot_callee_budget();
+
+    let result = kernel
+        .execute("caller", "probe_via_alias", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect("completes");
+    let remaining = remaining_ms(&result.step_results["hop"]);
+    assert!(
+        (5_000..=9_900).contains(&remaining),
+        "the alias callee sees the caller's budget less the 100 ms spent: {remaining}"
+    );
+}
+
+/// A capped pipeline driven through the handle path passes its budget
+/// to its callee too — the handle path arms its cap in a spawned task,
+/// after its own pre-flight, and the callee still sees it.
+#[tokio::test(flavor = "multi_thread")]
+async fn capped_pipeline_on_the_handle_path_bounds_its_callee() {
+    let kernel = boot_callee_budget();
+
+    let mut handle = kernel
+        .execute("caller", "probe_from_capped_pipeline", json!({}))
+        .with_config(&json!({}))
+        .into_dataflow_handle()
+        .expect("handle returned");
+    let result = handle
+        .result
+        .await
+        .expect("result delivered")
+        .expect("pipeline completes");
+    while handle.events.recv().await.is_some() {}
+    let remaining = remaining_ms(&result.step_results["call"]);
+    assert!(
+        (5_000..=10_000).contains(&remaining),
+        "the callee sees the pipeline's declared 10 s: {remaining}"
+    );
+}
+
+/// A resolver that takes its time answering, and answers the one key
+/// the manifests below declare.
+struct SlowResolver(Duration);
+
+impl SecretResolver for SlowResolver {
+    fn resolve<'a>(
+        &'a self,
+        _request: SecretRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, SecretError>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::time::sleep(self.0).await;
+            Ok(json!({ "k": "v" }))
+        })
+    }
+}
+
+/// Manifests whose actions declare a secret, so the resolver is
+/// consulted before they run, and report the deadline they see.
+fn slow_resolver_manifests() -> [&'static str; 2] {
+    let callee = r#"{
+        "name": "callee",
+        "usesSecrets": ["k"],
+        "actions": {
+            "probe_capped": {
+                "wallclockTimeoutMs": 1000,
+                "steps": [{"id": "report", "type": "test_resource_limits_fixture.report_deadline",
+                            "params": {}}]
+            },
+            "pipeline_capped": {
+                "dataflow": true,
+                "wallclockTimeoutMs": 1000,
+                "steps": [{"id": "report", "type": "test_resource_limits_fixture.report_deadline",
+                            "params": {}, "longRunning": true}]
+            }
+        }
+    }"#;
+    let caller = r#"{
+        "name": "caller",
+        "permissions": ["invoke:plugin:callee"],
+        "actions": {
+            "go": {
+                "wallclockTimeoutMs": 10000,
+                "steps": [{"id": "call", "type": "invoke",
+                            "params": {"plugin": "callee", "action": "probe_capped", "input": {}}}]
+            }
+        }
+    }"#;
+    [callee, caller]
+}
+
+fn boot_slow_resolver() -> Arc<Kernel> {
+    let [callee, caller] = slow_resolver_manifests();
+    boot_with_config_and_json(
+        KernelConfig::default()
+            .with_limits(RuntimeLimits::default())
+            .with_secret_resolver(Arc::new(SlowResolver(Duration::from_millis(300)))),
+        vec![],
+        &[callee, caller],
+    )
+}
+
+/// The wallclock budget starts when the action does, after its
+/// secrets are pulled: a resolver that takes 300 ms of a 1 s cap does
+/// not eat into what the action's steps get. Pinned at the three
+/// entry points a manifest can reach without a wasm guest — `run`, an
+/// inline invoke, and the dataflow handle — since each arms its cap
+/// separately.
+#[tokio::test(flavor = "multi_thread")]
+async fn resolver_latency_is_not_charged_to_the_budget() {
+    let kernel = boot_slow_resolver();
+
+    let top_level = kernel
+        .execute("callee", "probe_capped", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect("runs");
+    let remaining = remaining_ms(&top_level.output);
+    assert!(
+        remaining >= 900,
+        "run(): the step sees the whole 1 s cap, not 1 s less the resolver: {remaining}"
+    );
+
+    let inline = kernel
+        .execute("caller", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect("runs");
+    let remaining = remaining_ms(&inline.step_results["call"]);
+    assert!(
+        remaining >= 900,
+        "invoke: the callee's own 1 s cap starts after its secret pull: {remaining}"
+    );
+
+    let mut handle = kernel
+        .execute("callee", "pipeline_capped", json!({}))
+        .with_config(&json!({}))
+        .into_dataflow_handle()
+        .expect("handle returned");
+    let pipeline = handle
+        .result
+        .await
+        .expect("result delivered")
+        .expect("pipeline completes");
+    while handle.events.recv().await.is_some() {}
+    let remaining = remaining_ms(&pipeline.step_results["report"]);
+    assert!(
+        remaining >= 900,
+        "dataflow handle: the cap is armed after the pull: {remaining}"
     );
 }
 

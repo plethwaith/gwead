@@ -75,8 +75,8 @@ pub struct InvocationContext {
     /// The end of this invocation's wallclock budget, if it has one:
     /// when its watchdog fires, or — for a callee bounded by its
     /// caller — when the caller's does. Set by the entry point that
-    /// arms the watchdog (see `Kernel::effective_wallclock_timeout` and
-    /// `Kernel::effective_callee_wallclock`) and read by the `invoke`
+    /// arms the watchdog (see `Kernel::wallclock_cap` and
+    /// `Kernel::callee_wallclock`) and read by the `invoke`
     /// paths to bound a callee by the caller's *remaining* budget: a
     /// callee cannot outlive the invocation that asked for it. `None`
     /// is an uncapped invocation — a top-level dataflow pipeline with
