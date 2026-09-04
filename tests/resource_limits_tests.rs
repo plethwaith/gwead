@@ -61,6 +61,13 @@ fn boot_with_config_and_json(
             fail_on_cancel_step,
         )
         .expect("no collision on a fresh table");
+    config
+        .native_step_impls
+        .insert(
+            "test.test_resource_limits_fixture.report_deadline",
+            report_deadline_step,
+        )
+        .expect("no collision on a fresh table");
     let mut k = Kernel::boot(config).expect("kernel boot");
     common::script_runtime_mock::register(&mut k).expect("mock script runtime registers");
     k.register_plugin_from_json(
@@ -70,11 +77,13 @@ fn boot_with_config_and_json(
             "description": "Wires `sleep_async` for the wallclock-timeout tests — real async work that's preemptable by tokio::time::timeout.",
             "stepTypeDefs": [
                 {"name": "test_resource_limits_fixture.sleep_async", "freelyUsable": true},
-                {"name": "test_resource_limits_fixture.fail_on_cancel", "freelyUsable": true}
+                {"name": "test_resource_limits_fixture.fail_on_cancel", "freelyUsable": true},
+                {"name": "test_resource_limits_fixture.report_deadline", "freelyUsable": true}
             ],
             "stepTypeImpls": [
                 {"stepType": "test_resource_limits_fixture.sleep_async", "kind": "native", "implRef": "test.test_resource_limits_fixture.sleep_async"},
-                {"stepType": "test_resource_limits_fixture.fail_on_cancel", "kind": "native", "implRef": "test.test_resource_limits_fixture.fail_on_cancel"}
+                {"stepType": "test_resource_limits_fixture.fail_on_cancel", "kind": "native", "implRef": "test.test_resource_limits_fixture.fail_on_cancel"},
+                {"stepType": "test_resource_limits_fixture.report_deadline", "kind": "native", "implRef": "test.test_resource_limits_fixture.report_deadline"}
             ]
         }"#,
     )
@@ -135,6 +144,26 @@ fn fail_on_cancel_step<'a>(
                 Ok(StepOutput::from(json!({ "slept_ms": sleep_ms })))
             }
         }
+    })
+}
+
+/// Test-only step type that reports what the invocation it runs in
+/// knows about its own wallclock deadline: whether it has one, and
+/// how much of it is left. `remaining_ms` is `null` when uncapped.
+fn report_deadline_step<'a>(
+    ex: &'a mut (dyn PluginExecution + Send),
+    _params: &'a Value,
+) -> Pin<Box<dyn Future<Output = Result<StepOutput, StepError>> + Send + 'a>> {
+    let deadline = ex.wallclock_deadline();
+    Box::pin(async move {
+        let remaining_ms = deadline.map(|d| {
+            d.saturating_duration_since(tokio::time::Instant::now())
+                .as_millis() as u64
+        });
+        Ok(StepOutput::from(json!({
+            "has_deadline": deadline.is_some(),
+            "remaining_ms": remaining_ms,
+        })))
     })
 }
 
@@ -1208,6 +1237,278 @@ async fn handle_driven_dataflow_parent_invoking_a_dataflow_callee_winds_down() {
     .await
     .expect("events channel closes after the pipeline task exits");
     assert_eq!(sequence, ["completed:call:false", "pipeline:false"]);
+}
+
+// ---------------------------------------------------------------------------
+// Callee wallclock budget
+// ---------------------------------------------------------------------------
+
+/// Caller and callee manifests for the callee-budget tests.
+///
+/// The callee offers `probe` (a dataflow action whose one long-running
+/// step reports the deadline it runs under), `slow` (declares an 80 ms
+/// cap and then ignores the token for 5 s) and `patient` (declares a
+/// generous cap and ignores the token for 5 s). Each caller action
+/// invokes one of them from under a different budget.
+fn callee_budget_manifests() -> [&'static str; 2] {
+    let callee = r#"{
+        "name": "callee",
+        "actions": {
+            "probe": {
+                "dataflow": true,
+                "steps": [{"id": "report", "type": "test_resource_limits_fixture.report_deadline",
+                            "params": {}, "longRunning": true}]
+            },
+            "slow": {
+                "wallclockTimeoutMs": 80,
+                "steps": [{"id": "nap", "type": "test_resource_limits_fixture.sleep_async",
+                            "params": {"sleep_ms": 5000}}]
+            },
+            "patient": {
+                "wallclockTimeoutMs": 10000,
+                "steps": [{"id": "nap", "type": "test_resource_limits_fixture.sleep_async",
+                            "params": {"sleep_ms": 5000}}]
+            }
+        }
+    }"#;
+    let caller = r#"{
+        "name": "caller",
+        "permissions": ["invoke:plugin:callee"],
+        "actions": {
+            "probe_after_work": {
+                "wallclockTimeoutMs": 10000,
+                "steps": [
+                    {"id": "work", "type": "test_resource_limits_fixture.sleep_async",
+                     "params": {"sleep_ms": 100}},
+                    {"id": "call", "type": "invoke",
+                     "params": {"plugin": "callee", "action": "probe", "input": {}}}
+                ]
+            },
+            "probe_from_pipeline": {
+                "dataflow": true,
+                "steps": [{"id": "call", "type": "invoke", "longRunning": true,
+                            "params": {"plugin": "callee", "action": "probe", "input": {}}}]
+            },
+            "slow_under_ten_seconds": {
+                "wallclockTimeoutMs": 10000,
+                "steps": [{"id": "call", "type": "invoke",
+                            "params": {"plugin": "callee", "action": "slow", "input": {}}}]
+            },
+            "slow_caught": {
+                "wallclockTimeoutMs": 10000,
+                "steps": [{"id": "guard", "type": "try", "params": {
+                    "try": [{"id": "call", "type": "invoke",
+                             "params": {"plugin": "callee", "action": "slow", "input": {}}}],
+                    "catch": [{"id": "recovered", "type": "let",
+                               "params": {"value": "{{$.error}}"}}]
+                }}]
+            },
+            "patient_under_eighty_ms": {
+                "wallclockTimeoutMs": 80,
+                "steps": [{"id": "call", "type": "invoke",
+                            "params": {"plugin": "callee", "action": "patient", "input": {}}}]
+            }
+        }
+    }"#;
+    [callee, caller]
+}
+
+fn boot_callee_budget() -> Arc<Kernel> {
+    let [callee, caller] = callee_budget_manifests();
+    boot_with_config_and_json(
+        KernelConfig::default().with_limits(RuntimeLimits::default()),
+        vec![],
+        &[callee, caller],
+    )
+}
+
+/// The decision tree's own two automatic cases, seen from inside the
+/// action: a top-level action under the deployment default has a
+/// deadline, and a top-level dataflow action with no declaration has
+/// none. These are the baselines the callee tests below differ from.
+#[tokio::test(flavor = "multi_thread")]
+async fn top_level_invocation_reports_its_deadline() {
+    let probe = |dataflow: bool| {
+        let mut a = action(vec![{
+            let mut m = step(
+                "report",
+                "test_resource_limits_fixture.report_deadline",
+                json!({}),
+            );
+            m.long_running = dataflow;
+            m
+        }]);
+        a.dataflow = dataflow;
+        a
+    };
+    let kernel = boot_with_limits(
+        RuntimeLimits::default().with_default_wallclock_timeout(Duration::from_secs(10)),
+        vec![
+            manifest_with_action("plain", "go", probe(false)),
+            manifest_with_action("pipeline", "go", probe(true)),
+        ],
+    );
+
+    let plain = kernel
+        .execute("plain", "go", json!({}))
+        .with_config(&json!({}))
+        .run()
+        .await
+        .expect("runs");
+    assert_eq!(plain.output["has_deadline"], json!(true));
+    let remaining = plain.output["remaining_ms"].as_u64().expect("a number");
+    assert!(
+        (5_000..=10_000).contains(&remaining),
+        "a top-level action under a 10 s default sees roughly that budget: {remaining}"
+    );
+
+    let pipeline = kernel
+        .execute("pipeline", "go", json!({}))
+        .with_config(&json!({}))
+        .run()
+        .await
+        .expect("runs");
+    assert_eq!(pipeline.output["has_deadline"], json!(false));
+    assert_eq!(pipeline.output["remaining_ms"], Value::Null);
+}
+
+/// A dataflow callee that declares nothing does not get the top-level
+/// dataflow uncap: it runs under whatever its caller has left. The
+/// caller spends 100 ms of its 10 s before invoking, so the callee sees
+/// a budget below 10 s.
+#[tokio::test(flavor = "multi_thread")]
+async fn dataflow_callee_inherits_the_callers_remaining_budget() {
+    let kernel = boot_callee_budget();
+
+    let result = kernel
+        .execute("caller", "probe_after_work", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect("both actions complete");
+    let report = &result.step_results["call"];
+    assert_eq!(report["has_deadline"], json!(true), "report: {report}");
+    let remaining = report["remaining_ms"].as_u64().expect("a number");
+    assert!(
+        (5_000..=9_900).contains(&remaining),
+        "the callee's budget is the caller's 10 s less the 100 ms already spent: {remaining}"
+    );
+}
+
+/// A callee of an uncapped caller — a top-level dataflow pipeline with
+/// no declaration and no operator ceiling — has no budget to inherit,
+/// and declares nothing itself, so it runs uncapped too.
+#[tokio::test(flavor = "multi_thread")]
+async fn callee_of_an_uncapped_caller_is_uncapped() {
+    let kernel = boot_callee_budget();
+
+    let mut handle = kernel
+        .execute("caller", "probe_from_pipeline", json!({}))
+        .with_config(&json!({}))
+        .into_dataflow_handle()
+        .expect("handle returned");
+    let result = handle
+        .result
+        .await
+        .expect("result delivered")
+        .expect("pipeline completes");
+    while let Some(ev) = handle.events.recv().await {
+        if let gwead::kernel::DataflowEvent::PipelineCompleted { ok } = ev {
+            assert!(ok);
+        }
+    }
+    let report = &result.step_results["call"];
+    assert_eq!(report["has_deadline"], json!(false), "report: {report}");
+    assert_eq!(report["remaining_ms"], Value::Null);
+}
+
+/// A callee's own `wallclockTimeoutMs` is enforced by a watchdog of
+/// its own, whoever invokes it. The callee declares 80 ms and ignores
+/// the token; the caller has ten seconds. The callee is dropped at its
+/// cap and the caller sees that as the callee's failure — typed, and
+/// long before the caller's own deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn callee_declared_cap_applies_under_a_longer_caller() {
+    let kernel = boot_callee_budget();
+
+    let started = std::time::Instant::now();
+    let err = kernel
+        .execute("caller", "slow_under_ten_seconds", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("the callee's cap trips");
+    let elapsed = started.elapsed();
+    match err {
+        KernelError::CalleeFailed {
+            step_id,
+            plugin,
+            action,
+            source,
+        } => {
+            assert_eq!(
+                (step_id.as_str(), plugin.as_str(), action.as_str()),
+                ("call", "callee", "slow")
+            );
+            match &*source {
+                KernelError::ExecutionTimeout { timeout_ms } => assert_eq!(*timeout_ms, 80),
+                other => panic!("expected the callee's ExecutionTimeout as source, got: {other:?}"),
+            }
+        }
+        other => panic!("expected CalleeFailed, got: {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the callee's own backstop ended it, not the caller's 10 s: {elapsed:?}"
+    );
+}
+
+/// The callee's deadline fires a child of the caller's token, so it
+/// is a failed step in the caller and nothing more: a `try` around the
+/// invoke catches it, the handler sees the callee's error, and the
+/// caller completes — it was never cancelled.
+#[tokio::test(flavor = "multi_thread")]
+async fn callee_deadline_is_a_step_failure_the_caller_can_catch() {
+    let kernel = boot_callee_budget();
+
+    let started = std::time::Instant::now();
+    let result = kernel
+        .execute("caller", "slow_caught", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect("the caller catches its callee's deadline and completes");
+    let recovered = result.step_results["recovered"]
+        .as_str()
+        .expect("the handler stored the error text");
+    assert!(
+        recovered.contains("callee.slow failed")
+            && recovered.contains("wallclock timeout exceeded (80 ms)"),
+        "the handler sees the callee's deadline: {recovered}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the callee was ended at its 80 ms cap"
+    );
+}
+
+/// The other direction of the clamp: a callee cannot outlive its
+/// caller by declaring more. The callee asks for ten seconds; the
+/// caller has 80 ms; the caller's deadline is what fires.
+#[tokio::test(flavor = "multi_thread")]
+async fn callee_cannot_outlive_its_caller_by_declaring_more() {
+    let kernel = boot_callee_budget();
+
+    let err = kernel
+        .execute("caller", "patient_under_eighty_ms", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("the caller's cap trips");
+    match err {
+        KernelError::ExecutionTimeout { timeout_ms } => assert_eq!(timeout_ms, 80),
+        other => panic!("expected the caller's ExecutionTimeout, got: {other:?}"),
+    }
 }
 
 /// Caller manifest for the finally-supersedes tests: each action's

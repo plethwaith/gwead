@@ -74,6 +74,9 @@ pub(super) struct ScriptRuntimeStoreData {
         Option<std::sync::Arc<dyn crate::kernel::secrets::SecretResolver>>,
     pub(super) parent_exec_ctx: crate::kernel::exec_context::ExecutionContext,
     pub(super) parent_invoke_depth: u32,
+    /// The parent invocation's wallclock deadline (`None` when
+    /// uncapped); bounds whatever `io.invoke` dispatches.
+    pub(super) parent_deadline: Option<tokio::time::Instant>,
     /// Scratch slot for `io.invoke` result JSON. The
     /// wasm-side wrapper calls the host import (which writes here), then
     /// a follow-up `host_call_result_size` / `host_call_result_read` pair

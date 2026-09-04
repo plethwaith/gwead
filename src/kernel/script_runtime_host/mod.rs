@@ -194,6 +194,7 @@ pub(crate) fn step_script<'a>(
             secret_resolver: ex.secret_resolver().cloned(),
             exec_ctx: ex.exec_ctx().clone(),
             invoke_depth: ex.invoke_depth(),
+            deadline: ex.wallclock_deadline(),
         };
 
         tracing::debug!(
@@ -299,6 +300,7 @@ pub(crate) async fn run_script_runtime(
         parent_secret_resolver: parent.secret_resolver,
         parent_exec_ctx: parent.exec_ctx,
         parent_invoke_depth: parent.invoke_depth,
+        parent_deadline: parent.deadline,
         call_result: None,
         call_error: None,
     };
@@ -555,6 +557,7 @@ mod abi_alignment_tests {
             parent_secret_resolver: None,
             parent_exec_ctx: crate::kernel::exec_context::ExecutionContext::default(),
             parent_invoke_depth: 0,
+            parent_deadline: None,
             call_result: None,
             call_error: None,
         };

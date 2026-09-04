@@ -173,6 +173,7 @@ pub(super) async fn execute_dag_dataflow(
         trigger: ctx.trigger,
         secret_resolver: ctx.secret_resolver,
         limits: limits.clone(),
+        deadline: ctx.deadline,
         cancel: Some(cancel.clone()),
         dataflow_events: dataflow_events.clone(),
         step_type_access: ctx.step_type_access.clone(),

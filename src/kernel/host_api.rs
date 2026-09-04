@@ -199,6 +199,10 @@ pub(crate) struct ExecutionState {
     /// `ExecutionState` per spawned task carry the same logical token into
     /// every task.
     pub(crate) cancel: tokio_util::sync::CancellationToken,
+    /// The end of this invocation's wallclock budget, if it has one.
+    /// `None` is an uncapped invocation. See
+    /// [`super::runtime::InvocationContext::deadline`].
+    pub(crate) deadline: Option<tokio::time::Instant>,
     /// Pre-provisioned writable output stream handles for long-running
     /// producer steps in a streaming-dataflow action.
     ///
@@ -524,6 +528,9 @@ pub struct ExecutionStateParams {
     /// always populated. Pass `Some(token)` to expose cancellation to
     /// step bodies inside a dataflow pipeline.
     pub cancel: Option<tokio_util::sync::CancellationToken>,
+    /// The end of the invocation's wallclock budget; `None` when it
+    /// runs uncapped. See [`super::runtime::InvocationContext::deadline`].
+    pub deadline: Option<tokio::time::Instant>,
     /// Telemetry sidechannel sender. `Some` only on
     /// invocations dispatched through
     /// [`ExecuteActionRequest::into_dataflow_handle`](super::execute_request::ExecuteActionRequest::into_dataflow_handle).
@@ -679,6 +686,7 @@ pub(crate) struct DispatchSnapshot {
     pub exec_ctx: ExecutionContext,
     pub invoke_depth: u32,
     pub cancel: tokio_util::sync::CancellationToken,
+    pub deadline: Option<tokio::time::Instant>,
 }
 
 impl DispatchSnapshot {
@@ -698,6 +706,7 @@ impl DispatchSnapshot {
             exec_ctx: ex.exec_ctx().clone(),
             invoke_depth: ex.invoke_depth(),
             cancel: ex.cancel_token(),
+            deadline: ex.wallclock_deadline(),
         }
     }
 }
@@ -971,6 +980,16 @@ pub trait PluginExecution: sealed::Sealed + Send {
     /// so callers can tear down cleanly.
     fn cancel_token(&self) -> tokio_util::sync::CancellationToken;
 
+    /// The end of this invocation's wallclock budget, if it has one:
+    /// the action's own `wallclockTimeoutMs`, the deployment default,
+    /// or — for a callee — whatever its caller had left, all clamped by
+    /// the operator ceiling (`Kernel::effective_wallclock_timeout`).
+    /// The token fires then, and a step still running a short grace
+    /// later is dropped. `None` is an uncapped invocation. A step body
+    /// that waits on IO can bound that wait to the remaining budget
+    /// instead of discovering the deadline only when the token fires.
+    fn wallclock_deadline(&self) -> Option<tokio::time::Instant>;
+
     /// Dispatch to whichever plugin is bound to `role`, calling
     /// `action` with `input`.
     ///
@@ -1191,6 +1210,10 @@ impl PluginExecution for ExecutionState {
         self.cancel.clone()
     }
 
+    fn wallclock_deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+    }
+
     fn dispatch_role(
         &self,
         role: &str,
@@ -1255,6 +1278,7 @@ impl ExecutionState {
             limits: params.limits,
             active_fanout_overrides: HashMap::new(),
             cancel: params.cancel.unwrap_or_default(),
+            deadline: params.deadline,
             dataflow_outputs: std::sync::Arc::new(HashMap::new()),
             dataflow_events: params.dataflow_events,
             current_step_idx: None,
@@ -2121,6 +2145,7 @@ fn step_invoke<'a>(
         let secret_resolver = ex.secret_resolver().cloned();
         let exec_ctx = ex.exec_ctx().clone();
         let parent_cancel = ex.cancel_token();
+        let parent_deadline = ex.wallclock_deadline();
 
         let request = match (&plugin_field, &role_field) {
             (Some(p), None) => super::dispatch::DispatchRequest::ByPlugin {
@@ -2196,6 +2221,7 @@ fn step_invoke<'a>(
                 &exec_ctx,
                 parent_depth,
                 Some(parent_cancel),
+                parent_deadline,
             )
             .await
         {
@@ -2458,6 +2484,7 @@ pub(crate) fn step_alias_dispatch<'a>(
         let secret_resolver = ex.secret_resolver().cloned();
         let exec_ctx = ex.exec_ctx().clone();
         let parent_cancel = ex.cancel_token();
+        let parent_deadline = ex.wallclock_deadline();
 
         // Capability gate: an alias step dispatches into the impl
         // plugin's action, so using one against another plugin
@@ -2533,6 +2560,7 @@ pub(crate) fn step_alias_dispatch<'a>(
                 &exec_ctx,
                 parent_depth,
                 Some(parent_cancel),
+                parent_deadline,
             )
             .await
         {

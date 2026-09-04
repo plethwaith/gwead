@@ -326,6 +326,7 @@ fn parent_state(
         kernel: Some(Arc::downgrade(kernel)),
         trigger: None,
         limits: RuntimeLimits::default(),
+        deadline: None,
         cancel: None,
         dataflow_events: None,
     })
@@ -674,6 +675,7 @@ async fn trait_dispatch_role_without_kernel_back_ref_errors_cleanly() {
         kernel: None, // ← the case under test
         trigger: None,
         limits: RuntimeLimits::default(),
+        deadline: None,
         cancel: None,
         dataflow_events: None,
     });
