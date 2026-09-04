@@ -592,7 +592,8 @@ pub struct Action {
     /// explicitly. The two-hour case is `wallclockTimeoutMs: 7200000`.
     ///
     /// **Invoked as a callee** — reached through an `invoke` or alias
-    /// step, `dispatch_role`, or a guest's `io.invoke` — and the caller
+    /// step, `dispatch_role`, or a guest's `io.invoke` or
+    /// `io.invoke_streaming` — and the caller
     /// has a deadline, the action is bounded by the caller's
     /// *remaining* budget instead of cases 2 and 3: a declaration still
     /// applies (clamped to what the caller has left), but a dataflow

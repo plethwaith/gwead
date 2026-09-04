@@ -435,10 +435,11 @@ impl<'a> ExecuteActionRequest<'a> {
                 super::streams::STREAM_FANOUT_CAPACITY,
             )
         };
-        let output: super::streams::ReadableSource =
-            Box::pin(futures::stream::unfold(receiver, |mut rx| async move {
+        let output: super::streams::ReadableSource = Box::pin(futures::StreamExt::fuse(
+            futures::stream::unfold(receiver, |mut rx| async move {
                 rx.recv().await.map(|item| (item, rx))
-            }));
+            }),
+        ));
 
         let mut pre_allocated = std::collections::HashMap::new();
         pre_allocated.insert(producer_step_id, writable_id);

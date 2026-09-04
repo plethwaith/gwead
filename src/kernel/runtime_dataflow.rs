@@ -671,10 +671,11 @@ fn provision_dataflow_streams(
         // The unfolded stream resolves to None when the writable sender's
         // refcount drops to zero — i.e. when the producer drops its handle —
         // signalling EOF to downstream consumers naturally.
-        let recv_source: ReadableSource =
-            Box::pin(futures::stream::unfold(receiver, |mut rx| async move {
+        let recv_source: ReadableSource = Box::pin(futures::StreamExt::fuse(
+            futures::stream::unfold(receiver, |mut rx| async move {
                 rx.recv().await.map(|item| (item, rx))
-            }));
+            }),
+        ));
 
         // Step 3: register the readable. Reads against this handle drain
         // chunks the producer pushed via `stream_write` on `writable_id`.

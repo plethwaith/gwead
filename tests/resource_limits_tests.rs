@@ -1244,14 +1244,17 @@ async fn handle_driven_dataflow_parent_invoking_a_dataflow_callee_winds_down() {
 // Callee wallclock budget
 // ---------------------------------------------------------------------------
 
-/// Caller and callee manifests for the callee-budget tests.
+/// Callee, middle, and caller manifests for the callee-budget tests.
 ///
 /// The callee offers `probe` (a dataflow action whose one long-running
 /// step reports the deadline it runs under), `probe_plain` (the same
 /// report from an ordinary action), `slow` (declares an 80 ms cap and
-/// then ignores the token for 5 s) and `patient` (declares a generous
-/// cap and ignores the token for 5 s). Each caller action invokes one
-/// of them from under a different budget.
+/// then ignores the token for 5 s), `patient` (declares a generous cap
+/// and ignores the token for 5 s) and `boom` (throws). `mid` invokes
+/// the callee from an undeclared action, for the two-level chains. The
+/// caller's actions each reach one of them from under a different
+/// budget — directly, through `mid`, through an alias of its own, or
+/// from a pipeline on the handle paths.
 fn callee_budget_manifests() -> [&'static str; 3] {
     let callee = r#"{
         "name": "callee",
@@ -1292,6 +1295,10 @@ fn callee_budget_manifests() -> [&'static str; 3] {
             "boom_hop": {
                 "steps": [{"id": "call", "type": "invoke",
                             "params": {"plugin": "callee", "action": "boom", "input": {}}}]
+            },
+            "slow_hop": {
+                "steps": [{"id": "call", "type": "invoke",
+                            "params": {"plugin": "callee", "action": "slow", "input": {}}}]
             }
         }
     }"#;
@@ -1311,6 +1318,11 @@ fn callee_budget_manifests() -> [&'static str; 3] {
                      "params": {"sleep_ms": 100}},
                     {"id": "hop", "type": "caller.hop", "params": {}}
                 ]
+            },
+            "slow_two_levels_down": {
+                "wallclockTimeoutMs": 10000,
+                "steps": [{"id": "call", "type": "invoke",
+                            "params": {"plugin": "mid", "action": "slow_hop", "input": {}}}]
             },
             "boom_two_levels_down": {
                 "wallclockTimeoutMs": 10000,
@@ -1384,8 +1396,9 @@ fn boot_callee_budget() -> Arc<Kernel> {
     )
 }
 
-/// The remaining budget a `report_deadline` step recorded, from the
-/// step result that carries the callee's output.
+/// The remaining budget a `report_deadline` step recorded, from
+/// whichever value carries its output — an action's `output`, or the
+/// step result of the invoke that reached it.
 fn remaining_ms(report: &Value) -> u64 {
     assert_eq!(report["has_deadline"], json!(true), "report: {report}");
     report["remaining_ms"].as_u64().expect("a number")
@@ -1585,6 +1598,66 @@ async fn callee_failure_stays_typed_through_two_hops() {
     }
 }
 
+/// The shape the docs promise for a deadline two levels down: the
+/// leaf's own cap fires, and each level above wraps it in its own
+/// `CalleeFailed` rather than the remap collapsing it — neither the
+/// middle nor the root had reached its deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn callee_deadline_stays_typed_through_two_hops() {
+    let kernel = boot_callee_budget();
+
+    let started = std::time::Instant::now();
+    let err = kernel
+        .execute("caller", "slow_two_levels_down", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("the leaf's cap trips");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "ended by the leaf's 80 ms"
+    );
+    let KernelError::CalleeFailed { plugin, source, .. } = &err else {
+        panic!("expected CalleeFailed at the root, got: {err:?}");
+    };
+    assert_eq!(plugin, "mid");
+    let KernelError::CalleeFailed { plugin, source, .. } = &**source else {
+        panic!("expected CalleeFailed one level down, got: {source:?}");
+    };
+    assert_eq!(plugin, "callee");
+    match &**source {
+        KernelError::ExecutionTimeout { timeout_ms } => assert_eq!(*timeout_ms, 80),
+        other => panic!("expected the leaf's ExecutionTimeout, got: {other:?}"),
+    }
+}
+
+/// The streaming handle path — the one whose long-running step's bytes
+/// flow out to the embedder — passes its cap to a callee like the
+/// other handle path does.
+#[tokio::test(flavor = "multi_thread")]
+async fn capped_pipeline_on_the_streaming_handle_path_bounds_its_callee() {
+    let kernel = boot_callee_budget();
+
+    let mut handle = kernel
+        .execute("caller", "probe_from_capped_pipeline", json!({}))
+        .with_config(&json!({}))
+        .into_dataflow_streaming_handle()
+        .expect("handle returned");
+    use futures::StreamExt as _;
+    while handle.output.next().await.is_some() {}
+    let result = handle
+        .result
+        .await
+        .expect("result delivered")
+        .expect("pipeline completes");
+    while handle.events.recv().await.is_some() {}
+    let remaining = remaining_ms(&result.step_results["call"]);
+    assert!(
+        (5_000..=10_000).contains(&remaining),
+        "the callee sees the pipeline's declared 10 s: {remaining}"
+    );
+}
+
 /// An alias step is an invoke by another name, and its callee is
 /// bounded the same way.
 #[tokio::test(flavor = "multi_thread")]
@@ -1692,10 +1765,10 @@ fn boot_slow_resolver() -> Arc<Kernel> {
 
 /// The wallclock budget starts when the action does, after its
 /// secrets are pulled: a resolver that takes 300 ms of a 1 s cap does
-/// not eat into what the action's steps get. Pinned at the three
-/// entry points a manifest can reach without a wasm guest — `run`, an
-/// inline invoke, and the dataflow handle — since each arms its cap
-/// separately.
+/// not eat into what the action's steps get. Pinned here at `run`, an
+/// inline invoke, and the dataflow handle, since each arms its cap
+/// separately; the spawned streaming path is pinned beside its own
+/// harness in the kernel's unit tests.
 #[tokio::test(flavor = "multi_thread")]
 async fn resolver_latency_is_not_charged_to_the_budget() {
     let kernel = boot_slow_resolver();

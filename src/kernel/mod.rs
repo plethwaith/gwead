@@ -3654,26 +3654,26 @@ impl Kernel {
         // read that finds it.
         let outcome: Arc<std::sync::Mutex<Option<std::io::Error>>> = Default::default();
         let outcome_for_reader = Arc::clone(&outcome);
-        let recv_source: self::streams::ReadableSource = Box::pin(futures::stream::unfold(
-            (receiver, outcome_for_reader, false),
-            |(mut rx, outcome, reported)| async move {
-                if reported {
-                    return None;
-                }
-                match rx.recv().await {
-                    Some(item) => Some((item, (rx, outcome, false))),
-                    // Channel exhausted: every sender is gone, so the
-                    // callee has ended and its outcome is final.
-                    None => {
-                        let failure = outcome
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .take();
-                        failure.map(|failure| (Err(failure), (rx, outcome, true)))
+        let recv_source: self::streams::ReadableSource =
+            Box::pin(futures::StreamExt::fuse(futures::stream::unfold(
+                (receiver, outcome_for_reader),
+                |(mut rx, outcome)| async move {
+                    match rx.recv().await {
+                        Some(item) => Some((item, (rx, outcome))),
+                        // Channel exhausted: every sender is gone, so
+                        // the callee has ended and its outcome is
+                        // final. Taken, so the next pull finds the
+                        // channel still closed and the slot empty.
+                        None => {
+                            let failure = outcome
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .take();
+                            failure.map(|failure| (Err(failure), (rx, outcome)))
+                        }
                     }
-                }
-            },
-        ));
+                },
+            )));
         let readable_id = {
             let mut reg = self::streams::lock_shared(&parent_streams);
             reg.register_readable("application/octet-stream", recv_source)
@@ -3910,7 +3910,8 @@ impl Kernel {
             step_type_access: self.step_type_access_for(plugin_name),
             // The callee's own handle table — `None` makes the runtime
             // allocate a fresh one; see `execute_action_invoked` for
-            // why it is not the parent's.
+            // why it is not the parent's. The spawned path replaces
+            // this with a table holding its one writable.
             streams: None,
             invoke_depth: parent_depth + 1,
             dispatch_depth: 0,
@@ -5982,6 +5983,61 @@ mod wallclock_timeout_tests {
         })
     }
 
+    /// A producer that writes `params.chunks` one-byte chunks and then
+    /// fails, without ever yielding to a consumer.
+    fn write_n_then_fail<'a>(
+        ex: &'a mut (dyn host_api::PluginExecution + Send),
+        params: &'a Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<host_api::StepOutput, host_api::StepError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let chunks = params["chunks"].as_u64().unwrap_or(0);
+            let step_id = ex.current_step_id().to_string();
+            let writable = ex
+                .dataflow_outputs()
+                .get(&step_id)
+                .copied()
+                .expect("a pre-provisioned writable");
+            let streams_arc = ex.streams().clone();
+            for _ in 0..chunks {
+                let n = streams::write_async_shared(&streams_arc, writable, b"x").await;
+                assert!(n > 0, "each chunk fits the channel");
+            }
+            Err(host_api::StepError::Failed(
+                "failed behind a full channel".into(),
+            ))
+        })
+    }
+
+    /// A producer that races a long sleep against the token and
+    /// answers the token with the typed cancellation.
+    fn sleep_racing_token<'a>(
+        ex: &'a mut (dyn host_api::PluginExecution + Send),
+        params: &'a Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<host_api::StepOutput, host_api::StepError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let cancel = ex.cancel_token();
+        Box::pin(async move {
+            let ms = params["sleep_ms"].as_u64().unwrap_or(0);
+            tokio::select! {
+                () = cancel.cancelled() => Err(host_api::StepError::Cancelled),
+                () = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {
+                    Ok(host_api::StepOutput::from(Value::Null))
+                }
+            }
+        })
+    }
+
     /// A producer that writes the milliseconds left of its budget, as
     /// decimal text, and succeeds.
     fn write_remaining_budget<'a>(
@@ -6103,6 +6159,16 @@ mod wallclock_timeout_tests {
         kernel: &Arc<Kernel>,
         parent_deadline: Option<tokio::time::Instant>,
     ) -> streams::ReadableSource {
+        spawn_relay_under(kernel, parent_deadline, None).await
+    }
+
+    /// [`spawn_relay`] with a parent token as well. The resolver is the
+    /// kernel's, as a real parent invocation would hand on.
+    async fn spawn_relay_under(
+        kernel: &Arc<Kernel>,
+        parent_deadline: Option<tokio::time::Instant>,
+        parent_cancel: Option<tokio_util::sync::CancellationToken>,
+    ) -> streams::ReadableSource {
         let parent_streams: streams::SharedStreamRegistry = Default::default();
         let readable = kernel
             .execute_action_invoked_streaming(
@@ -6110,11 +6176,11 @@ mod wallclock_timeout_tests {
                 "relay",
                 Value::Null,
                 &Value::Null,
-                None,
+                kernel.secret_resolver.clone(),
                 &ExecutionContext::default(),
                 parent_streams.clone(),
                 0,
-                None,
+                parent_cancel,
                 parent_deadline,
             )
             .await
@@ -6202,6 +6268,50 @@ mod wallclock_timeout_tests {
         }
     }
 
+    /// The failure survives a full channel behind a slow consumer: the
+    /// producer fills the channel to capacity and fails; nobody reads
+    /// for longer than any delivery window; the consumer then drains
+    /// every chunk and still finds the failure after them. Recorded
+    /// beside the channel, the report has no window to miss.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawned_streaming_callee_failure_survives_a_full_channel() {
+        let capacity = streams::STREAM_FANOUT_CAPACITY;
+        let kernel = kernel_with_relay(write_n_then_fail, &format!(r#"{{"chunks": {capacity}}}"#));
+        let mut source = spawn_relay(&kernel, None).await;
+        tokio::time::sleep(WALLCLOCK_DROP_GRACE * 3).await;
+        let items = drain_relay(&mut source).await;
+        let (chunks, rest) = items.split_at(capacity);
+        assert!(
+            chunks
+                .iter()
+                .all(|item| matches!(item, Ok(b) if &b[..] == b"x")),
+            "every chunk the producer wrote arrives first"
+        );
+        match rest {
+            [Err(err)] => assert!(
+                err.to_string().contains("failed behind a full channel"),
+                "the failure follows the last chunk: {err}"
+            ),
+            other => panic!("expected the failure then EOF after the chunks, got: {other:?}"),
+        }
+    }
+
+    /// A callee its caller cancelled is not a failure: its stream ends
+    /// with a plain EOF and no error item, since the caller knows what
+    /// it did.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn caller_cancelled_spawned_streaming_callee_ends_with_plain_eof() {
+        let kernel = kernel_with_relay(sleep_racing_token, r#"{"sleep_ms": 5000}"#);
+        let parent = tokio_util::sync::CancellationToken::new();
+        let started = std::time::Instant::now();
+        let mut source = spawn_relay_under(&kernel, None, Some(parent.clone())).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        parent.cancel();
+        let items = drain_relay(&mut source).await;
+        assert!(items.is_empty(), "no chunk and no error item: {items:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
     /// The other half of holding a sender: it must be released. A
     /// successful callee's stream ends with its bytes and a plain EOF.
     #[tokio::test(flavor = "multi_thread")]
@@ -6230,7 +6340,12 @@ mod wallclock_timeout_tests {
             r#""usesSecrets": ["k"],"#,
             r#""wallclockTimeoutMs": 1000,"#,
         );
+        let started = std::time::Instant::now();
         let mut source = spawn_relay(&kernel, None).await;
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(300),
+            "the spawn waits on the pull, so the resolver was consulted"
+        );
         let items = drain_relay(&mut source).await;
         let remaining: u64 = match items.as_slice() {
             [Ok(text)] => std::str::from_utf8(text)
