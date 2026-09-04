@@ -1265,6 +1265,10 @@ fn callee_budget_manifests() -> [&'static str; 3] {
                 "steps": [{"id": "report", "type": "test_resource_limits_fixture.report_deadline",
                             "params": {}}]
             },
+            "boom": {
+                "steps": [{"id": "bad", "type": "throw_error",
+                            "params": {"code": "E_CALLEE", "message": "nope"}}]
+            },
             "slow": {
                 "wallclockTimeoutMs": 80,
                 "steps": [{"id": "nap", "type": "test_resource_limits_fixture.sleep_async",
@@ -1284,6 +1288,10 @@ fn callee_budget_manifests() -> [&'static str; 3] {
             "hop": {
                 "steps": [{"id": "call", "type": "invoke",
                             "params": {"plugin": "callee", "action": "probe_plain", "input": {}}}]
+            },
+            "boom_hop": {
+                "steps": [{"id": "call", "type": "invoke",
+                            "params": {"plugin": "callee", "action": "boom", "input": {}}}]
             }
         }
     }"#;
@@ -1303,6 +1311,11 @@ fn callee_budget_manifests() -> [&'static str; 3] {
                      "params": {"sleep_ms": 100}},
                     {"id": "hop", "type": "caller.hop", "params": {}}
                 ]
+            },
+            "boom_two_levels_down": {
+                "wallclockTimeoutMs": 10000,
+                "steps": [{"id": "call", "type": "invoke",
+                            "params": {"plugin": "mid", "action": "boom_hop", "input": {}}}]
             },
             "probe_two_levels_down": {
                 "wallclockTimeoutMs": 10000,
@@ -1525,6 +1538,51 @@ async fn budget_is_inherited_two_levels_down() {
         (5_000..=9_900).contains(&remaining),
         "the leaf sees the root's budget less the 100 ms spent: {remaining}"
     );
+}
+
+/// A failure two levels down keeps its shape through both hops: each
+/// level wraps the one below in its own `CalleeFailed`, and the leaf's
+/// structured error is still there to branch on.
+#[tokio::test(flavor = "multi_thread")]
+async fn callee_failure_stays_typed_through_two_hops() {
+    let kernel = boot_callee_budget();
+
+    let err = kernel
+        .execute("caller", "boom_two_levels_down", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("the leaf throws");
+    let KernelError::CalleeFailed {
+        step_id,
+        plugin,
+        action,
+        source,
+    } = &err
+    else {
+        panic!("expected CalleeFailed at the root, got: {err:?}");
+    };
+    assert_eq!(
+        (step_id.as_str(), plugin.as_str(), action.as_str()),
+        ("call", "mid", "boom_hop")
+    );
+    let KernelError::CalleeFailed {
+        step_id,
+        plugin,
+        action,
+        source,
+    } = &**source
+    else {
+        panic!("expected CalleeFailed one level down, got: {source:?}");
+    };
+    assert_eq!(
+        (step_id.as_str(), plugin.as_str(), action.as_str()),
+        ("call", "callee", "boom")
+    );
+    match &**source {
+        KernelError::PluginError { code, .. } => assert_eq!(code, "E_CALLEE"),
+        other => panic!("expected the leaf's PluginError, got: {other:?}"),
+    }
 }
 
 /// An alias step is an invoke by another name, and its callee is

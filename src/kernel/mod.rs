@@ -3336,7 +3336,7 @@ impl Kernel {
     }
 
     /// Decision tree for the wallclock cap of a *top-level*
-    /// invocation — every `execute_action*` entry point and event
+    /// invocation — an `ExecuteActionRequest` terminal or an event
     /// dispatch. `Some(d)` arms a watchdog for `d` from now (see
     /// [`Self::wallclock_cap`]); `None` runs the action uncapped,
     /// cooperative cancellation only. A callee's cap is decided by
@@ -3543,12 +3543,15 @@ impl Kernel {
     /// registry (passed as `parent_streams`). The caller reads from it
     /// like any other readable. EOF on it means the callee has *ended*,
     /// not merely that its producer closed its handle: the kernel holds
-    /// a sender of its own until then, so that a callee-side failure
-    /// can always be put on the stream as an error item — the caller's
-    /// next read sees `STREAM_IO_ERROR` rather than an EOF it could
-    /// mistake for the end of the data. The failure is logged at `warn`
-    /// as well. A callee cancelled by its caller ends the stream with a
-    /// plain EOF.
+    /// a sender of its own until then. A callee-side failure — a failed
+    /// step, its own deadline, or the action vanishing before it ran —
+    /// is recorded beside the channel and the readable yields it as an
+    /// error item once the bytes the producer did write are drained,
+    /// then EOF; the caller's read sees `STREAM_IO_ERROR` rather than
+    /// an EOF it could mistake for the end of the data, and nothing
+    /// queued ahead of the report can crowd it out. The failure is
+    /// logged at `warn` as well. A callee cancelled by its caller ends
+    /// the stream with a plain EOF.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_action_invoked_streaming(
         self: &Arc<Self>,
@@ -3642,10 +3645,35 @@ impl Kernel {
                 .expect("a writable registered a moment ago has a sender");
             (id, receiver, sender)
         };
-        let recv_source: self::streams::ReadableSource =
-            Box::pin(futures::stream::unfold(receiver, |mut rx| async move {
-                rx.recv().await.map(|item| (item, rx))
-            }));
+        // The callee's failure, if any, recorded out of band. It rides
+        // beside the data channel rather than through it so that it is
+        // never queued behind chunks a slow consumer has yet to drain,
+        // and never lost to a full channel: the readable yields it
+        // once the channel is exhausted. Written before the held
+        // sender drops, so the channel's close orders it ahead of the
+        // read that finds it.
+        let outcome: Arc<std::sync::Mutex<Option<std::io::Error>>> = Default::default();
+        let outcome_for_reader = Arc::clone(&outcome);
+        let recv_source: self::streams::ReadableSource = Box::pin(futures::stream::unfold(
+            (receiver, outcome_for_reader, false),
+            |(mut rx, outcome, reported)| async move {
+                if reported {
+                    return None;
+                }
+                match rx.recv().await {
+                    Some(item) => Some((item, (rx, outcome, false))),
+                    // Channel exhausted: every sender is gone, so the
+                    // callee has ended and its outcome is final.
+                    None => {
+                        let failure = outcome
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take();
+                        failure.map(|failure| (Err(failure), (rx, outcome, true)))
+                    }
+                }
+            },
+        ));
         let readable_id = {
             let mut reg = self::streams::lock_shared(&parent_streams);
             reg.register_readable("application/octet-stream", recv_source)
@@ -3686,6 +3714,12 @@ impl Kernel {
         ctx.pre_allocated_outputs = Some(pre_allocated);
 
         tokio::spawn(async move {
+            let record_failure = |text: String| {
+                *outcome
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(std::io::Error::other(text));
+            };
             let Some(registration) = kernel.registry.get_action(&plugin_owned, &action_owned)
             else {
                 tracing::warn!(
@@ -3693,6 +3727,10 @@ impl Kernel {
                     action = %action_owned,
                     "io.invoke_streaming: action unregistered between spawn and run"
                 );
+                record_failure(format!(
+                    "{plugin_owned}.{action_owned} unregistered before it ran"
+                ));
+                drop(failure_sender);
                 return;
             };
             let fut = kernel.runtime.execute_dag(
@@ -3728,38 +3766,17 @@ impl Kernel {
                         action = %action_owned,
                         error = %e,
                         "io.invoke_streaming: background action failed; \
-                         reporting it on the stream"
+                         its stream ends with the failure"
                     );
                     // The consumer cannot tell a truncated stream from
-                    // a complete one by EOF alone, so the failure goes
-                    // on the stream as an error item, through the
-                    // sender held for exactly this. Delivery is
-                    // bounded — the consumer has until the callee's
-                    // budget ends, or one grace from now if it already
-                    // has — because this task has nothing left to wait
-                    // on and a consumer that has stopped reading would
-                    // park it for good. A consumer that cannot take the
-                    // item by then reads EOF instead.
-                    let now = tokio::time::Instant::now();
-                    let latest =
-                        wallclock.deadline().map_or(now, |d| d.max(now)) + WALLCLOCK_DROP_GRACE;
-                    let item = Err(std::io::Error::other(format!(
-                        "{plugin_owned}.{action_owned} failed: {e}"
-                    )));
-                    let delivered = tokio::time::timeout_at(latest, failure_sender.send(item))
-                        .await
-                        .is_ok_and(|sent| sent.is_ok());
-                    if !delivered {
-                        tracing::debug!(
-                            plugin = %plugin_owned,
-                            action = %action_owned,
-                            "io.invoke_streaming: consumer did not take the failure \
-                             report in time; it reads EOF"
-                        );
-                    }
+                    // a complete one by EOF alone. Recorded beside the
+                    // channel, the failure is what the readable yields
+                    // after the last chunk — see `outcome` above.
+                    record_failure(format!("{plugin_owned}.{action_owned} failed: {e}"));
                 }
             }
-            // Last sender gone: the parent's readable reaches EOF.
+            // Last sender gone: the parent's readable drains, yields the
+            // recorded failure if there is one, and reaches EOF.
             drop(failure_sender);
         });
 
@@ -3863,7 +3880,8 @@ impl Kernel {
 
     /// What every callee execution takes from its caller's context:
     /// whose wallclock bound applies ([`Self::callee_wallclock`]), the
-    /// token it runs under, and an [`InvocationContext`] for a handle
+    /// token it runs under, and an
+    /// [`InvocationContext`](self::runtime::InvocationContext) for a handle
     /// table of its own. Shared by the inline and the spawned invoke
     /// paths so the two cannot drift.
     ///
@@ -4852,8 +4870,8 @@ impl CalleeWallclock {
 /// drop would win often enough that cooperative cleanup was the
 /// exception rather than the rule. The cost is that the ceiling is
 /// soft by this margin for a step that ignores the token: it runs up
-/// to `timeout + WALLCLOCK_DROP_GRACE` before being dropped, and the
-/// reported `timeout_ms` is still the declared cap.
+/// to one grace past its deadline before being dropped, and the
+/// reported `timeout_ms` is still the cap it ran under.
 const WALLCLOCK_DROP_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// What [`run_with_wallclock_timeout`] observed alongside the result.
@@ -5912,10 +5930,122 @@ mod wallclock_timeout_tests {
         })
     }
 
+    /// A producer that writes one chunk, closes its writable — the
+    /// well-behaved relay's "I am done" — and only then fails.
+    fn write_close_then_fail<'a>(
+        ex: &'a mut (dyn host_api::PluginExecution + Send),
+        _params: &'a Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<host_api::StepOutput, host_api::StepError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let step_id = ex.current_step_id().to_string();
+            let writable = ex
+                .dataflow_outputs()
+                .get(&step_id)
+                .copied()
+                .expect("a pre-provisioned writable");
+            let streams_arc = ex.streams().clone();
+            let n = streams::write_async_shared(&streams_arc, writable, b"partial").await;
+            assert!(n > 0, "the chunk before the failure is accepted");
+            streams::lock_shared(&streams_arc).close_handle(writable);
+            Err(host_api::StepError::Failed("failed after closing".into()))
+        })
+    }
+
+    /// A producer that writes one chunk and succeeds.
+    fn write_then_succeed<'a>(
+        ex: &'a mut (dyn host_api::PluginExecution + Send),
+        _params: &'a Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<host_api::StepOutput, host_api::StepError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let step_id = ex.current_step_id().to_string();
+            let writable = ex
+                .dataflow_outputs()
+                .get(&step_id)
+                .copied()
+                .expect("a pre-provisioned writable");
+            let streams_arc = ex.streams().clone();
+            let n = streams::write_async_shared(&streams_arc, writable, b"all").await;
+            assert!(n > 0);
+            Ok(host_api::StepOutput::from(Value::Null))
+        })
+    }
+
+    /// A producer that writes the milliseconds left of its budget, as
+    /// decimal text, and succeeds.
+    fn write_remaining_budget<'a>(
+        ex: &'a mut (dyn host_api::PluginExecution + Send),
+        _params: &'a Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<host_api::StepOutput, host_api::StepError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let remaining_ms = ex
+            .wallclock_deadline()
+            .map(|d| {
+                d.saturating_duration_since(tokio::time::Instant::now())
+                    .as_millis()
+            })
+            .expect("a capped relay has a deadline");
+        Box::pin(async move {
+            let step_id = ex.current_step_id().to_string();
+            let writable = ex
+                .dataflow_outputs()
+                .get(&step_id)
+                .copied()
+                .expect("a pre-provisioned writable");
+            let streams_arc = ex.streams().clone();
+            let text = remaining_ms.to_string();
+            let n = streams::write_async_shared(&streams_arc, writable, text.as_bytes()).await;
+            assert!(n > 0);
+            Ok(host_api::StepOutput::from(Value::Null))
+        })
+    }
+
+    /// A resolver that takes its time, and answers the one key the
+    /// relay may declare.
+    struct SlowResolver(std::time::Duration);
+
+    impl SecretResolver for SlowResolver {
+        fn resolve<'a>(
+            &'a self,
+            _request: secrets::SecretRequest<'a>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Value, secrets::SecretError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                tokio::time::sleep(self.0).await;
+                Ok(serde_json::json!({ "k": "v" }))
+            })
+        }
+    }
+
     /// A kernel with one dataflow action, `budget.relay`, whose single
-    /// long-running step `produce` runs `body`.
-    fn kernel_with_relay(body: native_impls::NativeStepImpl, params: &str) -> Arc<Kernel> {
-        let mut config = KernelConfig::default();
+    /// long-running step `produce` runs `body`. `manifest_fields` and
+    /// `action_fields` are raw JSON members spliced into the manifest
+    /// and the action (each ending in a comma, or empty).
+    fn kernel_with_relay_under(
+        config: KernelConfig,
+        body: native_impls::NativeStepImpl,
+        params: &str,
+        manifest_fields: &str,
+        action_fields: &str,
+    ) -> Arc<Kernel> {
+        let mut config = config;
         config
             .native_step_impls
             .insert("test.budget.produce", body)
@@ -5926,11 +6056,13 @@ mod wallclock_timeout_tests {
                 r#"{{
                     "name": "budget",
                     "version": "0.0.0",
+                    {manifest_fields}
                     "stepTypeDefs": [{{"name": "budget.produce", "freelyUsable": true}}],
                     "stepTypeImpls": [{{"stepType": "budget.produce", "kind": "native",
                                        "implRef": "test.budget.produce"}}],
                     "actions": {{
                         "relay": {{
+                            {action_fields}
                             "dataflow": true,
                             "steps": [{{"id": "produce", "type": "budget.produce",
                                        "params": {params}, "longRunning": true}}]
@@ -5940,6 +6072,29 @@ mod wallclock_timeout_tests {
             ))
             .expect("registers");
         kernel.into_arc()
+    }
+
+    /// [`kernel_with_relay_under`] with the default config and no
+    /// extra fields.
+    fn kernel_with_relay(body: native_impls::NativeStepImpl, params: &str) -> Arc<Kernel> {
+        kernel_with_relay_under(KernelConfig::default(), body, params, "", "")
+    }
+
+    /// Everything a relay's readable yields until EOF, within two
+    /// seconds.
+    async fn drain_relay(
+        source: &mut streams::ReadableSource,
+    ) -> Vec<Result<bytes::Bytes, std::io::Error>> {
+        use futures::StreamExt as _;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut items = Vec::new();
+            while let Some(item) = source.next().await {
+                items.push(item);
+            }
+            items
+        })
+        .await
+        .expect("the relay's readable reaches EOF")
     }
 
     /// Spawn `budget.relay` as a streaming callee under `parent_deadline`
@@ -5985,17 +6140,7 @@ mod wallclock_timeout_tests {
             Some(tokio::time::Instant::now() + std::time::Duration::from_millis(80));
         let started = std::time::Instant::now();
         let mut source = spawn_relay(&kernel, parent_deadline).await;
-
-        use futures::StreamExt as _;
-        let items = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            let mut items = Vec::new();
-            while let Some(item) = source.next().await {
-                items.push(item);
-            }
-            items
-        })
-        .await
-        .expect("the callee's own backstop ends it long before its 5 s sleep");
+        let items = drain_relay(&mut source).await;
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "ended by the caller's remaining budget, not the sleep"
@@ -6035,6 +6180,69 @@ mod wallclock_timeout_tests {
             "the error item names the callee and its failure: {text}"
         );
         assert!(source.next().await.is_none(), "EOF after the error item");
+    }
+
+    /// The held sender is what makes the report reliable: a producer
+    /// that closes its writable and *then* fails would otherwise have
+    /// ended the stream with a clean EOF before its outcome was known.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawned_streaming_callee_that_closed_its_writable_still_reports_its_failure() {
+        let kernel = kernel_with_relay(write_close_then_fail, "{}");
+        let mut source = spawn_relay(&kernel, None).await;
+        let items = drain_relay(&mut source).await;
+        match items.as_slice() {
+            [Ok(chunk), Err(err)] => {
+                assert_eq!(&chunk[..], b"partial");
+                assert!(
+                    err.to_string().contains("failed after closing"),
+                    "the failure after the close is on the stream: {err}"
+                );
+            }
+            other => panic!("expected the chunk, the failure, then EOF, got: {other:?}"),
+        }
+    }
+
+    /// The other half of holding a sender: it must be released. A
+    /// successful callee's stream ends with its bytes and a plain EOF.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn successful_spawned_streaming_callee_ends_with_eof() {
+        let kernel = kernel_with_relay(write_then_succeed, "{}");
+        let mut source = spawn_relay(&kernel, None).await;
+        let items = drain_relay(&mut source).await;
+        match items.as_slice() {
+            [Ok(chunk)] => assert_eq!(&chunk[..], b"all"),
+            other => panic!("expected the chunk then EOF, got: {other:?}"),
+        }
+    }
+
+    /// The spawned path pulls the callee's secrets before arming its
+    /// cap, like every other entry point: a resolver that takes 300 ms
+    /// of a 1 s declared cap leaves the producer with the whole second.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawned_streaming_callee_budget_starts_after_its_secret_pull() {
+        let config = KernelConfig::default().with_secret_resolver(Arc::new(SlowResolver(
+            std::time::Duration::from_millis(300),
+        )));
+        let kernel = kernel_with_relay_under(
+            config,
+            write_remaining_budget,
+            "{}",
+            r#""usesSecrets": ["k"],"#,
+            r#""wallclockTimeoutMs": 1000,"#,
+        );
+        let mut source = spawn_relay(&kernel, None).await;
+        let items = drain_relay(&mut source).await;
+        let remaining: u64 = match items.as_slice() {
+            [Ok(text)] => std::str::from_utf8(text)
+                .expect("utf8")
+                .parse()
+                .expect("a number"),
+            other => panic!("expected one chunk then EOF, got: {other:?}"),
+        };
+        assert!(
+            remaining >= 900,
+            "the cap is armed after the 300 ms pull, not before: {remaining}"
+        );
     }
 }
 

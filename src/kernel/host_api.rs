@@ -1018,9 +1018,11 @@ pub trait PluginExecution: sealed::Sealed + Send {
     ///
     /// It gets its **own** stream registry — a callee cannot name a
     /// handle in its caller's table, so pass data as input, not as a
-    /// handle. It inherits
-    /// `invoke_depth` (so the recursion cap applies), exec_ctx, and the
-    /// cancel token.
+    /// handle. It inherits `invoke_depth` (so the recursion cap
+    /// applies), exec_ctx, a *child* of the cancel token (this
+    /// invocation's cancel reaches it; nothing it fires reaches this
+    /// invocation), and this invocation's remaining wallclock budget as
+    /// its bound (see [`Self::wallclock_deadline`]).
     ///
     /// Callee config comes from the
     /// [`DispatchOrchestrator`](super::dispatch::DispatchOrchestrator);
