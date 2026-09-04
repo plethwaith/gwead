@@ -1104,6 +1104,177 @@ async fn first_failed_parallel_branch_wins_over_a_later_typed_one() {
     }
 }
 
+/// The `Err` arm of the wind-down gate: a cancellation reaching the
+/// scheduler as `Err(Cancelled)` from a `try` is still `Cancelled`
+/// through `run()`, where there is no handle contract.
+#[tokio::test(flavor = "multi_thread")]
+async fn dataflow_via_run_caller_cancel_through_a_try_is_cancelled() {
+    let mut a = action(vec![{
+        let mut m = step(
+            "guarded",
+            "try",
+            json!({
+                "try": [{
+                    "id": "host",
+                    "type": "test_resource_limits_fixture.fail_on_cancel",
+                    "params": { "sleep_ms": 5_000u64, "shape": "cancelled" }
+                }],
+                "catch": []
+            }),
+        );
+        m.long_running = true;
+        m
+    }]);
+    a.dataflow = true;
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action("p", "pipeline", a)],
+    );
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        trigger.cancel();
+    });
+
+    let err = kernel
+        .execute("p", "pipeline", json!({}))
+        .with_config(&json!({}))
+        .with_cancel(cancel)
+        .run()
+        .await
+        .expect_err("a cancelled dataflow through run() is not a success");
+    match err {
+        KernelError::Cancelled { at_step } => assert_eq!(at_step, "host"),
+        other => panic!("expected Cancelled, got: {other:?}"),
+    }
+}
+
+/// A handle-driven dataflow parent whose producer invokes a dataflow
+/// callee, cancelled by the caller. The callee has no events channel
+/// and resolves `Cancelled`; the `invoke` step carries that up typed;
+/// the parent is on the handle path and winds down: `Ok`, a
+/// `StepCompleted { ok: false }` for the invoke step, no `StepFailed`,
+/// and `PipelineCompleted { ok: false }` last.
+#[tokio::test(flavor = "multi_thread")]
+async fn handle_driven_dataflow_parent_invoking_a_dataflow_callee_winds_down() {
+    let [callee, _] = invoke_chain_manifests("relay");
+    let caller = r#"{
+        "name": "caller",
+        "permissions": ["invoke:plugin:callee"],
+        "actions": {
+            "pipeline": {
+                "dataflow": true,
+                "steps": [{"id": "call", "type": "invoke", "longRunning": true,
+                           "params": {"plugin": "callee", "action": "relay", "input": {}}}]
+            }
+        }
+    }"#;
+    let kernel = boot_with_config_and_json(
+        KernelConfig::default().with_limits(RuntimeLimits::default()),
+        vec![],
+        &[&callee, caller],
+    );
+
+    let mut handle = kernel
+        .execute("caller", "pipeline", json!({}))
+        .with_config(&json!({}))
+        .into_dataflow_handle()
+        .expect("handle returned");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle.cancel();
+
+    handle
+        .result
+        .await
+        .expect("result delivered")
+        .expect("a caller cancel on the handle path resolves Ok");
+
+    let mut sequence = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(ev) = handle.events.recv().await {
+            use gwead::kernel::DataflowEvent::*;
+            match ev {
+                StepCompleted { step_id, ok } => sequence.push(format!("completed:{step_id}:{ok}")),
+                StepFailed { step_id, error } => {
+                    panic!("no StepFailed on wind-down: {step_id}: {error}")
+                }
+                PipelineCompleted { ok } => sequence.push(format!("pipeline:{ok}")),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("events channel closes after the pipeline task exits");
+    assert_eq!(sequence, ["completed:call:false", "pipeline:false"]);
+}
+
+/// A `parallel` inside a `finally` supersedes the failure the `try`
+/// body left behind, the way a direct step in the `finally` does. The
+/// merge must take the first failed branch's markers over whatever the
+/// canonical state already held.
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_in_finally_supersedes_the_try_bodys_failure() {
+    let [callee, _] = invoke_chain_manifests("boom");
+    let caller = r#"{
+        "name": "caller",
+        "permissions": ["invoke:plugin:callee"],
+        "actions": {
+            "thrown": {
+                "steps": [{"id": "guarded", "type": "try", "params": {
+                    "try": [{"id": "body", "type": "throw_error",
+                             "params": {"code": "E_TRY", "message": "from the try body"}}],
+                    "finally": [{"id": "fan", "type": "parallel", "params": {"branches": [
+                        [{"id": "fin", "type": "throw_error",
+                          "params": {"code": "E_FIN", "message": "from finally"}}]
+                    ]}}]
+                }}]
+            },
+            "callee": {
+                "steps": [{"id": "guarded", "type": "try", "params": {
+                    "try": [{"id": "body", "type": "throw_error",
+                             "params": {"code": "E_TRY", "message": "from the try body"}}],
+                    "finally": [{"id": "fan", "type": "parallel", "params": {"branches": [
+                        [{"id": "call", "type": "invoke",
+                          "params": {"plugin": "callee", "action": "boom", "input": {}}}]
+                    ]}}]
+                }}]
+            }
+        }
+    }"#;
+    let kernel = boot_with_config_and_json(
+        KernelConfig::default().with_limits(RuntimeLimits::default()),
+        vec![],
+        &[&callee, caller],
+    );
+
+    let err = kernel
+        .execute("caller", "thrown", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("the finally's branch throws");
+    match err {
+        KernelError::PluginError { code, .. } => assert_eq!(code, "E_FIN"),
+        other => panic!("expected the finally branch's PluginError, got: {other:?}"),
+    }
+
+    let err = kernel
+        .execute("caller", "callee", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("the finally's branch callee throws");
+    match err {
+        KernelError::CalleeFailed { source, .. } => match &*source {
+            KernelError::PluginError { code, .. } => assert_eq!(code, "E_CALLEE"),
+            other => panic!("expected the callee's PluginError as source, got: {other:?}"),
+        },
+        other => panic!("expected CalleeFailed, got: {other:?}"),
+    }
+}
+
 /// A dataflow step that answers the *caller's* cancel with the typed
 /// cancellation gets the handle's documented contract: `Ok` with
 /// whatever was written and `PipelineCompleted { ok: false }`, not an

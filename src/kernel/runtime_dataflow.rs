@@ -332,10 +332,14 @@ pub(super) async fn execute_dag_dataflow(
                 // wind-down contract: the caller is listening for
                 // `PipelineCompleted` and inspects per-step state. The
                 // `run()`, `invoke` and role-dispatch paths have no
-                // events channel and no such contract, and a success
-                // there would carry the pre-provisioned stream handle
-                // id as the output — so a cancelled pipeline on those
-                // paths is `Err(Cancelled)` like any other action.
+                // events channel and no such contract, so there the
+                // step's own answer decides: a step that stops with
+                // `StepError::Cancelled` fails the pipeline with
+                // `Cancelled` like any other action, while a step that
+                // answers the token with an `Ok` (the `cancelled`
+                // sidecar idiom) keeps its `Ok` and the pipeline
+                // resolves `Ok` with the sidecars for the caller to
+                // inspect, as `run()` on a dataflow action always has.
                 let winding_down = cancel.is_cancelled() && dataflow_events.is_some();
                 let candidate_error = match run_result {
                     // A step that stopped on the pipeline's own cancel

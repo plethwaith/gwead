@@ -3608,14 +3608,23 @@ impl Kernel {
                     kernel.limits.clone(),
                 )
                 .await;
-            if let Err(e) = result {
-                tracing::warn!(
+            match result {
+                Ok(_) => {}
+                // A cancelled callee is the caller's doing, not a
+                // failure worth a warning.
+                Err(KernelError::Cancelled { .. }) => tracing::debug!(
+                    plugin = %plugin_owned,
+                    action = %action_owned,
+                    "io.invoke_streaming: background action cancelled; \
+                     stream EOF reached early"
+                ),
+                Err(e) => tracing::warn!(
                     plugin = %plugin_owned,
                     action = %action_owned,
                     error = %e,
                     "io.invoke_streaming: background action failed; \
                      stream EOF reached early"
-                );
+                ),
             }
         });
 

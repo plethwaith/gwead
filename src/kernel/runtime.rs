@@ -1491,7 +1491,14 @@ async fn run_parallel(
             branch_results.push(serde_json::Value::Null);
             continue;
         };
-        merge_parallel_branch_state(store, task_state, &baseline_step_ids, &baseline_variables);
+        let first_failed = !branch_ok && !any_branch_failed;
+        merge_parallel_branch_state(
+            store,
+            task_state,
+            first_failed,
+            &baseline_step_ids,
+            &baseline_variables,
+        );
         if !branch_ok {
             any_branch_failed = true;
         }
@@ -1543,6 +1550,7 @@ async fn run_parallel(
 fn merge_parallel_branch_state(
     canonical: &mut Store<ExecutionState>,
     task_state: ExecutionState,
+    takes_failure: bool,
     baseline_step_ids: &std::collections::HashSet<String>,
     baseline_variables: &IndexMap<String, Value>,
 ) {
@@ -1570,13 +1578,20 @@ fn merge_parallel_branch_state(
         }
     }
 
-    // The first failed branch in declaration order is the `parallel`
-    // step's failure, as a unit: its message, its structured payload
-    // and its callee error travel together, so a later branch's richer
-    // marker cannot outrank an earlier branch's plainer one in
-    // `step_failure_to_error`. Every failure kind sets `last_error`, so
-    // that is the "this branch failed" signal.
-    if canonical_state.last_error.is_none() && task_state.last_error.is_some() {
+    // The first failed branch in declaration order (`takes_failure`,
+    // decided by `run_parallel` from its own per-branch outcome) is the
+    // `parallel` step's failure: its message, thrown payload and callee
+    // error are copied together, overwriting whatever the canonical
+    // state held. Keying on the canonical markers instead would
+    // conflate "no earlier branch failed" with "no earlier step
+    // failed": a `try` without a `catch` leaves its markers set while
+    // `finally` runs, and a `parallel` in that `finally` supersedes
+    // them the way a direct step would. A later branch's richer marker
+    // cannot outrank the first branch's plainer one this way. The one
+    // exception is a resource violation, merged from any branch and
+    // preferred by `step_failure_to_error`: a later branch's fuel
+    // exhaustion reports with the first failed branch's message.
+    if takes_failure {
         canonical_state.last_error = task_state.last_error;
         canonical_state.plugin_error = task_state.plugin_error;
         canonical_state.callee_error = task_state.callee_error;
