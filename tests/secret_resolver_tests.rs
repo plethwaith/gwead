@@ -48,6 +48,11 @@ const CALLER: &str = r#"{
             "steps": [{"id": "mine", "type": "let", "params": {"value": "{{$secrets.apiKey}}"}}],
             "resultMapping": {"out": {"path": "$", "source": "mine"}}
         },
+        "self_go_dataflow": {
+            "dataflow": true,
+            "steps": [{"id": "mine", "type": "let", "params": {"value": "{{$secrets.apiKey}}"}, "longRunning": true}],
+            "resultMapping": {"out": {"path": "$", "source": "mine"}}
+        },
         "peek_both": {
             "steps": [
                 {"id": "a", "type": "let", "params": {"value": "{{$secrets.apiKey}}"}},
@@ -259,6 +264,45 @@ impl SecretResolver for BrokenResolver {
             })
         })
     }
+}
+
+/// The dataflow shape of the same failure. The secrets pull happens
+/// inside the pipeline task, after the handle is already in the
+/// caller's hands, so a subscriber keyed on `PipelineCompleted` must
+/// still see one — the scheduler never ran to emit it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resolver_error_fails_the_dataflow_pipeline_with_a_terminator() {
+    let resolver = Arc::new(BrokenResolver(AtomicUsize::new(0)));
+    let k = boot_with(KernelConfig::default().with_secret_resolver(resolver));
+    let mut handle = k
+        .execute("caller", "self_go_dataflow", json!({}))
+        .into_dataflow_handle()
+        .expect("handle returned");
+    let err = handle
+        .result
+        .await
+        .expect("result delivered")
+        .expect_err("must fail, not run without the secret");
+    assert!(
+        err.to_string().contains("vault sealed"),
+        "error must carry the resolver's reason: {err}"
+    );
+
+    let mut terminators = 0;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(ev) = handle.events.recv().await {
+            if let gwead::kernel::DataflowEvent::PipelineCompleted { ok } = ev {
+                assert!(!ok);
+                terminators += 1;
+            }
+        }
+    })
+    .await
+    .expect("events channel closes after the pipeline task exits");
+    assert_eq!(
+        terminators, 1,
+        "a pre-flight failure still delivers the terminator"
+    );
 }
 
 /// A missing credential must not present as an absent one.

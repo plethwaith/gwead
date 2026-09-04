@@ -22,9 +22,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::secrets::SecretResolver;
 use super::{
-    ContinuousHandle, DataflowHandle, DataflowStreamingHandle, Kernel, KernelError,
-    exec_context::ExecutionContext, runtime::InvocationContext, streams::SharedStreamRegistry,
-    types::ActionResult, with_wallclock_timeout,
+    ContinuousHandle, DataflowEvent, DataflowHandle, DataflowStreamingHandle, Kernel, KernelError,
+    WallclockOutcome, exec_context::ExecutionContext, run_with_wallclock_timeout,
+    runtime::InvocationContext, runtime_dataflow::emit_terminal_event,
+    streams::SharedStreamRegistry, types::ActionResult, with_wallclock_timeout,
 };
 
 /// `Value::Null` as a `'static` reference so the builder can default
@@ -268,8 +269,14 @@ impl<'a> ExecuteActionRequest<'a> {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let secret_resolver = self.secret_resolver();
         let kernel = self.arc()?;
-        let cancel = self.cancel.unwrap_or_default();
-        let driver_cancel = cancel.clone();
+        // A child of the caller's token, not a clone: the watchdog fires
+        // this at the deadline, and a caller's token may be shared with
+        // other work that must not be torn down by this pipeline's cap.
+        // The handle holds the child too, so `cancel()` reaches every
+        // step and `cancel_token()` observes the deadline; the caller's
+        // own cancel still propagates down.
+        let driver_cancel = self.cancel.unwrap_or_default().child_token();
+        let handle_cancel = driver_cancel.clone();
         let plugin_owned = self.plugin_name.to_string();
         let action_owned = self.action_name.to_string();
         let config_owned = self.config.clone();
@@ -284,9 +291,6 @@ impl<'a> ExecuteActionRequest<'a> {
         let join = tokio::spawn(async move {
             let mut ctx = InvocationContext::top_level(Some(Arc::downgrade(&kernel)));
             ctx.step_type_access = kernel.step_type_access_for(&plugin_owned);
-            // The handle's own token *is* this invocation's cancel
-            // handle, so the wallclock watchdog fires exactly what
-            // `DataflowHandle::cancel` fires — no child needed.
             let watchdog_cancel = driver_cancel.clone();
             ctx.cancel = Some(driver_cancel);
             let events_tx_for_timeout = events_tx.clone();
@@ -296,9 +300,10 @@ impl<'a> ExecuteActionRequest<'a> {
             let registration = match kernel.registry.get_action(&plugin_owned, &action_owned) {
                 Some(r) => r,
                 None => {
-                    let _ = result_tx.send(Err(KernelError::NotFound(format!(
+                    let err = KernelError::NotFound(format!(
                         "Action {plugin_owned}.{action_owned} not registered"
-                    ))));
+                    ));
+                    fail_dataflow_preflight(&events_tx_for_timeout, result_tx, err).await;
                     return;
                 }
             };
@@ -308,7 +313,7 @@ impl<'a> ExecuteActionRequest<'a> {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = result_tx.send(Err(e));
+                    fail_dataflow_preflight(&events_tx_for_timeout, result_tx, e).await;
                     return;
                 }
             };
@@ -325,35 +330,20 @@ impl<'a> ExecuteActionRequest<'a> {
                 ctx,
                 kernel.limits.clone(),
             );
-            let result = with_wallclock_timeout(fut, wallclock_timeout, watchdog_cancel).await;
-            // A wallclock timeout drops the scheduler future mid-flight,
-            // so the scheduler's own terminal emit never runs. Without
-            // this, an events subscriber keyed on `PipelineCompleted`
-            // would wait forever on a timed-out pipeline even though
-            // `handle.result` had resolved `Err`.
-            //
-            // **Only on the timeout path.** Guarding on `result.is_err()`
-            // would be wrong: an ordinary step failure emits the
-            // terminator *and* returns `Err`, so every failing pipeline
-            // would deliver two. And a raw `send().await` on the bounded
-            // channel would mean that on a full, undrained events channel
-            // the second one blocks forever, so `result_tx` never fires
-            // and `handle.result` never resolves: precisely the hang
-            // `emit_terminal_event` exists to prevent.
-            if matches!(result, Err(super::KernelError::ExecutionTimeout { .. })) {
-                super::runtime_dataflow::emit_terminal_event(
-                    Some(&events_tx_for_timeout),
-                    super::DataflowEvent::PipelineCompleted { ok: false },
-                )
-                .await;
-            }
+            let result = run_dataflow_under_wallclock(
+                fut,
+                wallclock_timeout,
+                watchdog_cancel,
+                &events_tx_for_timeout,
+            )
+            .await;
             let _ = result_tx.send(result);
         });
 
         Ok(DataflowHandle {
             events: events_rx,
             result: result_rx,
-            cancel,
+            cancel: handle_cancel,
             join,
         })
     }
@@ -459,8 +449,14 @@ impl<'a> ExecuteActionRequest<'a> {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let secret_resolver = self.secret_resolver();
         let kernel = self.arc()?;
-        let cancel = self.cancel.unwrap_or_default();
-        let driver_cancel = cancel.clone();
+        // A child of the caller's token, not a clone: the watchdog fires
+        // this at the deadline, and a caller's token may be shared with
+        // other work that must not be torn down by this pipeline's cap.
+        // The handle holds the child too, so `cancel()` reaches every
+        // step and `cancel_token()` observes the deadline; the caller's
+        // own cancel still propagates down.
+        let driver_cancel = self.cancel.unwrap_or_default().child_token();
+        let handle_cancel = driver_cancel.clone();
         let plugin_owned = self.plugin_name.to_string();
         let action_owned = self.action_name.to_string();
         let config_owned = self.config.clone();
@@ -489,9 +485,10 @@ impl<'a> ExecuteActionRequest<'a> {
             let registration = match kernel.registry.get_action(&plugin_owned, &action_owned) {
                 Some(r) => r,
                 None => {
-                    let _ = result_tx.send(Err(KernelError::NotFound(format!(
+                    let err = KernelError::NotFound(format!(
                         "Action {plugin_owned}.{action_owned} not registered"
-                    ))));
+                    ));
+                    fail_dataflow_preflight(&events_tx_for_timeout, result_tx, err).await;
                     return;
                 }
             };
@@ -501,7 +498,7 @@ impl<'a> ExecuteActionRequest<'a> {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = result_tx.send(Err(e));
+                    fail_dataflow_preflight(&events_tx_for_timeout, result_tx, e).await;
                     return;
                 }
             };
@@ -518,28 +515,13 @@ impl<'a> ExecuteActionRequest<'a> {
                 ctx,
                 kernel.limits.clone(),
             );
-            let result = with_wallclock_timeout(fut, wallclock_timeout, watchdog_cancel).await;
-            // A wallclock timeout drops the scheduler future mid-flight,
-            // so the scheduler's own terminal emit never runs. Without
-            // this, an events subscriber keyed on `PipelineCompleted`
-            // would wait forever on a timed-out pipeline even though
-            // `handle.result` had resolved `Err`.
-            //
-            // **Only on the timeout path.** Guarding on `result.is_err()`
-            // would be wrong: an ordinary step failure emits the
-            // terminator *and* returns `Err`, so every failing pipeline
-            // would deliver two. And a raw `send().await` on the bounded
-            // channel would mean that on a full, undrained events channel
-            // the second one blocks forever, so `result_tx` never fires
-            // and `handle.result` never resolves: precisely the hang
-            // `emit_terminal_event` exists to prevent.
-            if matches!(result, Err(super::KernelError::ExecutionTimeout { .. })) {
-                super::runtime_dataflow::emit_terminal_event(
-                    Some(&events_tx_for_timeout),
-                    super::DataflowEvent::PipelineCompleted { ok: false },
-                )
-                .await;
-            }
+            let result = run_dataflow_under_wallclock(
+                fut,
+                wallclock_timeout,
+                watchdog_cancel,
+                &events_tx_for_timeout,
+            )
+            .await;
             let _ = result_tx.send(result);
         });
 
@@ -547,7 +529,7 @@ impl<'a> ExecuteActionRequest<'a> {
             output,
             events: events_rx,
             result: result_rx,
-            cancel,
+            cancel: handle_cancel,
             join,
         })
     }
@@ -669,4 +651,61 @@ impl<'a> ExecuteActionRequest<'a> {
             join,
         })
     }
+}
+
+/// Run a dataflow scheduler future under the action's wallclock cap,
+/// keeping the handle's terminator contract: one `PipelineCompleted`
+/// per pipeline.
+///
+/// The scheduler emits its own terminator on every path it completes
+/// through — success, step failure, cooperative wind-down after a
+/// cancel — so a future that resolved needs nothing more, even when
+/// [`run_with_wallclock_timeout`] reported its outcome as the deadline.
+/// A future the backstop *dropped* mid-flight never reached its emit,
+/// so the substitute goes out here; without it an events subscriber
+/// keyed on `PipelineCompleted` would wait forever on a timed-out
+/// pipeline even though `handle.result` had resolved `Err`.
+///
+/// Guarding on the result instead would double-emit: an ordinary step
+/// failure emits and returns `Err`, and so does a pipeline whose step
+/// answered the watchdog's cancel with its own error. And the emit
+/// goes through `emit_terminal_event` rather than a raw `send().await`:
+/// on a full, undrained events channel the latter would block forever,
+/// `result_tx` would never fire, and `handle.result` would never
+/// resolve — precisely the hang that helper exists to prevent.
+async fn run_dataflow_under_wallclock<F>(
+    fut: F,
+    wallclock_timeout: Option<std::time::Duration>,
+    watchdog_cancel: CancellationToken,
+    events_tx: &tokio::sync::mpsc::Sender<DataflowEvent>,
+) -> Result<ActionResult, KernelError>
+where
+    F: std::future::Future<Output = Result<ActionResult, KernelError>>,
+{
+    let WallclockOutcome { result, abandoned } =
+        run_with_wallclock_timeout(fut, wallclock_timeout, watchdog_cancel).await;
+    if abandoned {
+        emit_terminal_event(
+            Some(events_tx),
+            DataflowEvent::PipelineCompleted { ok: false },
+        )
+        .await;
+    }
+    result
+}
+
+/// Fail a pipeline before its scheduler started. The handle is already
+/// in the caller's hands, so a subscriber keyed on `PipelineCompleted`
+/// must still see one — the scheduler never ran to emit it.
+async fn fail_dataflow_preflight(
+    events_tx: &tokio::sync::mpsc::Sender<DataflowEvent>,
+    result_tx: tokio::sync::oneshot::Sender<Result<ActionResult, KernelError>>,
+    err: KernelError,
+) {
+    emit_terminal_event(
+        Some(events_tx),
+        DataflowEvent::PipelineCompleted { ok: false },
+    )
+    .await;
+    let _ = result_tx.send(Err(err));
 }

@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gwead::kernel::host_api::{PluginExecution, StepError, StepOutput};
+use gwead::kernel::host_api::{PluginErrorPayload, PluginExecution, StepError, StepOutput};
 use gwead::kernel::types::*;
 use gwead::kernel::{Kernel, KernelConfig, KernelError, RuntimeLimits};
 use indexmap::IndexMap;
@@ -33,6 +33,14 @@ fn boot_with_limits(limits: RuntimeLimits, manifests: Vec<PluginManifest>) -> Ar
 }
 
 fn boot_with_config(config: KernelConfig, manifests: Vec<PluginManifest>) -> Arc<Kernel> {
+    boot_with_config_and_json(config, manifests, &[])
+}
+
+fn boot_with_config_and_json(
+    config: KernelConfig,
+    manifests: Vec<PluginManifest>,
+    json_manifests: &[&str],
+) -> Arc<Kernel> {
     init_tracing();
     let mut config = common::script_runtime_mock::trusting(config, &["lua"]);
     // Seed the test-only `sleep_async` impl into the
@@ -46,6 +54,13 @@ fn boot_with_config(config: KernelConfig, manifests: Vec<PluginManifest>) -> Arc
             sleep_async_step,
         )
         .expect("no collision on a fresh table");
+    config
+        .native_step_impls
+        .insert(
+            "test.test_resource_limits_fixture.fail_on_cancel",
+            fail_on_cancel_step,
+        )
+        .expect("no collision on a fresh table");
     let mut k = Kernel::boot(config).expect("kernel boot");
     common::script_runtime_mock::register(&mut k).expect("mock script runtime registers");
     k.register_plugin_from_json(
@@ -54,16 +69,21 @@ fn boot_with_config(config: KernelConfig, manifests: Vec<PluginManifest>) -> Arc
             "version": "0.0.0",
             "description": "Wires `sleep_async` for the wallclock-timeout tests — real async work that's preemptable by tokio::time::timeout.",
             "stepTypeDefs": [
-                {"name": "test_resource_limits_fixture.sleep_async", "freelyUsable": true}
+                {"name": "test_resource_limits_fixture.sleep_async", "freelyUsable": true},
+                {"name": "test_resource_limits_fixture.fail_on_cancel", "freelyUsable": true}
             ],
             "stepTypeImpls": [
-                {"stepType": "test_resource_limits_fixture.sleep_async", "kind": "native", "implRef": "test.test_resource_limits_fixture.sleep_async"}
+                {"stepType": "test_resource_limits_fixture.sleep_async", "kind": "native", "implRef": "test.test_resource_limits_fixture.sleep_async"},
+                {"stepType": "test_resource_limits_fixture.fail_on_cancel", "kind": "native", "implRef": "test.test_resource_limits_fixture.fail_on_cancel"}
             ]
         }"#,
     )
     .expect("resource_limits test fixture registers");
     for m in manifests {
         k.register_plugin(m).expect("registration");
+    }
+    for j in json_manifests {
+        k.register_plugin_from_json(j).expect("registration");
     }
     k.into_arc()
 }
@@ -80,6 +100,41 @@ fn sleep_async_step<'a>(
         let sleep_ms = params.get("sleep_ms").and_then(|v| v.as_u64()).unwrap_or(0);
         tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         Ok(StepOutput::from(json!({ "slept_ms": sleep_ms })))
+    })
+}
+
+/// Test-only step type modelling an embedder's host step that races
+/// its work against the cancellation token. `params.shape` picks what
+/// it answers the token with: `"cancelled"` is the typed
+/// `StepError::Cancelled`; `"thrown"` a structured `PluginError` with
+/// code `host_cancelled` and `"failed"` a plain failure whose message
+/// merely mentions cancellation — the two ways a step can misreport
+/// its own cancellation.
+fn fail_on_cancel_step<'a>(
+    ex: &'a mut (dyn PluginExecution + Send),
+    params: &'a Value,
+) -> Pin<Box<dyn Future<Output = Result<StepOutput, StepError>> + Send + 'a>> {
+    let cancel = ex.cancel_token();
+    Box::pin(async move {
+        let sleep_ms = params.get("sleep_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+        let shape = params
+            .get("shape")
+            .and_then(|v| v.as_str())
+            .unwrap_or("thrown");
+        tokio::select! {
+            _ = cancel.cancelled() => Err(match shape {
+                "cancelled" => StepError::Cancelled,
+                "failed" => StepError::Failed("host step cancelled by token".to_string()),
+                _ => StepError::Thrown(PluginErrorPayload {
+                    code: "host_cancelled".to_string(),
+                    message: "host step observed the cancellation token".to_string(),
+                    params: json!({}),
+                }),
+            }),
+            _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {
+                Ok(StepOutput::from(json!({ "slept_ms": sleep_ms })))
+            }
+        }
     })
 }
 
@@ -399,6 +454,955 @@ async fn cancellation_stops_wave_scheduler_between_steps() {
         }
         other => panic!("expected KernelError::Cancelled, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Deadline vs caller cancel: what the wrapper reports
+// ---------------------------------------------------------------------------
+
+/// Build the one-step `fail_on_cancel` action used by the remap tests.
+fn fail_on_cancel_action(shape: &str, sleep_ms: u64, wallclock_ms: Option<u64>) -> Action {
+    let mut a = action(vec![step(
+        "host",
+        "test_resource_limits_fixture.fail_on_cancel",
+        json!({ "sleep_ms": sleep_ms, "shape": shape }),
+    )]);
+    a.wallclock_timeout_ms = wallclock_ms;
+    a
+}
+
+/// The watchdog fires the token; the host step answers with the typed
+/// `StepError::Cancelled`. The caller sees `ExecutionTimeout`: the
+/// deadline is what stopped the action. (Gwead issue #1.)
+#[tokio::test(flavor = "multi_thread")]
+async fn deadline_remaps_typed_cancellation_to_execution_timeout() {
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action(
+            "p",
+            "go",
+            fail_on_cancel_action("cancelled", 5_000, Some(80)),
+        )],
+    );
+
+    let err = kernel
+        .execute("p", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("declared cap < step sleep must trip the deadline");
+    match err {
+        KernelError::ExecutionTimeout { timeout_ms } => assert_eq!(timeout_ms, 80),
+        other => panic!("expected ExecutionTimeout, got: {other:?}"),
+    }
+}
+
+/// A step that answers the token with a `PluginError` of its own is
+/// reporting a failure, and a failure after the deadline is passed
+/// through as what it says it is: the kernel does not guess that a
+/// structured error "really meant" cancellation. The typed variant is
+/// how a step says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn deadline_passes_through_a_structured_error_that_is_not_typed_as_cancellation() {
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action(
+            "p",
+            "go",
+            fail_on_cancel_action("thrown", 5_000, Some(80)),
+        )],
+    );
+
+    let err = kernel
+        .execute("p", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("the step fails once the token fires");
+    match err {
+        KernelError::PluginError { code, .. } => assert_eq!(code, "host_cancelled"),
+        other => panic!("expected the step's own PluginError, got: {other:?}"),
+    }
+}
+
+/// Same for a plain failure whose message happens to mention
+/// cancellation: text is not a type.
+#[tokio::test(flavor = "multi_thread")]
+async fn deadline_passes_through_a_plain_failure() {
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action(
+            "p",
+            "go",
+            fail_on_cancel_action("failed", 5_000, Some(80)),
+        )],
+    );
+
+    let err = kernel
+        .execute("p", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("the step fails once the token fires");
+    match err {
+        KernelError::Execution(msg) => assert!(msg.contains("cancelled by token"), "{msg}"),
+        other => panic!("expected the step's own Execution error, got: {other:?}"),
+    }
+}
+
+/// `try` must not catch a cancellation. With an empty `catch` the
+/// step's failure would be swallowed and the action would report
+/// `Ok`; a typed cancellation escapes the `try` and the deadline is
+/// reported.
+#[tokio::test(flavor = "multi_thread")]
+async fn try_does_not_swallow_a_typed_cancellation() {
+    let mut a = action(vec![step(
+        "guarded",
+        "try",
+        json!({
+            "try": [{
+                "id": "host",
+                "type": "test_resource_limits_fixture.fail_on_cancel",
+                "params": { "sleep_ms": 5_000u64, "shape": "cancelled" }
+            }],
+            "catch": []
+        }),
+    )]);
+    a.wallclock_timeout_ms = Some(80);
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action("p", "go", a)],
+    );
+
+    let err = kernel
+        .execute("p", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("a cancelled step inside try must not be swallowed");
+    match err {
+        KernelError::ExecutionTimeout { timeout_ms } => assert_eq!(timeout_ms, 80),
+        other => panic!("expected ExecutionTimeout, got: {other:?}"),
+    }
+}
+
+/// Caller and callee manifests for the invoke-chain tests. The callee
+/// races a host step against its token; the caller's `go` invokes it.
+fn invoke_chain_manifests(callee_action: &str) -> [String; 2] {
+    let callee = String::from(
+        r#"{
+            "name": "callee",
+            "actions": {
+                "go": {
+                    "steps": [{"id": "host", "type": "test_resource_limits_fixture.fail_on_cancel",
+                                "params": {"sleep_ms": 5000, "shape": "cancelled"}}]
+                },
+                "boom": {
+                    "steps": [{"id": "bad", "type": "throw_error",
+                                "params": {"code": "E_CALLEE", "message": "nope"}}]
+                },
+                "relay": {
+                    "dataflow": true,
+                    "steps": [{"id": "host", "type": "test_resource_limits_fixture.fail_on_cancel",
+                                "params": {"sleep_ms": 5000, "shape": "cancelled"}, "longRunning": true}]
+                }
+            }
+        }"#,
+    );
+    let caller = format!(
+        r#"{{
+            "name": "caller",
+            "permissions": ["invoke:plugin:callee"],
+            "actions": {{
+                "go": {{
+                    "wallclockTimeoutMs": 80,
+                    "steps": [{{"id": "call", "type": "invoke",
+                                "params": {{"plugin": "callee", "action": "{callee_action}", "input": {{}}}}}}]
+                }},
+                "go_uncapped": {{
+                    "wallclockTimeoutMs": 10000,
+                    "steps": [{{"id": "call", "type": "invoke",
+                                "params": {{"plugin": "callee", "action": "{callee_action}", "input": {{}}}}}}]
+                }}
+            }}
+        }}"#
+    );
+    [callee, caller]
+}
+
+/// The caller's deadline fires; its token propagates to the callee,
+/// whose host step answers with the typed cancellation. The callee
+/// resolves `Cancelled`, the `invoke` step carries that up as the
+/// caller's own cancellation, and the caller's wrapper reports the
+/// deadline — no flattening to text anywhere on the way.
+#[tokio::test(flavor = "multi_thread")]
+async fn callers_deadline_through_an_invoked_callee_is_execution_timeout() {
+    let [callee, caller] = invoke_chain_manifests("go");
+    let kernel = boot_with_config_and_json(
+        KernelConfig::default().with_limits(RuntimeLimits::default()),
+        vec![],
+        &[&callee, &caller],
+    );
+
+    let err = kernel
+        .execute("caller", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("the caller's cap must trip");
+    match err {
+        KernelError::ExecutionTimeout { timeout_ms } => assert_eq!(timeout_ms, 80),
+        other => panic!("expected ExecutionTimeout, got: {other:?}"),
+    }
+}
+
+/// A callee's own failure reaches the caller intact: `CalleeFailed`
+/// names the step and the callee, and `source` is the callee's
+/// structured error, so the caller can branch on its code.
+#[tokio::test(flavor = "multi_thread")]
+async fn callee_failure_reaches_the_caller_typed() {
+    let [callee, caller] = invoke_chain_manifests("boom");
+    let kernel = boot_with_config_and_json(
+        KernelConfig::default().with_limits(RuntimeLimits::default()),
+        vec![],
+        &[&callee, &caller],
+    );
+
+    let err = kernel
+        .execute("caller", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("the callee throws");
+    let text = err.to_string();
+    match err {
+        KernelError::CalleeFailed {
+            step_id,
+            plugin,
+            action,
+            source,
+        } => {
+            assert_eq!(
+                (step_id.as_str(), plugin.as_str(), action.as_str()),
+                ("call", "callee", "boom")
+            );
+            match &*source {
+                KernelError::PluginError { code, .. } => assert_eq!(code, "E_CALLEE"),
+                other => panic!("expected the callee's PluginError as source, got: {other:?}"),
+            }
+        }
+        other => panic!("expected CalleeFailed, got: {other:?}"),
+    }
+    assert!(
+        text.contains("step 'call' → callee.boom failed: Plugin error E_CALLEE: nope"),
+        "the message keeps the flattened shape a catch handler reads: {text}"
+    );
+}
+
+/// The mirror image: the *caller* fires the token well inside the
+/// deadline. The typed cancellation must stay `Cancelled` — the remap
+/// is keyed on the watchdog having fired, not on the token. (The shape
+/// must be one the remap would otherwise claim, or the test pins
+/// nothing.)
+#[tokio::test(flavor = "multi_thread")]
+async fn caller_cancel_stays_cancelled() {
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action(
+            "p",
+            "go",
+            fail_on_cancel_action("cancelled", 5_000, Some(10_000)),
+        )],
+    );
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        trigger.cancel();
+    });
+
+    let err = kernel
+        .execute("p", "go", json!({}))
+        .with_config(&Value::Null)
+        .with_cancel(cancel)
+        .run()
+        .await
+        .expect_err("caller cancel must not run to completion");
+    match err {
+        KernelError::Cancelled { at_step } => assert_eq!(at_step, "host"),
+        other => panic!("expected Cancelled, got: {other:?}"),
+    }
+}
+
+/// A `parallel` branch's step answers the deadline with the typed
+/// cancellation. The branch task must carry it out as the `parallel`
+/// step's own error rather than a failed branch, so the action reports
+/// the deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn deadline_inside_a_parallel_branch_is_execution_timeout() {
+    let mut a = action(vec![step(
+        "fan",
+        "parallel",
+        json!({ "branches": [[{
+            "id": "host",
+            "type": "test_resource_limits_fixture.fail_on_cancel",
+            "params": { "sleep_ms": 5_000u64, "shape": "cancelled" }
+        }]] }),
+    )]);
+    a.wallclock_timeout_ms = Some(80);
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action("p", "go", a)],
+    );
+
+    let err = kernel
+        .execute("p", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("declared cap < step sleep must trip the deadline");
+    match err {
+        KernelError::ExecutionTimeout { timeout_ms } => assert_eq!(timeout_ms, 80),
+        other => panic!("expected ExecutionTimeout, got: {other:?}"),
+    }
+}
+
+/// The same swallow `try` must not perform, one nesting level down: a
+/// cancelled step inside a `parallel` inside a `try` with an empty
+/// `catch`. The caller's cancel must surface as `Cancelled`, not as an
+/// `Ok` from the swallowed branch failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn try_does_not_swallow_a_cancellation_inside_a_parallel_branch() {
+    let a = action(vec![step(
+        "guarded",
+        "try",
+        json!({
+            "try": [{
+                "id": "fan",
+                "type": "parallel",
+                "params": { "branches": [[{
+                    "id": "host",
+                    "type": "test_resource_limits_fixture.fail_on_cancel",
+                    "params": { "sleep_ms": 5_000u64, "shape": "cancelled" }
+                }]] }
+            }],
+            "catch": []
+        }),
+    )]);
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action("p", "go", a)],
+    );
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        trigger.cancel();
+    });
+
+    let err = kernel
+        .execute("p", "go", json!({}))
+        .with_config(&Value::Null)
+        .with_cancel(cancel)
+        .run()
+        .await
+        .expect_err("a cancelled branch inside try must not be swallowed");
+    match err {
+        KernelError::Cancelled { at_step } => assert_eq!(at_step, "host"),
+        other => panic!("expected Cancelled, got: {other:?}"),
+    }
+}
+
+/// A callee failure inside a `parallel` branch keeps its type: the
+/// branch state's callee marker merges back so the `parallel` step
+/// reports `CalleeFailed`, not the flattened string.
+#[tokio::test(flavor = "multi_thread")]
+async fn callee_failure_inside_a_parallel_branch_stays_typed() {
+    let [callee, _] = invoke_chain_manifests("boom");
+    let caller = r#"{
+        "name": "caller",
+        "permissions": ["invoke:plugin:callee"],
+        "actions": {
+            "go": {
+                "steps": [{"id": "fan", "type": "parallel", "params": {"branches": [[
+                    {"id": "call", "type": "invoke",
+                     "params": {"plugin": "callee", "action": "boom", "input": {}}}
+                ]]}}]
+            }
+        }
+    }"#;
+    let kernel = boot_with_config_and_json(
+        KernelConfig::default().with_limits(RuntimeLimits::default()),
+        vec![],
+        &[&callee, caller],
+    );
+
+    let err = kernel
+        .execute("caller", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("the callee throws");
+    match err {
+        KernelError::CalleeFailed { source, .. } => match &*source {
+            KernelError::PluginError { code, .. } => assert_eq!(code, "E_CALLEE"),
+            other => panic!("expected the callee's PluginError as source, got: {other:?}"),
+        },
+        other => panic!("expected CalleeFailed, got: {other:?}"),
+    }
+}
+
+/// The pipeline's deadline fires the pipeline's own token, which the
+/// handle exposes, and leaves a token the caller shared untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn dataflow_deadline_fires_the_handle_token_not_the_callers() {
+    let mut a = action(vec![{
+        let mut m = step(
+            "sleep",
+            "test_resource_limits_fixture.sleep_async",
+            json!({ "sleep_ms": 5_000u64 }),
+        );
+        m.long_running = true;
+        m
+    }]);
+    a.dataflow = true;
+    a.wallclock_timeout_ms = Some(80);
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action("p", "pipeline", a)],
+    );
+
+    let shared = tokio_util::sync::CancellationToken::new();
+    let mut handle = kernel
+        .execute("p", "pipeline", json!({}))
+        .with_config(&json!({}))
+        .with_cancel(shared.clone())
+        .into_dataflow_handle()
+        .expect("handle returned");
+    let observed = handle.cancel_token();
+
+    let err = handle
+        .result
+        .await
+        .expect("result delivered")
+        .expect_err("declared cap must trip");
+    assert!(matches!(
+        err,
+        KernelError::ExecutionTimeout { timeout_ms: 80 }
+    ));
+    assert!(
+        observed.is_cancelled(),
+        "the handle's token observes the deadline"
+    );
+    assert!(
+        !shared.is_cancelled(),
+        "the caller's shared token is not this pipeline's to fire"
+    );
+    // Drain so the pipeline task's terminator is accounted for.
+    while handle.events.recv().await.is_some() {}
+}
+
+/// The wind-down contract belongs to the handle path only. A dataflow
+/// action driven through `run()` has no events channel and no handle;
+/// a caller cancel there is `Err(Cancelled)` like any other action,
+/// not an `Ok` whose output is the pre-provisioned stream handle id.
+#[tokio::test(flavor = "multi_thread")]
+async fn dataflow_via_run_caller_cancel_is_cancelled() {
+    let mut a = action(vec![{
+        let mut m = step(
+            "host",
+            "test_resource_limits_fixture.fail_on_cancel",
+            json!({ "sleep_ms": 5_000u64, "shape": "cancelled" }),
+        );
+        m.long_running = true;
+        m
+    }]);
+    a.dataflow = true;
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action("p", "pipeline", a)],
+    );
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        trigger.cancel();
+    });
+
+    let err = kernel
+        .execute("p", "pipeline", json!({}))
+        .with_config(&json!({}))
+        .with_cancel(cancel)
+        .run()
+        .await
+        .expect_err("a cancelled dataflow through run() is not a success");
+    match err {
+        KernelError::Cancelled { at_step } => assert_eq!(at_step, "host"),
+        other => panic!("expected Cancelled, got: {other:?}"),
+    }
+}
+
+/// Same through an `invoke`: a wave action whose step invokes a
+/// dataflow callee, cancelled by the caller, is the caller's own
+/// `Cancelled` — not an `Ok` from the callee's wind-down.
+#[tokio::test(flavor = "multi_thread")]
+async fn invoked_dataflow_callee_caller_cancel_is_cancelled() {
+    let [callee, caller] = invoke_chain_manifests("relay");
+    let kernel = boot_with_config_and_json(
+        KernelConfig::default().with_limits(RuntimeLimits::default()),
+        vec![],
+        &[&callee, &caller],
+    );
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        trigger.cancel();
+    });
+
+    let err = kernel
+        .execute("caller", "go_uncapped", json!({}))
+        .with_config(&Value::Null)
+        .with_cancel(cancel)
+        .run()
+        .await
+        .expect_err("a cancelled callee is the caller's cancellation");
+    match err {
+        KernelError::Cancelled { at_step } => assert_eq!(at_step, "call"),
+        other => panic!("expected Cancelled, got: {other:?}"),
+    }
+}
+
+/// The streaming handle holds the pipeline's child token too.
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_dataflow_deadline_fires_the_handle_token_not_the_callers() {
+    let mut a = action(vec![{
+        let mut m = step(
+            "sleep",
+            "test_resource_limits_fixture.sleep_async",
+            json!({ "sleep_ms": 5_000u64 }),
+        );
+        m.long_running = true;
+        m
+    }]);
+    a.dataflow = true;
+    a.wallclock_timeout_ms = Some(80);
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action("p", "pipeline", a)],
+    );
+
+    let shared = tokio_util::sync::CancellationToken::new();
+    let handle = kernel
+        .execute("p", "pipeline", json!({}))
+        .with_config(&json!({}))
+        .with_cancel(shared.clone())
+        .into_dataflow_streaming_handle()
+        .expect("streaming handle returned");
+    let observed = handle.cancel_token();
+
+    let err = handle
+        .result
+        .await
+        .expect("result delivered")
+        .expect_err("declared cap must trip");
+    assert!(matches!(
+        err,
+        KernelError::ExecutionTimeout { timeout_ms: 80 }
+    ));
+    assert!(
+        observed.is_cancelled(),
+        "the handle's token observes the deadline"
+    );
+    assert!(
+        !shared.is_cancelled(),
+        "the caller's shared token is not this pipeline's to fire"
+    );
+}
+
+/// A cancellation that reaches the dataflow scheduler as an `Err` —
+/// here from a `try` wrapping the host step, whose escape turns the
+/// step's `false` into `Err(Cancelled)` — winds down the same way as
+/// the marker shape.
+#[tokio::test(flavor = "multi_thread")]
+async fn dataflow_caller_cancel_through_a_try_resolves_ok() {
+    let mut a = action(vec![{
+        let mut m = step(
+            "guarded",
+            "try",
+            json!({
+                "try": [{
+                    "id": "host",
+                    "type": "test_resource_limits_fixture.fail_on_cancel",
+                    "params": { "sleep_ms": 5_000u64, "shape": "cancelled" }
+                }],
+                "catch": []
+            }),
+        );
+        m.long_running = true;
+        m
+    }]);
+    a.dataflow = true;
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action("p", "pipeline", a)],
+    );
+
+    let handle = kernel
+        .execute("p", "pipeline", json!({}))
+        .with_config(&json!({}))
+        .into_dataflow_handle()
+        .expect("handle returned");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle.cancel();
+    handle
+        .result
+        .await
+        .expect("result delivered")
+        .expect("a caller cancel resolves Ok with partial results");
+}
+
+/// Branch failure precedence: the first failed branch in declaration
+/// order is the `parallel` step's failure, even when a later branch
+/// failed with a marker the error mapper would otherwise prefer.
+#[tokio::test(flavor = "multi_thread")]
+async fn first_failed_parallel_branch_wins_over_a_later_typed_one() {
+    let [callee, _] = invoke_chain_manifests("boom");
+    let caller = r#"{
+        "name": "caller",
+        "permissions": ["invoke:plugin:callee"],
+        "actions": {
+            "go": {
+                "steps": [{"id": "fan", "type": "parallel", "params": {"branches": [
+                    [{"id": "plain", "type": "throw_error",
+                      "params": {"code": "E_FIRST", "message": "first"}}],
+                    [{"id": "call", "type": "invoke",
+                      "params": {"plugin": "callee", "action": "boom", "input": {}}}]
+                ]}}]
+            }
+        }
+    }"#;
+    let kernel = boot_with_config_and_json(
+        KernelConfig::default().with_limits(RuntimeLimits::default()),
+        vec![],
+        &[&callee, caller],
+    );
+
+    let err = kernel
+        .execute("caller", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("both branches fail");
+    match err {
+        KernelError::PluginError { code, .. } => assert_eq!(code, "E_FIRST"),
+        other => panic!("expected the first branch's PluginError, got: {other:?}"),
+    }
+}
+
+/// The `Err` arm of the wind-down gate: a cancellation reaching the
+/// scheduler as `Err(Cancelled)` from a `try` is still `Cancelled`
+/// through `run()`, where there is no handle contract.
+#[tokio::test(flavor = "multi_thread")]
+async fn dataflow_via_run_caller_cancel_through_a_try_is_cancelled() {
+    let mut a = action(vec![{
+        let mut m = step(
+            "guarded",
+            "try",
+            json!({
+                "try": [{
+                    "id": "host",
+                    "type": "test_resource_limits_fixture.fail_on_cancel",
+                    "params": { "sleep_ms": 5_000u64, "shape": "cancelled" }
+                }],
+                "catch": []
+            }),
+        );
+        m.long_running = true;
+        m
+    }]);
+    a.dataflow = true;
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action("p", "pipeline", a)],
+    );
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        trigger.cancel();
+    });
+
+    let err = kernel
+        .execute("p", "pipeline", json!({}))
+        .with_config(&json!({}))
+        .with_cancel(cancel)
+        .run()
+        .await
+        .expect_err("a cancelled dataflow through run() is not a success");
+    match err {
+        KernelError::Cancelled { at_step } => assert_eq!(at_step, "host"),
+        other => panic!("expected Cancelled, got: {other:?}"),
+    }
+}
+
+/// A handle-driven dataflow parent whose producer invokes a dataflow
+/// callee, cancelled by the caller. The callee has no events channel
+/// and resolves `Cancelled`; the `invoke` step carries that up typed;
+/// the parent is on the handle path and winds down: `Ok`, a
+/// `StepCompleted { ok: false }` for the invoke step, no `StepFailed`,
+/// and `PipelineCompleted { ok: false }` last.
+#[tokio::test(flavor = "multi_thread")]
+async fn handle_driven_dataflow_parent_invoking_a_dataflow_callee_winds_down() {
+    let [callee, _] = invoke_chain_manifests("relay");
+    let caller = r#"{
+        "name": "caller",
+        "permissions": ["invoke:plugin:callee"],
+        "actions": {
+            "pipeline": {
+                "dataflow": true,
+                "steps": [{"id": "call", "type": "invoke", "longRunning": true,
+                           "params": {"plugin": "callee", "action": "relay", "input": {}}}]
+            }
+        }
+    }"#;
+    let kernel = boot_with_config_and_json(
+        KernelConfig::default().with_limits(RuntimeLimits::default()),
+        vec![],
+        &[&callee, caller],
+    );
+
+    let mut handle = kernel
+        .execute("caller", "pipeline", json!({}))
+        .with_config(&json!({}))
+        .into_dataflow_handle()
+        .expect("handle returned");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle.cancel();
+
+    handle
+        .result
+        .await
+        .expect("result delivered")
+        .expect("a caller cancel on the handle path resolves Ok");
+
+    let mut sequence = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(ev) = handle.events.recv().await {
+            use gwead::kernel::DataflowEvent::*;
+            match ev {
+                StepCompleted { step_id, ok } => sequence.push(format!("completed:{step_id}:{ok}")),
+                StepFailed { step_id, error } => {
+                    panic!("no StepFailed on wind-down: {step_id}: {error}")
+                }
+                PipelineCompleted { ok } => sequence.push(format!("pipeline:{ok}")),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("events channel closes after the pipeline task exits");
+    assert_eq!(sequence, ["completed:call:false", "pipeline:false"]);
+}
+
+/// Caller manifest for the finally-supersedes tests: each action's
+/// `try` body throws, and its `finally` runs a `parallel` whose one
+/// branch fails in a different way.
+fn finally_parallel_caller() -> &'static str {
+    r#"{
+        "name": "caller",
+        "permissions": ["invoke:plugin:callee"],
+        "actions": {
+            "thrown": {
+                "steps": [{"id": "guarded", "type": "try", "params": {
+                    "try": [{"id": "body", "type": "throw_error",
+                             "params": {"code": "E_TRY", "message": "from the try body"}}],
+                    "finally": [{"id": "fan", "type": "parallel", "params": {"branches": [
+                        [{"id": "fin", "type": "throw_error",
+                          "params": {"code": "E_FIN", "message": "from finally"}}]
+                    ]}}]
+                }}]
+            },
+            "callee": {
+                "steps": [{"id": "guarded", "type": "try", "params": {
+                    "try": [{"id": "body", "type": "throw_error",
+                             "params": {"code": "E_TRY", "message": "from the try body"}}],
+                    "finally": [{"id": "fan", "type": "parallel", "params": {"branches": [
+                        [{"id": "call", "type": "invoke",
+                          "params": {"plugin": "callee", "action": "boom", "input": {}}}]
+                    ]}}]
+                }}]
+            }
+        }
+    }"#
+}
+
+/// A `parallel` inside a `finally` supersedes the failure the `try`
+/// body left behind, the way a direct step in the `finally` does: the
+/// merge must take the first failed branch's markers over whatever the
+/// canonical state already held. Here the branch throws.
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_in_finally_supersedes_the_try_bodys_failure_with_a_thrown_error() {
+    let [callee, _] = invoke_chain_manifests("boom");
+    let kernel = boot_with_config_and_json(
+        KernelConfig::default().with_limits(RuntimeLimits::default()),
+        vec![],
+        &[&callee, finally_parallel_caller()],
+    );
+
+    let err = kernel
+        .execute("caller", "thrown", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("the finally's branch throws");
+    match err {
+        KernelError::PluginError { code, .. } => assert_eq!(code, "E_FIN"),
+        other => panic!("expected the finally branch's PluginError, got: {other:?}"),
+    }
+}
+
+/// Same, with the branch's failure being a callee's: the typed error
+/// must survive the merge too.
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_in_finally_supersedes_the_try_bodys_failure_with_a_callee_error() {
+    let [callee, _] = invoke_chain_manifests("boom");
+    let kernel = boot_with_config_and_json(
+        KernelConfig::default().with_limits(RuntimeLimits::default()),
+        vec![],
+        &[&callee, finally_parallel_caller()],
+    );
+
+    let err = kernel
+        .execute("caller", "callee", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect_err("the finally's branch callee throws");
+    match err {
+        KernelError::CalleeFailed { source, .. } => match &*source {
+            KernelError::PluginError { code, .. } => assert_eq!(code, "E_CALLEE"),
+            other => panic!("expected the callee's PluginError as source, got: {other:?}"),
+        },
+        other => panic!("expected CalleeFailed, got: {other:?}"),
+    }
+}
+
+/// A dataflow step that answers the *caller's* cancel with the typed
+/// cancellation gets the handle's documented contract: `Ok` with
+/// whatever was written and `PipelineCompleted { ok: false }`, not an
+/// error.
+#[tokio::test(flavor = "multi_thread")]
+async fn dataflow_caller_cancel_with_typed_cancellation_resolves_ok() {
+    let mut a = action(vec![{
+        let mut m = step(
+            "host",
+            "test_resource_limits_fixture.fail_on_cancel",
+            json!({ "sleep_ms": 5_000u64, "shape": "cancelled" }),
+        );
+        m.long_running = true;
+        m
+    }]);
+    a.dataflow = true;
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action("p", "pipeline", a)],
+    );
+
+    let mut handle = kernel
+        .execute("p", "pipeline", json!({}))
+        .with_config(&json!({}))
+        .into_dataflow_handle()
+        .expect("handle returned");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle.cancel();
+
+    handle
+        .result
+        .await
+        .expect("result delivered")
+        .expect("a caller cancel resolves Ok with partial results");
+
+    let mut saw_not_ok_terminator = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                gwead::kernel::DataflowEvent::PipelineCompleted { ok } => {
+                    saw_not_ok_terminator = !ok;
+                }
+                gwead::kernel::DataflowEvent::StepFailed { step_id, .. } => {
+                    panic!("a cancelled step is not a failed one: {step_id}");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("events channel closes after the pipeline task exits");
+    assert!(saw_not_ok_terminator);
+}
+
+/// Dataflow with a step that answers the token with the typed
+/// cancellation. The watchdog fires first and the backstop only after
+/// its grace window, so the step winds down, the scheduler emits its
+/// own `PipelineCompleted { ok: false }` and resolves `Ok` with partial
+/// results, and the wrapper turns that `Ok` into `ExecutionTimeout`.
+/// The handle must deliver exactly ONE terminator: the substitute emit
+/// is for a dropped future only, not for any `ExecutionTimeout`
+/// result. (Keying the substitute on the result delivers two here.)
+#[tokio::test(flavor = "multi_thread")]
+async fn dataflow_deadline_answered_by_step_emits_one_terminator() {
+    let mut a = action(vec![{
+        let mut m = step(
+            "host",
+            "test_resource_limits_fixture.fail_on_cancel",
+            json!({ "sleep_ms": 5_000u64, "shape": "cancelled" }),
+        );
+        m.long_running = true;
+        m
+    }]);
+    a.dataflow = true;
+    a.wallclock_timeout_ms = Some(80);
+    let kernel = boot_with_limits(
+        RuntimeLimits::default(),
+        vec![manifest_with_action("p", "pipeline", a)],
+    );
+
+    let mut handle = kernel
+        .execute("p", "pipeline", json!({}))
+        .with_config(&json!({}))
+        .into_dataflow_handle()
+        .expect("handle returned");
+
+    let err = handle
+        .result
+        .await
+        .expect("result delivered")
+        .expect_err("declared cap on dataflow action must still apply");
+    match err {
+        KernelError::ExecutionTimeout { timeout_ms } => assert_eq!(timeout_ms, 80),
+        other => panic!("expected ExecutionTimeout, got: {other:?}"),
+    }
+
+    // Every sender is gone once the pipeline task exits, so the drain
+    // ends on channel close; the outer timeout is a hang guard only.
+    let mut terminators = 0;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(ev) = handle.events.recv().await {
+            if let gwead::kernel::DataflowEvent::PipelineCompleted { ok } = ev {
+                assert!(!ok, "a deadline-stopped pipeline is not ok");
+                terminators += 1;
+            }
+        }
+    })
+    .await
+    .expect("events channel closes after the pipeline task exits");
+    assert_eq!(terminators, 1, "exactly one PipelineCompleted per pipeline");
 }
 
 // ---------------------------------------------------------------------------

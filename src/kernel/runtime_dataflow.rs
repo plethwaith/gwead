@@ -182,19 +182,38 @@ pub(super) async fn execute_dag_dataflow(
     // when multi-consumer) for every long-running producer. Sets
     // step_results[producer_id] to the main readable handle so consumer
     // resolution surfaces resolve `steps.<producer>.result` immediately.
-    let fanout_branches = provision_dataflow_streams(
+    //
+    // A pre-flight failure resolves the pipeline like any other error:
+    // with its terminator, since the handle is already in the caller's
+    // hands and nothing later would emit one.
+    let engine = runtime.engine().clone();
+    let prepared = provision_dataflow_streams(
         &mut canonical_state,
         action,
         plan,
         pre_allocated_outputs.as_ref(),
-    )?;
-
-    // Linker setup — same registration path as the wave scheduler.
-    let engine = runtime.engine().clone();
-    let mut linker = Linker::new(&engine);
-    host_api::register_kernel_services(&mut linker)?;
-    runtime.register_linker_imports(&mut linker)?;
-    let linker = Arc::new(linker);
+    )
+    .and_then(|fanout_branches| {
+        // Linker setup — same registration path as the wave scheduler.
+        let mut linker = Linker::new(&engine);
+        host_api::register_kernel_services(&mut linker)?;
+        runtime.register_linker_imports(&mut linker)?;
+        Ok((fanout_branches, Arc::new(linker)))
+    });
+    let (fanout_branches, linker) = match prepared {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            emit_terminal_event(
+                dataflow_events.as_ref(),
+                super::DataflowEvent::PipelineCompleted { ok: false },
+            )
+            .await;
+            if drain_streams && canonical_state.invoke_depth == 0 {
+                super::streams::lock_shared(&canonical_state.streams).drain();
+            }
+            return Err(e);
+        }
+    };
 
     // Each task gets a forked `ExecutionState` clone (the stream registry,
     // `dataflow_outputs`, cancel token, and events sender are all
@@ -309,7 +328,30 @@ pub(super) async fn execute_dag_dataflow(
                 };
                 let task_state = task_store.into_data();
                 let body_ok = matches!(run_result, Ok(true));
+                // Only a pipeline driven through a handle has the
+                // wind-down contract: the caller is listening for
+                // `PipelineCompleted` and inspects per-step state. The
+                // `run()`, `invoke` and role-dispatch paths have no
+                // events channel and no such contract, so there the
+                // step's own answer decides: a step that stops with
+                // `StepError::Cancelled` fails the pipeline with
+                // `Cancelled` like any other action, while a step that
+                // answers the token with an `Ok` (the `cancelled`
+                // sidecar idiom) keeps its `Ok` and the pipeline
+                // resolves `Ok` with the sidecars for the caller to
+                // inspect, as `run()` on a dataflow action always has.
+                let winding_down = cancel.is_cancelled() && dataflow_events.is_some();
                 let candidate_error = match run_result {
+                    // A step that stopped on the pipeline's own cancel
+                    // is winding down, not failing. The handle's
+                    // contract for a cancel is `Ok` with whatever was
+                    // written plus `PipelineCompleted { ok: false }`,
+                    // whether the step said so with a `cancelled`
+                    // sidecar on an `Ok` or with `StepError::Cancelled`.
+                    // (Under the wallclock deadline the wrapper turns
+                    // that `Ok` into `ExecutionTimeout`.)
+                    Err(KernelError::Cancelled { .. }) if winding_down => None,
+                    Ok(false) if task_state.cancelled && winding_down => None,
                     Err(e) => Some(e),
                     Ok(true) => None,
                     // Any failure in the dataflow scheduler
@@ -320,8 +362,9 @@ pub(super) async fn execute_dag_dataflow(
                 // Emit the per-step lifecycle event. `StepFailed` carries
                 // the textual error so a UI can show it without waiting
                 // for the pipeline-final ActionResult; `StepCompleted`
-                // carries `ok`, which on this path is always `true`
-                // since any failure is reported as `StepFailed`.
+                // carries `ok`: `true` for a normal finish, `false` for
+                // a step that wound down on the pipeline's own cancel.
+                // Any failure is reported as `StepFailed` instead.
                 match &candidate_error {
                     Some(err) => emit_event(
                         dataflow_events.as_ref(),

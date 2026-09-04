@@ -112,6 +112,15 @@ pub(crate) struct ExecutionState {
     /// generic `Execution(string)` so embedder callers can
     /// branch on the code field.
     pub(crate) plugin_error: Option<PluginErrorPayload>,
+    /// Set when the step stopped on the invocation's cancellation token
+    /// ([`StepError::Cancelled`]). Read by `step_failure_to_error`
+    /// ahead of every marker but a resource violation: a cancelled step
+    /// is not a failed one, and `try` does not catch it.
+    pub(crate) cancelled: bool,
+    /// Set when a nested invocation the step made failed
+    /// ([`StepError::Callee`]): the callee's own error, intact, for
+    /// [`super::KernelError::CalleeFailed`].
+    pub(crate) callee_error: Option<CalleeError>,
     /// forEach iteration state stack (for nested forEach).
     pub(crate) foreach_stack: Vec<ForEachState>,
     /// Active error-handler payloads. Pushed by the runtime before
@@ -389,6 +398,15 @@ pub struct PluginErrorPayload {
     pub params: Value,
 }
 
+/// A failed nested invocation, held on the execution state between the
+/// step that made it and the scheduler's error mapping.
+#[derive(Debug, Clone)]
+pub(crate) struct CalleeError {
+    pub plugin: String,
+    pub action: String,
+    pub source: std::sync::Arc<super::KernelError>,
+}
+
 /// Where a loop's items come from.
 ///
 /// `for_each` iterates a list that already exists. `repeat` iterates a
@@ -569,7 +587,10 @@ impl StepOutput {
 /// surfaces as [`super::KernelError::Execution`]. `Thrown(payload)`
 /// is the `throw_error` step: a deliberate structured failure
 /// the engine promotes to [`super::KernelError::PluginError`] so
-/// callers can branch on `code`/`message`/`params`.
+/// callers can branch on `code`/`message`/`params`. `Cancelled` is a
+/// step that observed the invocation's cancellation token and stopped;
+/// it is not a failure, and `try` does not catch it. `Callee` is a
+/// nested invocation that failed, with the callee's error intact.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum StepError {
@@ -579,6 +600,43 @@ pub enum StepError {
     /// Structured plugin error (the `throw_error` step type).
     /// Promoted to [`super::KernelError::PluginError`].
     Thrown(PluginErrorPayload),
+    /// The step observed [`PluginExecution::cancel_token`] and stopped
+    /// on it. Promoted to [`super::KernelError::Cancelled`], which the
+    /// kernel's wallclock watchdog then reports as
+    /// [`super::KernelError::ExecutionTimeout`] when the deadline is
+    /// what fired the token. A step that races IO against the token
+    /// returns this — not a `Failed` or `Thrown` of its own — so the
+    /// stop keeps its meaning on the way out.
+    Cancelled,
+    /// A nested invocation the step made failed: an `invoke` step's
+    /// callee, or an action a native step dispatched by role. Promoted
+    /// to [`super::KernelError::CalleeFailed`] with `source` intact, so
+    /// a caller can branch on a callee's `PluginError` code or see that
+    /// it timed out. Shared rather than boxed because `StepError` is
+    /// `Clone` and kernel errors are not.
+    Callee {
+        plugin: String,
+        action: String,
+        source: std::sync::Arc<super::KernelError>,
+    },
+}
+
+impl StepError {
+    /// Map a callee's error onto the calling step's error, keeping it
+    /// typed. A cancelled callee means the caller was cancelled: an
+    /// invoked callee runs under the caller's own token, so nothing
+    /// else could have fired it. Everything else is the callee's own
+    /// failure.
+    pub fn from_callee(plugin: &str, action: &str, err: super::KernelError) -> Self {
+        match err {
+            super::KernelError::Cancelled { .. } => StepError::Cancelled,
+            source => StepError::Callee {
+                plugin: plugin.to_string(),
+                action: action.to_string(),
+                source: std::sync::Arc::new(source),
+            },
+        }
+    }
 }
 
 impl std::fmt::Display for StepError {
@@ -586,6 +644,12 @@ impl std::fmt::Display for StepError {
         match self {
             StepError::Failed(msg) => write!(f, "{msg}"),
             StepError::Thrown(p) => write!(f, "{}: {}", p.code, p.message),
+            StepError::Cancelled => write!(f, "cancelled"),
+            StepError::Callee {
+                plugin,
+                action,
+                source,
+            } => write!(f, "{plugin}.{action} failed: {source}"),
         }
     }
 }
@@ -1175,6 +1239,8 @@ impl ExecutionState {
             body_secrets: None,
             secret_resolver: params.secret_resolver,
             plugin_error: None,
+            cancelled: false,
+            callee_error: None,
             foreach_stack: Vec::new(),
             error_stack: Vec::new(),
             // `Arc<Mutex<StreamRegistry>>` is the `SharedStreamRegistry`
@@ -2134,11 +2200,7 @@ fn step_invoke<'a>(
             .await
         {
             Ok(action_result) => Ok(StepOutput::from(action_result.output)),
-            Err(e) => Err(StepError::Failed(format!(
-                "invoke step '{step_id}' → {plugin}.{action} failed: {e}",
-                plugin = plan.plugin,
-                action = plan.action
-            ))),
+            Err(e) => Err(StepError::from_callee(&plan.plugin, &plan.action, e)),
         }
     })
 }
@@ -2475,11 +2537,7 @@ pub(crate) fn step_alias_dispatch<'a>(
             .await
         {
             Ok(action_result) => Ok(StepOutput::from(action_result.output)),
-            Err(e) => Err(StepError::Failed(format!(
-                "alias step '{step_id}' ('{step_type}') → {plugin}.{action} failed: {e}",
-                plugin = plan.plugin,
-                action = plan.action
-            ))),
+            Err(e) => Err(StepError::from_callee(&plan.plugin, &plan.action, e)),
         }
     })
 }

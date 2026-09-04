@@ -192,8 +192,10 @@ impl ContinuousHandle {
 pub enum DataflowEvent {
     /// A step task has been spawned and started executing.
     StepStarted { step_id: String },
-    /// A step task has finished normally; `ok` is `true`. A failure
-    /// is reported as [`Self::StepFailed`] instead.
+    /// A step task has finished without failing. `ok` is `true` for a
+    /// normal finish and `false` for a step that stopped on the
+    /// pipeline's own cancel (a `StepError::Cancelled` while winding
+    /// down). A failure is reported as [`Self::StepFailed`] instead.
     StepCompleted { step_id: String, ok: bool },
     /// A step task failed in a way the scheduler did NOT tolerate.
     /// Pipeline tear-down is in progress.
@@ -223,11 +225,13 @@ pub enum DataflowEvent {
     /// scheduler on a full channel would deadlock it against the
     /// subscriber that drains it.
     ///
-    /// It covers the panic and wallclock-timeout paths as well as the
-    /// ordinary exit: a panicked step task and a timeout that drops the
-    /// scheduler future mid-flight both still emit it. Otherwise
-    /// `result` would resolve `Err` while a subscriber keyed on this
-    /// event waited for channel-close or forever.
+    /// It covers the panic, wallclock-timeout and pre-flight paths as
+    /// well as the ordinary exit: a panicked step task, a timeout that
+    /// drops the scheduler future mid-flight, and a failure before the
+    /// scheduler ran (action lookup, secrets pull, stream provisioning,
+    /// linker setup) all still emit it. Otherwise `result` would
+    /// resolve `Err` while a subscriber keyed on this event waited for
+    /// channel-close or forever.
     ///
     /// **Do not treat it as guaranteed.** If the events receiver is
     /// dropped, or the process is killed, nothing arrives. Treat
@@ -286,11 +290,16 @@ impl DataflowHandle {
     /// _ = state.cancel.cancelled() => break, _ = io_work => ... }`).
     /// Once every step exits, [`Self::result`] resolves with an
     /// `Ok(ActionResult)` carrying whatever `step_results` were
-    /// written before tear-down (typically including a
-    /// `cancelled: true` sidecar per step). The events channel
+    /// written before tear-down — whether a step answered the token
+    /// with an `Ok` carrying a `cancelled: true` sidecar or with
+    /// `StepError::Cancelled` (the latter records no result and
+    /// reports `StepCompleted { ok: false }`). The events channel
     /// emits a final [`DataflowEvent::PipelineCompleted`] with
     /// `ok: false` to distinguish a cancelled run from a clean
-    /// completion.
+    /// completion. The token is this pipeline's own, a child of any
+    /// token the caller passed in: the caller's cancel reaches it, the
+    /// pipeline's wallclock deadline fires it, and neither touches
+    /// other work sharing the caller's token.
     ///
     /// Misbehaving step types that ignore the token would hang the
     /// pipeline indefinitely — a dataflow action that declares no
@@ -304,10 +313,11 @@ impl DataflowHandle {
         self.cancel.cancel();
     }
 
-    /// Clone of the underlying cancellation token. Useful for
-    /// handing the same token into other async layers (HTTP request
-    /// cancellation, parent `select!` arms, etc.) so they all tear
-    /// down on a single signal.
+    /// Clone of the pipeline's own cancellation token. Useful for
+    /// handing it into other async layers (HTTP request cancellation,
+    /// parent `select!` arms, etc.) so they all tear down on a single
+    /// signal — including the pipeline's wallclock deadline, which
+    /// fires this token.
     pub fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
         self.cancel.clone()
     }
@@ -3598,14 +3608,23 @@ impl Kernel {
                     kernel.limits.clone(),
                 )
                 .await;
-            if let Err(e) = result {
-                tracing::warn!(
+            match result {
+                Ok(_) => {}
+                // A cancelled callee is the caller's doing, not a
+                // failure worth a warning.
+                Err(KernelError::Cancelled { .. }) => tracing::debug!(
+                    plugin = %plugin_owned,
+                    action = %action_owned,
+                    "io.invoke_streaming: background action cancelled; \
+                     stream EOF reached early"
+                ),
+                Err(e) => tracing::warn!(
                     plugin = %plugin_owned,
                     action = %action_owned,
                     error = %e,
                     "io.invoke_streaming: background action failed; \
                      stream EOF reached early"
-                );
+                ),
             }
         });
 
@@ -4508,13 +4527,36 @@ impl Kernel {
 /// `run_parallel`, `run_ifs`) poll that token between steps, so the same
 /// loop exits within milliseconds of the deadline.
 ///
-/// The `tokio::time::timeout` stays as the second half. It catches the
-/// mirror-image case: a future that *does* yield but ignores the token
-/// (a step awaiting something that never resolves). Whichever fires
-/// first, the caller sees [`KernelError::ExecutionTimeout`] — a
-/// cooperative exit reports `Cancelled`, which this maps back, because
-/// "your deadline expired" and "somebody cancelled you" are different
-/// facts and the caller acted on the first.
+/// The `tokio::time::timeout` stays as the second half, armed
+/// [`WALLCLOCK_DROP_GRACE`] later than the watchdog so the cooperative
+/// exit gets first crack. It catches the mirror-image case: a future
+/// that *does* yield but ignores the token (a step awaiting something
+/// that never resolves). It drops the future, whose own cleanup then
+/// never runs, and fires the token itself so detached work that holds
+/// only the token — a streaming `invoke` callee, a forwarder task —
+/// still winds down. Either way the caller sees
+/// [`KernelError::ExecutionTimeout`].
+///
+/// Once the watchdog has fired, a cancellation-shaped outcome is
+/// reported as the deadline: "your deadline expired" and "somebody
+/// cancelled you" are different facts the caller acts on. The shapes
+/// are typed all the way down — the wave scheduler's cooperative exit
+/// and a host step's [`StepError::Cancelled`](host_api::StepError)
+/// are `Cancelled`; a callee cancelled through the caller's token,
+/// which it runs under, is the caller's own `Cancelled`; a callee
+/// reporting its own deadline is `CalleeFailed` over `ExecutionTimeout`
+/// ([`stopped_by_cancellation`]). An `Ok` resolved after the watchdog
+/// fired is the deadline too: the scheduler winding down with partial
+/// results, or a step handing back what it had, is not a success, and
+/// an `Ok` cannot carry the fact that the deadline passed. Any *other*
+/// error passes through as the failure it is — a step that ignored the
+/// token and then failed for its own reasons is reported for those
+/// reasons, with the deadline noted in the log. A step that answers
+/// the token with a `Failed` or `Thrown` of its own therefore
+/// misreports itself; the typed variant exists so it need not. The
+/// watchdog claims the stop only if nobody had fired the token before
+/// it: a caller's own cancel just ahead of the deadline is reported as
+/// theirs, whatever the timer did.
 ///
 /// Still best-effort against a `block_in_place` region inside a single
 /// host step, which neither mechanism can preempt. In practice those
@@ -4523,13 +4565,15 @@ impl Kernel {
 /// the per-script fuel budget.
 ///
 /// A **dataflow** action is no exception: its deadline also surfaces as
-/// [`KernelError::ExecutionTimeout`]. The cooperative cancel the
-/// watchdog fires does make the scheduler wind down and emit
-/// `PipelineCompleted { ok: false }` on the events channel, but the
-/// outer `tokio::time::timeout` resolves first and its `Err` is what
-/// the caller gets — the `Ok`-with-partial-results shape is for a
-/// cancel the *caller* requested, not for the deadline.
-/// (`resource_limits_tests` pins this.)
+/// [`KernelError::ExecutionTimeout`]. The watchdog's cancel makes the
+/// scheduler wind down and emit `PipelineCompleted { ok: false }` on
+/// the events channel, and its `Ok`-with-partial-results is remapped
+/// here — that shape is for a cancel the *caller* requested, not for
+/// the deadline (`dataflow_deadline_answered_by_step_emits_one_terminator`
+/// in `resource_limits_tests`). The dataflow
+/// entry points use [`run_with_wallclock_timeout`] directly so they
+/// can tell a future the backstop *dropped* (its terminal emit never
+/// ran, so they send a substitute) from one that wound down itself.
 ///
 /// `None` means no automatic cap: dataflow actions with no per-action
 /// declaration and no operator ceiling end up here and rely entirely on
@@ -4542,8 +4586,60 @@ async fn with_wallclock_timeout<F>(
 where
     F: std::future::Future<Output = Result<ActionResult, KernelError>>,
 {
+    run_with_wallclock_timeout(fut, timeout, cancel)
+        .await
+        .result
+}
+
+/// How long the hard backstop waits past the deadline before dropping
+/// the action future.
+///
+/// The watchdog fires the token exactly at the deadline. A future that
+/// observes it — the wave scheduler between steps, a host step racing
+/// its IO against the token, a dataflow scheduler winding down — exits
+/// on its own within this window and its own cleanup runs. Only a
+/// future that ignores the token for the whole window is dropped.
+/// Armed at the same instant, the two mechanisms would race and the
+/// drop would win often enough that cooperative cleanup was the
+/// exception rather than the rule. The cost is that the ceiling is
+/// soft by this margin for a step that ignores the token: it runs up
+/// to `timeout + WALLCLOCK_DROP_GRACE` before being dropped, and the
+/// reported `timeout_ms` is still the declared cap.
+const WALLCLOCK_DROP_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// What [`run_with_wallclock_timeout`] observed alongside the result.
+///
+/// The dataflow entry points need one extra bit the `Result` alone
+/// cannot carry: whether the action future ran to completion or was
+/// dropped mid-flight by the backstop. Only the dropped future skipped
+/// the scheduler's own `PipelineCompleted` emit, so only that case
+/// needs a substitute terminator. Keying the substitute on the *error
+/// variant* instead would double-emit whenever a completed future's
+/// outcome was remapped to the deadline.
+struct WallclockOutcome {
+    result: Result<ActionResult, KernelError>,
+    /// `true` when the backstop dropped the future before it resolved,
+    /// so none of its own cleanup ran. `false` whenever the future
+    /// itself resolved, including when its outcome was remapped to
+    /// [`KernelError::ExecutionTimeout`] because the watchdog stopped it.
+    abandoned: bool,
+}
+
+/// [`with_wallclock_timeout`] plus the abandoned-vs-completed bit; see
+/// the former for the mechanism.
+async fn run_with_wallclock_timeout<F>(
+    fut: F,
+    timeout: Option<std::time::Duration>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> WallclockOutcome
+where
+    F: std::future::Future<Output = Result<ActionResult, KernelError>>,
+{
     let Some(timeout) = timeout else {
-        return fut.await;
+        return WallclockOutcome {
+            result: fut.await,
+            abandoned: false,
+        };
     };
     let timeout_ms = timeout.as_millis() as u64;
 
@@ -4555,25 +4651,89 @@ where
         let cancel = cancel.clone();
         tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
-            expired.store(true, std::sync::atomic::Ordering::SeqCst);
-            cancel.cancel();
+            // A token the caller (or a parent) fired first is their
+            // cancel, not ours: leave `expired` clear so whatever the
+            // future resolves to is reported as theirs.
+            if !cancel.is_cancelled() {
+                expired.store(true, std::sync::atomic::Ordering::SeqCst);
+                cancel.cancel();
+            }
         })
     };
 
-    let outcome = match tokio::time::timeout(timeout, fut).await {
-        Ok(result) => result,
-        Err(_) => Err(KernelError::ExecutionTimeout { timeout_ms }),
-    };
+    let outcome = tokio::time::timeout(timeout + WALLCLOCK_DROP_GRACE, fut).await;
     watchdog.abort();
+    let expired = expired.load(std::sync::atomic::Ordering::SeqCst);
 
     match outcome {
-        // The watchdog's cancel is what stopped it, so report the
-        // deadline rather than a cancellation the caller never asked
-        // for.
-        Err(KernelError::Cancelled { .. }) if expired.load(std::sync::atomic::Ordering::SeqCst) => {
-            Err(KernelError::ExecutionTimeout { timeout_ms })
+        Err(_elapsed) => {
+            // Dropping the future does not reach work that holds only
+            // the token. Fire it here: the aborted watchdog may never
+            // have got to, and firing an already-fired token is a no-op.
+            cancel.cancel();
+            WallclockOutcome {
+                result: Err(KernelError::ExecutionTimeout { timeout_ms }),
+                abandoned: true,
+            }
         }
-        other => other,
+        // The watchdog's cancel is what stopped the action, so report
+        // the deadline rather than whatever shape the stop took on the
+        // way out — a cancellation the caller never asked for, a
+        // step's own "I was cancelled" error, or an `Ok` of partial
+        // results. A failure that merely coincided with the deadline
+        // reads the same way; it is logged in full so it is not lost.
+        Ok(Ok(_)) if expired => {
+            tracing::debug!(
+                timeout_ms,
+                "action resolved Ok after the wallclock watchdog fired; reporting ExecutionTimeout"
+            );
+            WallclockOutcome {
+                result: Err(KernelError::ExecutionTimeout { timeout_ms }),
+                abandoned: false,
+            }
+        }
+        Ok(Err(err)) if expired && stopped_by_cancellation(&err) => {
+            tracing::debug!(
+                timeout_ms,
+                error = %err,
+                "action stopped by the wallclock watchdog; reporting ExecutionTimeout"
+            );
+            WallclockOutcome {
+                result: Err(KernelError::ExecutionTimeout { timeout_ms }),
+                abandoned: false,
+            }
+        }
+        Ok(Err(err)) if expired => {
+            tracing::debug!(
+                timeout_ms,
+                error = %err,
+                "action failed after the wallclock watchdog fired; reporting the failure itself"
+            );
+            WallclockOutcome {
+                result: Err(err),
+                abandoned: false,
+            }
+        }
+        Ok(result) => WallclockOutcome {
+            result,
+            abandoned: false,
+        },
+    }
+}
+
+/// Whether an error is the shape a cancellation takes on its way out
+/// of an action: the invocation's own `Cancelled`, or a failed callee
+/// whose root cause is a cancellation or a deadline. A callee's
+/// `ExecutionTimeout` counts too: when the caller's watchdog has fired
+/// and the callee reports a deadline, that is the same event seen one
+/// level down. Today an invoked callee runs under the caller's token
+/// with no cap of its own, so that arm waits on the callee deadline
+/// (issue #4) to become reachable outside its unit test.
+fn stopped_by_cancellation(err: &KernelError) -> bool {
+    match err {
+        KernelError::Cancelled { .. } | KernelError::ExecutionTimeout { .. } => true,
+        KernelError::CalleeFailed { source, .. } => stopped_by_cancellation(source),
+        _ => false,
     }
 }
 
@@ -5159,7 +5319,10 @@ pub enum KernelError {
     /// `RuntimeLimits::default_wallclock_timeout`, either clamped by
     /// `max_wallclock_timeout`; see `Kernel::effective_wallclock_timeout`.
     /// Wraps the entire `execute_dag` future; fires on either a
-    /// genuinely long-running step or a hung blocking call.
+    /// genuinely long-running step or a hung blocking call. A step that
+    /// ignores the cancellation token is dropped a short grace after
+    /// the cap (100 ms), so the ceiling is soft by that margin;
+    /// `timeout_ms` is always the declared cap.
     #[error("Action wallclock timeout exceeded ({timeout_ms} ms)")]
     ExecutionTimeout { timeout_ms: u64 },
 
@@ -5172,6 +5335,25 @@ pub enum KernelError {
     #[error("Action cancelled at step '{at_step}'")]
     Cancelled { at_step: String },
 
+    /// A nested invocation failed — an `invoke` or alias step's callee,
+    /// or an action a native step dispatched by role — and this is the
+    /// callee's own error, intact. Callers branch on `source` (a
+    /// callee's `PluginError` code, its `ExecutionTimeout`) instead of
+    /// parsing the message, which keeps the flattened shape so a
+    /// `try.catch` handler's `{{$.error}}` reads as before. Shared
+    /// rather than boxed because it travels through the `Clone` step
+    /// error. (A *cancelled* callee is not this: it runs under the
+    /// caller's own token, so it surfaces as the caller's own
+    /// [`Self::Cancelled`].)
+    #[error("step '{step_id}' → {plugin}.{action} failed: {source}")]
+    CalleeFailed {
+        step_id: String,
+        plugin: String,
+        action: String,
+        #[source]
+        source: Arc<KernelError>,
+    },
+
     /// A plugin explicitly threw a structured error via the
     /// `throw_error` step type. Carries the plugin-supplied
     /// `code`, optional `message`, and optional `params` object so
@@ -5183,6 +5365,210 @@ pub enum KernelError {
         message: String,
         params: serde_json::Value,
     },
+}
+
+#[cfg(test)]
+mod wallclock_timeout_tests {
+    use super::*;
+
+    fn ok_result() -> ActionResult {
+        ActionResult {
+            output: Value::Null,
+            variables: Default::default(),
+            step_results: Default::default(),
+        }
+    }
+
+    fn host_cancelled() -> KernelError {
+        KernelError::PluginError {
+            code: "host_cancelled".into(),
+            message: String::new(),
+            params: Value::Null,
+        }
+    }
+
+    /// A future that ignores the token and never resolves is dropped
+    /// by the backstop: `ExecutionTimeout`, `abandoned` so the dataflow
+    /// path knows the future's own cleanup never ran, and the token
+    /// fired anyway so detached work holding only the token winds down.
+    #[tokio::test]
+    async fn future_that_ignores_the_token_is_abandoned_and_token_fired() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let outcome = run_with_wallclock_timeout(
+            std::future::pending(),
+            Some(std::time::Duration::from_millis(20)),
+            cancel.clone(),
+        )
+        .await;
+        assert!(outcome.abandoned);
+        assert!(matches!(
+            outcome.result,
+            Err(KernelError::ExecutionTimeout { timeout_ms: 20 })
+        ));
+        assert!(
+            cancel.is_cancelled(),
+            "the abandoned path must still fire the token"
+        );
+    }
+
+    fn cancelled() -> KernelError {
+        KernelError::Cancelled {
+            at_step: "s".into(),
+        }
+    }
+
+    /// A future that answers the watchdog's cancel with `Cancelled`
+    /// resolved on its own: not abandoned, and reported as the
+    /// deadline. The grace window makes this deterministic — the
+    /// watchdog fires first, the backstop only 100 ms later.
+    #[tokio::test]
+    async fn cancellation_after_the_watchdog_fired_is_the_deadline_not_abandoned() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let observed = cancel.clone();
+        let outcome = run_with_wallclock_timeout(
+            async move {
+                observed.cancelled().await;
+                Err(cancelled())
+            },
+            Some(std::time::Duration::from_millis(20)),
+            cancel,
+        )
+        .await;
+        assert!(!outcome.abandoned);
+        assert!(matches!(
+            outcome.result,
+            Err(KernelError::ExecutionTimeout { timeout_ms: 20 })
+        ));
+    }
+
+    /// A callee cancelled or timed out one level down is the same
+    /// event: reported as the deadline when the watchdog has fired.
+    #[tokio::test]
+    async fn callee_deadline_after_the_watchdog_fired_is_the_deadline() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let observed = cancel.clone();
+        let outcome = run_with_wallclock_timeout(
+            async move {
+                observed.cancelled().await;
+                Err(KernelError::CalleeFailed {
+                    step_id: "call".into(),
+                    plugin: "callee".into(),
+                    action: "go".into(),
+                    source: Arc::new(KernelError::ExecutionTimeout { timeout_ms: 20 }),
+                })
+            },
+            Some(std::time::Duration::from_millis(20)),
+            cancel,
+        )
+        .await;
+        assert!(matches!(
+            outcome.result,
+            Err(KernelError::ExecutionTimeout { timeout_ms: 20 })
+        ));
+    }
+
+    /// A failure that is not cancellation-shaped passes through even
+    /// after the watchdog fired: the step failed for its own reasons
+    /// and those reasons are what the caller needs.
+    #[tokio::test]
+    async fn own_failure_after_the_watchdog_fired_passes_through() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let observed = cancel.clone();
+        let outcome = run_with_wallclock_timeout(
+            async move {
+                observed.cancelled().await;
+                Err(host_cancelled())
+            },
+            Some(std::time::Duration::from_millis(20)),
+            cancel,
+        )
+        .await;
+        assert!(!outcome.abandoned);
+        assert!(matches!(
+            outcome.result,
+            Err(KernelError::PluginError { code, .. }) if code == "host_cancelled"
+        ));
+    }
+
+    /// Same for a future that answers the cancel with an `Ok`: a result
+    /// produced because the deadline fired is not a success.
+    #[tokio::test]
+    async fn ok_after_the_watchdog_fired_is_the_deadline() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let observed = cancel.clone();
+        let outcome = run_with_wallclock_timeout(
+            async move {
+                observed.cancelled().await;
+                Ok(ok_result())
+            },
+            Some(std::time::Duration::from_millis(20)),
+            cancel,
+        )
+        .await;
+        assert!(!outcome.abandoned);
+        assert!(matches!(
+            outcome.result,
+            Err(KernelError::ExecutionTimeout { timeout_ms: 20 })
+        ));
+    }
+
+    /// The caller fires the token just before the deadline and the
+    /// future takes a while to wind down, so the deadline timer fires
+    /// while it is still running. That is the caller's cancel, not the
+    /// watchdog's: `Cancelled` stays `Cancelled`. (The shape must be
+    /// one the remap would otherwise claim, or the test pins nothing.)
+    #[tokio::test]
+    async fn caller_cancel_before_the_deadline_is_not_claimed_by_the_watchdog() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let observed = cancel.clone();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            trigger.cancel();
+        });
+        let outcome = run_with_wallclock_timeout(
+            async move {
+                observed.cancelled().await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                Err(cancelled())
+            },
+            Some(std::time::Duration::from_millis(20)),
+            cancel,
+        )
+        .await;
+        assert!(!outcome.abandoned);
+        assert!(matches!(outcome.result, Err(KernelError::Cancelled { .. })));
+    }
+
+    /// An error inside the deadline is the future's own business: it
+    /// passes through, and the future was not abandoned.
+    #[tokio::test]
+    async fn error_inside_the_deadline_passes_through() {
+        let outcome = run_with_wallclock_timeout(
+            async { Err(host_cancelled()) },
+            Some(std::time::Duration::from_secs(10)),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert!(!outcome.abandoned);
+        assert!(matches!(
+            outcome.result,
+            Err(KernelError::PluginError { code, .. }) if code == "host_cancelled"
+        ));
+    }
+
+    /// `None` is no cap at all: no watchdog, no outer timeout.
+    #[tokio::test]
+    async fn no_cap_runs_bare() {
+        let outcome = run_with_wallclock_timeout(
+            async { Ok(ok_result()) },
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert!(!outcome.abandoned);
+        assert!(outcome.result.is_ok());
+    }
 }
 
 #[cfg(test)]
