@@ -555,6 +555,11 @@ impl StreamRegistry {
         let mut branch_ids: Vec<StreamId> = Vec::with_capacity(n_branches);
         for _ in 0..n_branches {
             let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(channel_capacity);
+            // Fused: a consumer that takes this source out of the registry polls
+            // it directly, and an `Unfold` panics if polled past its end. Reads
+            // through the registry are guarded separately, in `read_async`, and
+            // that guard also covers sources an embedder registers unfused — so
+            // neither guard makes the other redundant.
             let recv_source: ReadableSource = Box::pin(futures::StreamExt::fuse(
                 futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv().await.map(|item| (item, rx))
@@ -832,10 +837,14 @@ impl StreamState {
         // Step 4: put source + leftover back unless closed. EOF is
         // sticky: an exhausted source is replaced by an empty one, so a
         // guest that reads past EOF gets `STREAM_EOF` again rather than
-        // polling a finished stream — `futures::stream::Unfold`, which
-        // every channel-backed readable is, panics on that, and a
-        // guest must not be able to panic its host with a loop that
-        // reads one time too many.
+        // polling a finished stream. A source an embedder registers
+        // through `register_readable` may be anything — a bare
+        // `Unfold` panics when polled past its end — and a guest must
+        // not be able to panic its host with a loop that reads one
+        // time too many. The kernel's own channel-backed readables are
+        // fused at construction for the consumers that *take* the
+        // source and poll it directly, bypassing this path; that does
+        // not make this guard redundant, nor this guard those fuses.
         {
             let mut inner = self.lock_inner();
             if !inner.closed
@@ -1173,9 +1182,10 @@ mod tests {
         assert_eq!(state.read_async(&mut buf).await, STREAM_CLOSED);
     }
 
-    /// EOF sticks. The channel-backed readables are `Unfold`s, which
-    /// panic if polled after they finish; a guest reading one time too
-    /// many must get `STREAM_EOF` again, not a host panic.
+    /// EOF sticks. An embedder may register any source, and a bare
+    /// `Unfold` — used here on purpose, unfused — panics if polled
+    /// after it finishes; a guest reading one time too many must get
+    /// `STREAM_EOF` again, not a host panic.
     #[tokio::test]
     async fn read_past_eof_returns_eof_again_without_polling_the_source() {
         let mut reg = StreamRegistry::new();
@@ -1188,6 +1198,25 @@ mod tests {
         let mut buf = [0u8; 8];
         assert_eq!(state.read_async(&mut buf).await, 2);
         assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
+        assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
+        assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
+    }
+
+    /// What a guest sees of a producer that fails: the error code once,
+    /// then EOF, and EOF again — an error item does not end the source,
+    /// so it is the following `None` that sticks.
+    #[tokio::test]
+    async fn read_reports_an_error_item_once_and_then_eof() {
+        let mut reg = StreamRegistry::new();
+        let source: ReadableSource = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"ab")),
+            Err(std::io::Error::other("upstream fell over")),
+        ]));
+        let id = reg.register_readable("application/octet-stream", source);
+        let state = reg.streams.get(&id).unwrap().clone();
+        let mut buf = [0u8; 8];
+        assert_eq!(state.read_async(&mut buf).await, 2);
+        assert_eq!(state.read_async(&mut buf).await, STREAM_IO_ERROR);
         assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
         assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
     }

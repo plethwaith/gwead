@@ -1253,8 +1253,9 @@ async fn handle_driven_dataflow_parent_invoking_a_dataflow_callee_winds_down() {
 /// and ignores the token for 5 s) and `boom` (throws). `mid` invokes
 /// the callee from an undeclared action, for the two-level chains. The
 /// caller's actions each reach one of them from under a different
-/// budget — directly, through `mid`, through an alias of its own, or
-/// from a pipeline on the handle paths.
+/// budget — directly, through `mid`, or from a pipeline on the handle
+/// paths — and one reaches the caller's own `probe_self` through an
+/// alias of its own.
 fn callee_budget_manifests() -> [&'static str; 3] {
     let callee = r#"{
         "name": "callee",
@@ -1617,14 +1618,32 @@ async fn callee_deadline_stays_typed_through_two_hops() {
         started.elapsed() < Duration::from_secs(2),
         "ended by the leaf's 80 ms"
     );
-    let KernelError::CalleeFailed { plugin, source, .. } = &err else {
+    let KernelError::CalleeFailed {
+        step_id,
+        plugin,
+        action,
+        source,
+    } = &err
+    else {
         panic!("expected CalleeFailed at the root, got: {err:?}");
     };
-    assert_eq!(plugin, "mid");
-    let KernelError::CalleeFailed { plugin, source, .. } = &**source else {
+    assert_eq!(
+        (step_id.as_str(), plugin.as_str(), action.as_str()),
+        ("call", "mid", "slow_hop")
+    );
+    let KernelError::CalleeFailed {
+        step_id,
+        plugin,
+        action,
+        source,
+    } = &**source
+    else {
         panic!("expected CalleeFailed one level down, got: {source:?}");
     };
-    assert_eq!(plugin, "callee");
+    assert_eq!(
+        (step_id.as_str(), plugin.as_str(), action.as_str()),
+        ("call", "callee", "slow")
+    );
     match &**source {
         KernelError::ExecutionTimeout { timeout_ms } => assert_eq!(*timeout_ms, 80),
         other => panic!("expected the leaf's ExecutionTimeout, got: {other:?}"),
@@ -1645,6 +1664,10 @@ async fn capped_pipeline_on_the_streaming_handle_path_bounds_its_callee() {
         .expect("handle returned");
     use futures::StreamExt as _;
     while handle.output.next().await.is_some() {}
+    assert!(
+        handle.output.next().await.is_none(),
+        "fused: a poll past the end stays None"
+    );
     let result = handle
         .result
         .await

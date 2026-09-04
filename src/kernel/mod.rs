@@ -3550,8 +3550,10 @@ impl Kernel {
     /// then EOF; the caller's read sees `STREAM_IO_ERROR` rather than
     /// an EOF it could mistake for the end of the data, and nothing
     /// queued ahead of the report can crowd it out. The failure is
-    /// logged at `warn` as well. A callee cancelled by its caller ends
-    /// the stream with a plain EOF.
+    /// logged at `warn` as well. A callee its caller cancels ends the
+    /// stream with a plain EOF — except at the very end of an inherited
+    /// budget, where the caller's cancel and the callee's own watchdog
+    /// race and the stream may end with the deadline item instead.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_action_invoked_streaming(
         self: &Arc<Self>,
@@ -3652,6 +3654,12 @@ impl Kernel {
         // once the channel is exhausted. Written before the held
         // sender drops, so the channel's close orders it ahead of the
         // read that finds it.
+        //
+        // Fused: a consumer that takes this source out of the registry polls
+        // it directly, and an `Unfold` panics if polled past its end. Reads
+        // through the registry are guarded separately, in `read_async`, and
+        // that guard also covers sources an embedder registers unfused — so
+        // neither guard makes the other redundant.
         let outcome: Arc<std::sync::Mutex<Option<std::io::Error>>> = Default::default();
         let outcome_for_reader = Arc::clone(&outcome);
         let recv_source: self::streams::ReadableSource =
@@ -6147,6 +6155,10 @@ mod wallclock_timeout_tests {
             while let Some(item) = source.next().await {
                 items.push(item);
             }
+            assert!(
+                source.next().await.is_none(),
+                "fused: a poll past the end stays None instead of panicking"
+            );
             items
         })
         .await
