@@ -4808,7 +4808,7 @@ where
 /// `deadline` (what a step body sees through
 /// `PluginExecution::wallclock_deadline`), so the two agree exactly;
 /// computed separately they were apart by whatever ran in between.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub(crate) struct WallclockCap {
     /// When the watchdog fires the token. The backstop drops the
     /// future one [`WALLCLOCK_DROP_GRACE`] later.

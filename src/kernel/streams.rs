@@ -556,10 +556,11 @@ impl StreamRegistry {
         let mut branch_ids: Vec<StreamId> = Vec::with_capacity(n_branches);
         for _ in 0..n_branches {
             let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(channel_capacity);
-            // Fused: a consumer that takes this source out of the registry polls
-            // it directly, and an `Unfold` panics if polled past its end. Reads
-            // through the registry are guarded separately, in `read_async`, and
-            // that guard also covers sources an embedder registers unfused — so
+            // Fused: a consumer that takes this branch out of the
+            // registry polls it directly, and an `Unfold` panics if
+            // polled past its end. Reads through the registry are
+            // guarded separately, in `read_async`, and that guard also
+            // covers sources an embedder registers unfused — so
             // neither guard makes the other redundant.
             let recv_source: ReadableSource = Box::pin(futures::StreamExt::fuse(
                 futures::stream::unfold(rx, |mut rx| async move {

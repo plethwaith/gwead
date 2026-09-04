@@ -1600,11 +1600,11 @@ async fn callee_failure_stays_typed_through_two_hops() {
     }
 }
 
-/// The shape `Kernel::callee_wallclock` promises for a deadline two
-/// levels down: the leaf's own cap fires, and each level above wraps
-/// it in its own `CalleeFailed` rather than the wrapper's remap
-/// collapsing it — neither the middle nor the root had reached its
-/// deadline.
+/// The shape that follows from applying `Kernel::callee_wallclock`
+/// at each hop of a two-level chain: the leaf's own cap fires, and
+/// each level above wraps it in its own `CalleeFailed` rather than
+/// the wrapper's remap collapsing it — neither the middle nor the
+/// root had reached its deadline.
 #[tokio::test(flavor = "multi_thread")]
 async fn callee_deadline_stays_typed_through_two_hops() {
     let kernel = boot_callee_budget();
@@ -1744,8 +1744,10 @@ impl SecretResolver for SlowResolver {
     }
 }
 
-/// Manifests whose actions declare a secret, so the resolver is
-/// consulted before they run, and report the deadline they see.
+/// Manifests for the resolver tests. The callee plugin declares a
+/// secret, so the resolver is consulted before any of its actions
+/// run, and each reports the deadline it sees; the caller declares
+/// none and only reaches the callee.
 fn slow_resolver_manifests() -> [&'static str; 2] {
     let callee = r#"{
         "name": "callee",
@@ -1792,10 +1794,10 @@ fn boot_slow_resolver() -> Arc<Kernel> {
 /// The wallclock budget starts when the action does, after its
 /// secrets are pulled: a resolver that takes 300 ms of a 2 s cap does
 /// not eat into what the action's steps get (they see at least 1.8 s,
-/// never the 1.7 s a cap armed before the pull would leave). Pinned here at `run`, an
-/// inline invoke, and the dataflow handle, since each arms its cap
-/// separately; the spawned streaming path is pinned beside its own
-/// harness in the kernel's unit tests.
+/// never the 1.7 s a cap armed before the pull would leave). Pinned
+/// here at `run`, an inline invoke, and the dataflow handle, since
+/// each arms its cap separately; the spawned streaming path is pinned
+/// beside its own harness in the kernel's unit tests.
 #[tokio::test(flavor = "multi_thread")]
 async fn resolver_latency_is_not_charged_to_the_budget() {
     let kernel = boot_slow_resolver();
