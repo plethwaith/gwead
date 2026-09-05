@@ -204,7 +204,7 @@ pub(crate) fn step_script<'a>(
             dataflow_output = ?dataflow_output,
             "script step starting"
         );
-        let result = run_script_runtime(
+        let outcome = run_script_runtime(
             &engine,
             &runtime_module,
             &source,
@@ -217,7 +217,7 @@ pub(crate) fn step_script<'a>(
         )
         .await;
 
-        match result {
+        match outcome.result {
             Ok(result_json) => {
                 let val: Value = serde_json::from_str(&result_json).unwrap_or(Value::Null);
                 Ok(StepOutput::from(val))
@@ -243,6 +243,34 @@ pub(crate) fn step_script<'a>(
                         rest.trim()
                     )));
                 }
+                // A guest has no typed cancellation of its own. Its
+                // binding may raise a language-level error when a host
+                // import tells it the step was cancelled —
+                // `STREAM_CANCELLED` from a parked `stream_write`,
+                // `is_cancelled` answering 1, or a plain `io.invoke`
+                // whose callee stopped on this step's token. An error from a guest
+                // that was told is the cancellation surfacing through
+                // the guest's error idiom, and is reported as such, so
+                // the dataflow scheduler sees a step winding down and
+                // the wallclock wrapper sees its deadline rather than a
+                // failure carrying the guest's text. The gate is the
+                // telling, not the token: a guest that never heard of
+                // the cancel and failed for its own reasons keeps its
+                // failure, as the wallclock wrapper promises. The text
+                // has no other home once the step is recorded as
+                // cancelled, so it is logged at info. Resource-cap
+                // violations are mapped above, before this: a guest
+                // that ignores its cancel until its fuel runs out has
+                // still hit the kernel's limit.
+                if outcome.told_of_cancel {
+                    tracing::info!(
+                        plugin = %owner_plugin,
+                        step_id = %step_id,
+                        error = %e,
+                        "Script step failed after being told of its cancellation; reporting cancellation"
+                    );
+                    return Err(StepError::Cancelled);
+                }
                 tracing::warn!(
                     plugin = %owner_plugin,
                     step_id = %step_id,
@@ -253,6 +281,16 @@ pub(crate) fn step_script<'a>(
             }
         }
     })
+}
+
+/// What a script-runtime run came to, with the one fact about the
+/// guest's view that outlives its store: whether a host import told
+/// it the step was cancelled (see
+/// [`ScriptRuntimeStoreData::told_of_cancel`]).
+pub(crate) struct ScriptOutcome {
+    /// The result JSON on success, or the guest's error text.
+    pub(crate) result: Result<String, String>,
+    pub(crate) told_of_cancel: bool,
 }
 
 /// Instantiate a script-runtime wasm module and execute a script.
@@ -274,16 +312,23 @@ pub(crate) async fn run_script_runtime(
     dataflow_output: Option<crate::kernel::streams::StreamId>,
     cancel: tokio_util::sync::CancellationToken,
     parent: ScriptRuntimeParentContext,
-) -> Result<String, String> {
+) -> ScriptOutcome {
+    // No store yet, so nothing could have told the guest anything.
+    let setup_failed = |err: String| ScriptOutcome {
+        result: Err(err),
+        told_of_cancel: false,
+    };
     let mut linker = wasmtime::Linker::<ScriptRuntimeStoreData>::new(engine);
 
     // Async-required WASI linker. Pairs with `call_async`
-    // below so the sub-store can host `.await`-ing imports
-    // (`stream_read` / `stream_write`).
-    wasmtime_wasi::p1::add_to_linker_async(&mut linker, |data| &mut data.wasi)
-        .map_err(|e| format!("WASI linker setup failed: {e}"))?;
-
-    imports::register_all(&mut linker)?;
+    // in `execute_in_store` so the sub-store can host `.await`-ing
+    // imports (`stream_read` / `stream_write`).
+    if let Err(e) = wasmtime_wasi::p1::add_to_linker_async(&mut linker, |data| &mut data.wasi) {
+        return setup_failed(format!("WASI linker setup failed: {e}"));
+    }
+    if let Err(e) = imports::register_all(&mut linker) {
+        return setup_failed(e);
+    }
 
     // Create WASI context (sandboxed: no filesystem, no env, no args)
     let wasi_p1 = wasmtime_wasi::WasiCtxBuilder::new().build_p1();
@@ -304,9 +349,37 @@ pub(crate) async fn run_script_runtime(
         parent_deadline: parent.deadline,
         call_result: None,
         call_error: None,
+        told_of_cancel: false,
     };
     let mut store = wasmtime::Store::new(engine, store_data);
 
+    let result = execute_in_store(
+        &mut store,
+        &linker,
+        runtime_module,
+        source,
+        args_json,
+        limits,
+    )
+    .await;
+    ScriptOutcome {
+        result,
+        told_of_cancel: store.data().told_of_cancel,
+    }
+}
+
+/// Run the guest in `store`: apply the invocation's caps, instantiate
+/// `runtime_module`, hand it `source` and `args_json`, call `execute`,
+/// and read back what it set. The store outlives the run so the
+/// caller can read what the guest was told.
+async fn execute_in_store(
+    store: &mut wasmtime::Store<ScriptRuntimeStoreData>,
+    linker: &wasmtime::Linker<ScriptRuntimeStoreData>,
+    runtime_module: &Module,
+    source: &str,
+    args_json: &[u8],
+    limits: &crate::kernel::RuntimeLimits,
+) -> Result<String, String> {
     // Apply per-invocation resource caps. The engine itself was
     // constructed with `consume_fuel(true)`, so this just sets the
     // budget for THIS invocation. `limiter` installs the
@@ -330,7 +403,7 @@ pub(crate) async fn run_script_runtime(
     // surface that with the sentinel prefix too so the runtime can
     // map it onto `KernelError::MemoryLimitExceeded`.
     let instance = linker
-        .instantiate_async(&mut store, runtime_module)
+        .instantiate_async(&mut *store, runtime_module)
         .await
         .map_err(|e| {
             let msg = e.to_string();
@@ -355,15 +428,15 @@ pub(crate) async fn run_script_runtime(
 
     // Get the alloc and execute exports
     let alloc_fn = instance
-        .get_typed_func::<i32, i32>(&mut store, "alloc")
+        .get_typed_func::<i32, i32>(&mut *store, "alloc")
         .map_err(|e| format!("No 'alloc' export: {e}"))?;
 
     let execute_fn = instance
-        .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "execute")
+        .get_typed_func::<(i32, i32, i32, i32), i32>(&mut *store, "execute")
         .map_err(|e| format!("No 'execute' export: {e}"))?;
 
     let memory = instance
-        .get_memory(&mut store, "memory")
+        .get_memory(&mut *store, "memory")
         .ok_or("No 'memory' export")?;
 
     // Allocate and write source, then args.
@@ -380,23 +453,23 @@ pub(crate) async fn run_script_runtime(
     // `write_guest_slice` makes it an ordinary step error.
     let source_bytes = source.as_bytes();
     let source_ptr = alloc_fn
-        .call_async(&mut store, source_bytes.len() as i32)
+        .call_async(&mut *store, source_bytes.len() as i32)
         .await
         .map_err(|e| format!("alloc source: {e}"))?;
-    write_guest_slice(&memory, &mut store, source_ptr, source_bytes, "source")?;
+    write_guest_slice(&memory, store, source_ptr, source_bytes, "source")?;
 
     let args_ptr = alloc_fn
-        .call_async(&mut store, args_json.len() as i32)
+        .call_async(&mut *store, args_json.len() as i32)
         .await
         .map_err(|e| format!("alloc args: {e}"))?;
-    write_guest_slice(&memory, &mut store, args_ptr, args_json, "args")?;
+    write_guest_slice(&memory, store, args_ptr, args_json, "args")?;
 
     // Call execute. Resource-cap traps get sentinel-prefixed
     // error strings so `step_script` can map them into the structured
     // `KernelError` variants via `ExecutionState::resource_violation`.
     let success = execute_fn
         .call_async(
-            &mut store,
+            &mut *store,
             (
                 source_ptr,
                 source_bytes.len() as i32,
@@ -417,6 +490,433 @@ pub(crate) async fn run_script_runtime(
             .clone()
             .unwrap_or_else(|| "script runtime reported an error with no message".into());
         Err(err)
+    }
+}
+
+#[cfg(test)]
+mod told_of_cancel_tests {
+    //! The gate on reading a guest's error as its cancellation is
+    //! whether a host import told the guest about the cancel, not
+    //! whether the token has fired.
+    use super::*;
+
+    /// A guest that asks `is_cancelled` and raises if the answer is 1,
+    /// or raises unasked when `ask` is false.
+    fn raising_guest(ask: bool) -> Vec<u8> {
+        let m = crate::kernel::abi::ABI_MODULE;
+        let decide = if ask {
+            "(call $is_cancelled)"
+        } else {
+            "(i32.const 1)"
+        };
+        let wat = format!(
+            r#"
+            (module
+              (import "{m}" "host_set_result" (func $host_set_result (param i32 i32)))
+              (import "{m}" "host_set_error" (func $host_set_error (param i32 i32)))
+              (import "{m}" "is_cancelled" (func $is_cancelled (result i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 0) "null")
+              (data (i32.const 8) "guest raised")
+              (global $next (mut i32) (i32.const 32))
+              (func (export "alloc") (param $len i32) (result i32)
+                (local $ptr i32)
+                global.get $next
+                local.set $ptr
+                global.get $next
+                local.get $len
+                i32.add
+                global.set $next
+                local.get $ptr)
+              (func (export "execute") (param i32 i32 i32 i32) (result i32)
+                (if (result i32) {decide}
+                  (then (call $host_set_error (i32.const 8) (i32.const 12)) (i32.const 0))
+                  (else (call $host_set_result (i32.const 0) (i32.const 4)) (i32.const 1))))
+            )
+            "#
+        );
+        wat::parse_str(&wat).expect("wat parses")
+    }
+
+    async fn run(guest: Vec<u8>, cancel: tokio_util::sync::CancellationToken) -> ScriptOutcome {
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config).expect("engine");
+        let module = Module::new(&engine, &guest).expect("module compiles");
+        let parent = ScriptRuntimeParentContext {
+            kernel: None,
+            plugin: "p".into(),
+            config: Value::Null,
+            secret_resolver: None,
+            exec_ctx: Default::default(),
+            invoke_depth: 0,
+            deadline: None,
+        };
+        run_script_runtime(
+            &engine,
+            &module,
+            "",
+            b"{}",
+            &Default::default(),
+            &crate::kernel::RuntimeLimits::default(),
+            None,
+            cancel,
+            parent,
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_told_by_is_cancelled_that_raises_was_told() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let outcome = run(raising_guest(true), cancel).await;
+        assert_eq!(outcome.result, Err("guest raised".into()));
+        assert!(outcome.told_of_cancel);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_that_asked_under_a_quiet_token_was_not_told() {
+        let outcome = run(
+            raising_guest(true),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(outcome.result, Ok("null".into()));
+        assert!(!outcome.told_of_cancel);
+    }
+
+    /// The token has fired, but nothing told the guest: its error is
+    /// its own, and `step_script` must keep it a failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_that_raises_unasked_under_a_fired_token_was_not_told() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let outcome = run(raising_guest(false), cancel).await;
+        assert_eq!(outcome.result, Err("guest raised".into()));
+        assert!(!outcome.told_of_cancel);
+    }
+
+    /// A guest that invokes `p.<action>` on its own plugin through
+    /// `host_invoke` and, if the invoke fails, raises with the host's
+    /// call-error text — read back through the call-result protocol
+    /// — so a test sees why.
+    fn invoking_guest(action: &str) -> Vec<u8> {
+        let m = crate::kernel::abi::ABI_MODULE;
+        let action_len = action.len();
+        let wat = format!(
+            r#"
+            (module
+              (import "{m}" "host_set_result" (func $host_set_result (param i32 i32)))
+              (import "{m}" "host_set_error" (func $host_set_error (param i32 i32)))
+              (import "{m}" "host_call_result_size" (func $call_result_size (result i32)))
+              (import "{m}" "host_call_result_read"
+                (func $call_result_read (param i32 i32) (result i32)))
+              (import "{m}" "host_invoke"
+                (func $host_invoke (param i32 i32 i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 0) "null")
+              (data (i32.const 24) "{{\"plugin\": \"p\"}}")
+              (data (i32.const 40) "{action}")
+              (data (i32.const 60) "{{}}")
+              (global $next (mut i32) (i32.const 64))
+              (func (export "alloc") (param $len i32) (result i32)
+                (local $ptr i32)
+                global.get $next
+                local.set $ptr
+                global.get $next
+                local.get $len
+                i32.add
+                global.set $next
+                local.get $ptr)
+              (func (export "execute") (param i32 i32 i32 i32) (result i32)
+                (local $len i32)
+                (if (result i32)
+                  (i32.eqz (call $host_invoke
+                    (i32.const 24) (i32.const 15)
+                    (i32.const 40) (i32.const {action_len})
+                    (i32.const 60) (i32.const 2)))
+                  (then
+                    (local.set $len (call $call_result_size))
+                    (drop (call $call_result_read (i32.const 4096) (local.get $len)))
+                    (call $host_set_error (i32.const 4096) (local.get $len))
+                    (i32.const 0))
+                  (else (call $host_set_result (i32.const 0) (i32.const 4)) (i32.const 1))))
+            )
+            "#
+        );
+        wat::parse_str(&wat).expect("wat parses")
+    }
+
+    /// A step body that sleeps two seconds without racing the token.
+    fn sleep_ignoring_token<'a>(
+        _ex: &'a mut (dyn crate::kernel::host_api::PluginExecution + Send),
+        _params: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = Result<StepOutput, StepError>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            Ok(StepOutput::from(Value::Null))
+        })
+    }
+
+    /// A kernel with plugin `p` as the invoking guest's parent: its
+    /// one-step action `a`, and `slow`, whose own 50 ms wallclock cap
+    /// ends a two-second sleep.
+    fn kernel_with_p() -> std::sync::Arc<crate::kernel::Kernel> {
+        let mut config = crate::kernel::KernelConfig::default();
+        config
+            .native_step_impls
+            .insert("test.p.sleep", sleep_ignoring_token)
+            .expect("fresh table");
+        let mut kernel = crate::kernel::Kernel::boot(config).expect("boot");
+        kernel
+            .register_plugin_from_json(
+                r#"{
+                    "name": "p",
+                    "version": "0.0.0",
+                    "stepTypeDefs": [{"name": "p.sleep", "freelyUsable": true}],
+                    "stepTypeImpls": [{"stepType": "p.sleep", "kind": "native",
+                                       "implRef": "test.p.sleep"}],
+                    "actions": {
+                        "a": {"steps": [{"id": "v", "type": "let", "params": {"value": 1}}]},
+                        "slow": {
+                            "wallclockTimeoutMs": 50,
+                            "steps": [{"id": "s", "type": "p.sleep", "params": {}}]
+                        }
+                    }
+                }"#,
+            )
+            .expect("registers");
+        kernel.into_arc()
+    }
+
+    async fn run_invoking(
+        action: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> ScriptOutcome {
+        let kernel = kernel_with_p();
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config).expect("engine");
+        let module = Module::new(&engine, invoking_guest(action)).expect("module compiles");
+        let parent = ScriptRuntimeParentContext {
+            kernel: Some(std::sync::Arc::downgrade(&kernel)),
+            plugin: "p".into(),
+            config: Value::Null,
+            secret_resolver: None,
+            exec_ctx: Default::default(),
+            invoke_depth: 0,
+            deadline: None,
+        };
+        run_script_runtime(
+            &engine,
+            &module,
+            "",
+            b"{}",
+            &Default::default(),
+            &crate::kernel::RuntimeLimits::default(),
+            None,
+            cancel,
+            parent,
+        )
+        .await
+    }
+
+    /// The callee runs under a child of the step's token, so a fired
+    /// token stops it as a cancellation, and the failed invoke is the
+    /// guest being told of its own cancel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_whose_invoke_was_cancelled_under_its_token_was_told() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let outcome = run_invoking("a", cancel).await;
+        let text = outcome
+            .result
+            .expect_err("the cancelled invoke fails the guest");
+        assert!(text.starts_with("io.invoke → p.a failed"), "{text}");
+        assert!(outcome.told_of_cancel, "{text}");
+    }
+
+    /// An invoke that fails for its own reasons tells the guest
+    /// nothing about a cancel, fired token or not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_whose_invoke_failed_for_its_own_reasons_was_not_told() {
+        for fired in [false, true] {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            if fired {
+                cancel.cancel();
+            }
+            let outcome = run_invoking("missing", cancel).await;
+            let text = outcome
+                .result
+                .expect_err("the invoke of a missing action fails");
+            assert!(
+                text.starts_with("io.invoke → p.missing failed"),
+                "the error arm was reached; fired = {fired}: {text}"
+            );
+            assert!(!outcome.told_of_cancel, "fired = {fired}: {text}");
+        }
+    }
+
+    /// A callee that hit its own, shorter cap under a quiet parent
+    /// token has failed for its own reasons, however cancellation-
+    /// shaped the error: the guard on the token is what keeps it from
+    /// counting as a telling.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_whose_callee_hit_its_own_deadline_under_a_quiet_token_was_not_told() {
+        let outcome = run_invoking("slow", tokio_util::sync::CancellationToken::new()).await;
+        let text = outcome
+            .result
+            .expect_err("the callee's deadline fails the invoke");
+        assert!(
+            text.starts_with("io.invoke → p.slow failed") && text.contains("wallclock"),
+            "{text}"
+        );
+        assert!(!outcome.told_of_cancel, "{text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_whose_invoke_succeeded_was_not_told() {
+        let outcome = run_invoking("a", tokio_util::sync::CancellationToken::new()).await;
+        assert_eq!(outcome.result, Ok("null".into()));
+        assert!(!outcome.told_of_cancel);
+    }
+}
+
+#[cfg(test)]
+mod step_script_tests {
+    //! How `step_script` reads a guest that did not succeed: the
+    //! cancellation when a host import told the guest of the cancel,
+    //! the guest's own failure when nothing did, and a resource cap
+    //! before either.
+    use super::*;
+    use crate::kernel::host_api::{ExecutionStateParams, ResourceViolation};
+
+    /// A guest whose `execute` is `body`, with `is_cancelled`,
+    /// `host_set_result`, and `host_set_error` in reach.
+    fn guest(body: &str) -> Vec<u8> {
+        let m = crate::kernel::abi::ABI_MODULE;
+        let wat = format!(
+            r#"
+            (module
+              (import "{m}" "host_set_result" (func $host_set_result (param i32 i32)))
+              (import "{m}" "host_set_error" (func $host_set_error (param i32 i32)))
+              (import "{m}" "is_cancelled" (func $is_cancelled (result i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 0) "null")
+              (data (i32.const 8) "guest raised")
+              (global $next (mut i32) (i32.const 32))
+              (func (export "alloc") (param $len i32) (result i32)
+                (local $ptr i32)
+                global.get $next
+                local.set $ptr
+                global.get $next
+                local.get $len
+                i32.add
+                global.set $next
+                local.get $ptr)
+              (func (export "execute") (param i32 i32 i32 i32) (result i32)
+                {body})
+            )
+            "#
+        );
+        wat::parse_str(&wat).expect("wat parses")
+    }
+
+    const RAISE: &str = "(call $host_set_error (i32.const 8) (i32.const 12)) (i32.const 0)";
+
+    /// An execution state whose `(script, "lua")` runtime is `guest`,
+    /// under `cancel` and `limits`.
+    fn state(
+        guest: Vec<u8>,
+        cancel: tokio_util::sync::CancellationToken,
+        limits: crate::kernel::RuntimeLimits,
+    ) -> ExecutionState {
+        let engine = Engine::new(wasmtime::Config::new().consume_fuel(true)).expect("engine");
+        let module = Module::new(&engine, guest).expect("module compiles");
+        let mut runtimes = std::collections::HashMap::new();
+        runtimes.insert("lua".to_string(), std::sync::Arc::new(module));
+        ExecutionState::new(ExecutionStateParams {
+            plugin_name: "p".to_string(),
+            step_type_access: Default::default(),
+            action: serde_json::from_value(serde_json::json!({ "steps": [] })).unwrap(),
+            input: Value::Null,
+            config: Value::Null,
+            secrets: Value::Null,
+            secret_resolver: None,
+            script_runtimes: std::sync::Arc::new(runtimes),
+            engine,
+            exec_ctx: Default::default(),
+            streams: None,
+            invoke_depth: 0,
+            dispatch_depth: 0,
+            kernel: None,
+            trigger: None,
+            limits,
+            deadline: None,
+            cancel: Some(cancel),
+            dataflow_events: None,
+        })
+    }
+
+    fn fired() -> tokio_util::sync::CancellationToken {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        cancel
+    }
+
+    async fn run(state: &mut ExecutionState) -> Result<StepOutput, StepError> {
+        let params = serde_json::json!({ "language": "lua", "source": "" });
+        step_script(state, &params).await
+    }
+
+    /// The token has fired, but no host import told the guest: the
+    /// error it raised is its own, and stays a failure carrying its
+    /// text. The gate is the telling, not the token.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_untold_guest_that_raises_under_a_fired_token_keeps_its_failure() {
+        let mut state = state(guest(RAISE), fired(), Default::default());
+        let result = run(&mut state).await;
+        assert!(
+            matches!(&result, Err(StepError::Failed(text)) if text == "guest raised"),
+            "{result:?}"
+        );
+        assert!(state.resource_violation.is_none());
+    }
+
+    /// The same raise from a guest `is_cancelled` had told: the
+    /// cancellation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_told_guest_that_raises_is_cancelled() {
+        let body = format!("(drop (call $is_cancelled)) {RAISE}");
+        let mut state = state(guest(&body), fired(), Default::default());
+        let result = run(&mut state).await;
+        assert!(matches!(result, Err(StepError::Cancelled)), "{result:?}");
+    }
+
+    /// A guest that was told and then spins until its fuel runs out
+    /// has hit the kernel's limit; the resource cap is mapped before
+    /// the telling is consulted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_told_guest_that_exhausts_its_fuel_reports_the_fuel_cap() {
+        let body = "(drop (call $is_cancelled)) (loop $spin (br $spin)) (unreachable)";
+        let limits = crate::kernel::RuntimeLimits {
+            fuel_budget: 1_000_000,
+            ..Default::default()
+        };
+        let mut state = state(guest(body), fired(), limits);
+        let result = run(&mut state).await;
+        assert!(
+            matches!(&result, Err(StepError::Failed(text)) if text.starts_with("FuelExhausted")),
+            "{result:?}"
+        );
+        assert!(matches!(
+            state.resource_violation,
+            Some(ResourceViolation::FuelExhausted {
+                budget: 1_000_000,
+                ..
+            })
+        ));
     }
 }
 
@@ -561,6 +1061,7 @@ mod abi_alignment_tests {
             parent_deadline: None,
             call_result: None,
             call_error: None,
+            told_of_cancel: false,
         };
         let mut store = wasmtime::Store::new(&engine, store_data);
 

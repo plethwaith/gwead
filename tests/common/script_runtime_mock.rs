@@ -11,17 +11,26 @@
 //! kernel has no dependency on any specific runtime. So the mock lives
 //! here as a test-only artifact compiled inline via [`wat::parse_str`].
 //!
-//! What the mock provides:
-//! - Three exports: `memory`, `alloc(len) -> ptr`, `execute(src_ptr,
-//!   src_len, args_ptr, args_len) -> i32`
-//! - One import: `gwead1.host_set_result(ptr, len)` — called from
-//!   `execute` to write a fixed-payload "mock-script-result" UTF-8
-//!   string back to the host
-//! - Always returns `1` from `execute` (success). Host-import
-//!   behaviour is NOT exercised — tests that care about that have to
-//!   use a real runtime plugin. Two twins trip the resource caps: one
-//!   spins until the fuel meter traps, one declares more memory than
-//!   the cap allows and fails to instantiate.
+//! Several mocks share the module's registration path. All export
+//! `memory`, `alloc(len) -> ptr`, and `execute(src_ptr, src_len,
+//! args_ptr, args_len) -> i32`, and none interprets its script
+//! source; a real language runtime lives in its own crate.
+//!
+//! - The standard mock ([`build_wasm_bytes`], what [`register`]
+//!   installs) imports only `gwead1.host_set_result`, writes a
+//!   fixed "mock-script-result" string back, and always returns `1`
+//!   (success). Host-import behaviour is NOT exercised — tests that
+//!   care about that have to use a real runtime plugin.
+//! - Two twins trip the resource caps: one spins until the fuel meter
+//!   traps ([`build_spinning_wasm_bytes`]), one declares more memory
+//!   than the cap allows and fails to instantiate
+//!   ([`build_hungry_wasm_bytes`]).
+//! - The write-until-refused mock
+//!   ([`build_write_until_refused_wasm_bytes`]) also imports
+//!   `stream_output`, `stream_write`, and `host_set_error`: its
+//!   `execute` writes to the step's dataflow output until the host
+//!   refuses a write, then reports how, so a test can park a real
+//!   guest inside a host import.
 //!
 //! Registration:
 //! - Compile the wat to wasm once per test via [`build_wasm_bytes`]
@@ -144,6 +153,95 @@ pub fn build_wasm_bytes() -> Vec<u8> {
     wat::parse_str(MOCK_WAT).expect("mock script-runtime wat parses")
 }
 
+/// What the write-until-refused guest does when its parked write comes
+/// back `STREAM_CANCELLED` — the two ways a real binding might surface
+/// the code to its script.
+#[derive(Clone, Copy, Debug)]
+pub enum OnCancelled {
+    /// Report `"cancelled"` as the step result and succeed: the binding
+    /// let the script notice and return normally.
+    ReturnResult,
+    /// Raise: the binding turned the code into a language-level error,
+    /// so `execute` fails with the text `"stream write cancelled"`.
+    RaiseError,
+}
+
+/// WAT source for a mock whose `execute` writes to its dataflow
+/// output until the host refuses a write, then reports how the loop
+/// ended. Imports `stream_output` and `stream_write` on top of
+/// `host_set_result` / `host_set_error`, so a test can park a real wasm
+/// guest inside the `stream_write` import — the shape a relay guest has
+/// when its consumer stalls — and observe what releases it.
+///
+/// `{cancelled}` and `{closed}` are the `STREAM_CANCELLED` /
+/// `STREAM_CLOSED` codes, spliced in by name from the kernel's
+/// constants; `{on_cancelled}` is the body for the cancelled branch
+/// (see [`OnCancelled`]). The result is `"closed"` on `STREAM_CLOSED`
+/// and `"other"` for any other negative code.
+const WRITE_UNTIL_REFUSED_WAT: &str = r#"
+(module
+  (import "gwead1" "host_set_result" (func $host_set_result (param i32 i32)))
+  (import "gwead1" "host_set_error" (func $host_set_error (param i32 i32)))
+  (import "gwead1" "stream_output" (func $stream_output (result i32)))
+  (import "gwead1" "stream_write" (func $stream_write (param i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  ;; The chunk, then the JSON string results and the error text.
+  (data (i32.const 0) "chunk")
+  (data (i32.const 8) "\"cancelled\"")
+  (data (i32.const 20) "\"closed\"   ")
+  (data (i32.const 32) "\"other\"    ")
+  (data (i32.const 48) "stream write cancelled")
+  (global $next (mut i32) (i32.const 96))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    global.get $next
+    local.set $ptr
+    global.get $next
+    local.get $len
+    i32.add
+    global.set $next
+    local.get $ptr)
+  (func (export "execute") (param $src_ptr i32) (param $src_len i32)
+                           (param $args_ptr i32) (param $args_len i32)
+                           (result i32)
+    (local $handle i32)
+    (local $rc i32)
+    (local.set $handle (call $stream_output))
+    (block $refused
+      (loop $again
+        (local.set $rc
+          (call $stream_write (local.get $handle) (i32.const 0) (i32.const 5)))
+        (br_if $refused (i32.lt_s (local.get $rc) (i32.const 0)))
+        (br $again)))
+    (if (result i32) (i32.eq (local.get $rc) (i32.const {cancelled}))
+      (then {on_cancelled})
+      (else
+        (if (result i32) (i32.eq (local.get $rc) (i32.const {closed}))
+          (then (call $host_set_result (i32.const 20) (i32.const 8)) (i32.const 1))
+          (else (call $host_set_result (i32.const 32) (i32.const 7)) (i32.const 1))))))
+)
+"#;
+
+/// Compile the write-until-refused mock — see
+/// [`WRITE_UNTIL_REFUSED_WAT`] — with `on_cancelled` as its response
+/// to `STREAM_CANCELLED`.
+pub fn build_write_until_refused_wasm_bytes(on_cancelled: OnCancelled) -> Vec<u8> {
+    use gwead::kernel::streams::{STREAM_CANCELLED, STREAM_CLOSED};
+    let on_cancelled = match on_cancelled {
+        OnCancelled::ReturnResult => {
+            "(call $host_set_result (i32.const 8) (i32.const 11)) (i32.const 1)"
+        }
+        OnCancelled::RaiseError => {
+            "(call $host_set_error (i32.const 48) (i32.const 22)) (i32.const 0)"
+        }
+    };
+    let wat = WRITE_UNTIL_REFUSED_WAT
+        .replace("{cancelled}", &STREAM_CANCELLED.to_string())
+        .replace("{closed}", &STREAM_CLOSED.to_string())
+        .replace("{on_cancelled}", on_cancelled);
+    wat::parse_str(&wat).expect("write-until-refused wat parses")
+}
+
 /// Compile the spinning twin — see [`SPINNING_WAT`].
 pub fn build_spinning_wasm_bytes() -> Vec<u8> {
     wat::parse_str(SPINNING_WAT).expect("spinning script-runtime wat parses")
@@ -203,7 +301,11 @@ pub fn register_hungry_for_language(
     register_module_for_language(kernel, language, build_hungry_wasm_bytes())
 }
 
-fn register_module_for_language(
+/// Register `wasm_bytes` as the `(script, language)` impl under the
+/// mock's plugin name. [`register_for_language`] with the standard
+/// mock; tests that need a guest with a specific body (see
+/// [`build_write_until_refused_wasm_bytes`]) pass their own.
+pub fn register_module_for_language(
     kernel: &mut Kernel,
     language: &str,
     wasm_bytes: Vec<u8>,

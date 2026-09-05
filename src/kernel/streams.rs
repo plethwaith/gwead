@@ -45,6 +45,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Default per-branch chunk-count capacity for the streaming fan-out
 /// tee (`fan_out_readable_streaming`) and for the writable→
@@ -883,7 +884,26 @@ impl StreamState {
 
     /// Per-stream async write. Clones the `mpsc::Sender` under the
     /// per-stream lock, drops it, then `.await`s the send.
-    pub async fn write_async(&self, data: &[u8]) -> i32 {
+    ///
+    /// The channel is bounded, and a send that finds it full waits
+    /// for the consumer to take something — that is the backpressure
+    /// a writable exists to apply. A consumer that keeps its receiver
+    /// open but stops reading would otherwise hold the writer here
+    /// for good, and a writer parked inside a host import never gets
+    /// back to its own code to notice it was cancelled, so a parked
+    /// send is raced against `cancel`: when the token fires first the
+    /// write returns [`STREAM_CANCELLED`] with nothing committed, and
+    /// the channel is left as it was. The wallclock watchdog fires
+    /// the same token, so a deadline reaches a parked writer the same
+    /// way.
+    ///
+    /// Only a *parked* write is released. A write the channel has room
+    /// for is committed even under a fired token, so a producer that
+    /// has noticed the cancel can still push the chunk it was holding
+    /// before it stops; the token is a backstop for the wait, not a
+    /// gate on the data. A receiver that has gone away is
+    /// [`STREAM_CLOSED`] whether or not the token has fired.
+    pub async fn write_async(&self, data: &[u8], cancel: &CancellationToken) -> i32 {
         let sink = {
             let inner = self.lock_inner();
             if inner.closed {
@@ -895,9 +915,19 @@ impl StreamState {
             }
         };
         let bytes = Bytes::copy_from_slice(data);
-        match sink.send(Ok(bytes)).await {
-            Ok(()) => data.len() as i32,
-            Err(_) => STREAM_CLOSED,
+        // The send is polled first, every poll: a chunk the channel
+        // has room for is committed and a receiver that has gone away
+        // is reported whatever the token says, and only a send that
+        // has to wait falls through to the token. `Sender::send`
+        // reserves a slot and commits in one poll, so losing the race
+        // never leaves a half-sent chunk behind.
+        tokio::select! {
+            biased;
+            sent = sink.send(Ok(bytes)) => match sent {
+                Ok(()) => data.len() as i32,
+                Err(_) => STREAM_CLOSED,
+            },
+            () = cancel.cancelled() => STREAM_CANCELLED,
         }
     }
 }
@@ -935,8 +965,15 @@ pub async fn read_async_shared(arc: &SharedStreamRegistry, id: StreamId, buf: &m
 /// Shared-registry entry point for the wasm `stream_write` host
 /// import. Same outer-lock + delegate pattern as
 /// [`read_async_shared`]; the send runs under the per-stream mutex
-/// (dropped before the `.await`).
-pub async fn write_async_shared(arc: &SharedStreamRegistry, id: StreamId, data: &[u8]) -> i32 {
+/// (dropped before the `.await`). `cancel` is the writing
+/// invocation's token; see [`StreamState::write_async`] for what it
+/// does to a parked send.
+pub async fn write_async_shared(
+    arc: &SharedStreamRegistry,
+    id: StreamId,
+    data: &[u8],
+    cancel: &CancellationToken,
+) -> i32 {
     let state = {
         let reg = lock_shared(arc);
         match reg.streams.get(&id) {
@@ -944,7 +981,7 @@ pub async fn write_async_shared(arc: &SharedStreamRegistry, id: StreamId, data: 
             None => return STREAM_INVALID_HANDLE,
         }
     };
-    state.write_async(data).await
+    state.write_async(data, cancel).await
 }
 
 // ---------------------------------------------------------------------------
@@ -970,6 +1007,12 @@ pub const STREAM_CLOSED: i32 = -4;
 pub const STREAM_IO_ERROR: i32 = -5;
 /// Buffer pointer + length exceeds the wasm module's linear memory.
 pub const STREAM_OOB: i32 = -6;
+/// A write waiting for room on a full channel was released by the
+/// invocation's cancellation token — the caller's cancel or the
+/// wallclock watchdog. Nothing was committed.
+/// Distinct from [`STREAM_CLOSED`] so a guest can tell a consumer that
+/// went away (finish cleanly) from a stop it was told to make.
+pub const STREAM_CANCELLED: i32 = -7;
 
 #[cfg(test)]
 mod tests {
@@ -978,6 +1021,12 @@ mod tests {
 
     fn bytes_source(chunks: Vec<Bytes>) -> ReadableSource {
         Box::pin(stream::iter(chunks.into_iter().map(Ok)))
+    }
+
+    /// A token nobody fires, for writes whose cancellation path is
+    /// not under test.
+    fn never() -> CancellationToken {
+        CancellationToken::new()
     }
 
     #[test]
@@ -1243,7 +1292,7 @@ mod tests {
         let mut reg = StreamRegistry::new();
         let (id, mut rx) = reg.register_writable("application/octet-stream", 4);
         let state = reg.get(id).unwrap();
-        assert_eq!(state.write_async(b"hello").await, 5);
+        assert_eq!(state.write_async(b"hello", &never()).await, 5);
         let got = rx.try_recv().unwrap().unwrap();
         assert_eq!(got, Bytes::from_static(b"hello"));
     }
@@ -1253,7 +1302,10 @@ mod tests {
         let mut reg = StreamRegistry::new();
         let id = reg.register_readable("application/octet-stream", bytes_source(vec![]));
         let state = reg.get(id).unwrap();
-        assert_eq!(state.write_async(b"nope").await, STREAM_DIRECTION_MISMATCH);
+        assert_eq!(
+            state.write_async(b"nope", &never()).await,
+            STREAM_DIRECTION_MISMATCH
+        );
     }
 
     #[tokio::test]
@@ -1262,7 +1314,119 @@ mod tests {
         let (id, rx) = reg.register_writable("application/octet-stream", 1);
         drop(rx);
         let state = reg.get(id).unwrap();
-        assert_eq!(state.write_async(b"late").await, STREAM_CLOSED);
+        assert_eq!(state.write_async(b"late", &never()).await, STREAM_CLOSED);
+    }
+
+    /// A token that fires while a write is parked on a full channel
+    /// releases the write: it returns `STREAM_CANCELLED`, and the
+    /// chunk it was holding is not committed. The consumer is still
+    /// there, so this is not `STREAM_CLOSED`.
+    #[tokio::test]
+    async fn parked_write_is_released_when_the_token_fires() {
+        let mut reg = StreamRegistry::new();
+        let (id, mut rx) = reg.register_writable("application/octet-stream", 1);
+        let state = reg.get(id).unwrap();
+        let cancel = CancellationToken::new();
+        assert_eq!(state.write_async(b"fits", &cancel).await, 4);
+
+        let firing = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                cancel.cancel();
+            })
+        };
+        assert_eq!(
+            state.write_async(b"parked", &cancel).await,
+            STREAM_CANCELLED
+        );
+        firing.await.unwrap();
+
+        let queued = rx.try_recv().unwrap().unwrap();
+        assert_eq!(queued, Bytes::from_static(b"fits"));
+        assert!(
+            rx.try_recv().is_err(),
+            "the released chunk was not committed behind the consumer's back"
+        );
+    }
+
+    /// A parked write learns that the receiver has gone before it
+    /// learns that the token fired, whichever order the two happened
+    /// in: a departed consumer is `STREAM_CLOSED`, never
+    /// `STREAM_CANCELLED`. Polled by hand so the write is parked
+    /// before either happens, and both land before its next poll.
+    #[tokio::test]
+    async fn parked_write_reports_a_departed_receiver_over_a_fired_token() {
+        for receiver_first in [true, false] {
+            let mut reg = StreamRegistry::new();
+            let (id, rx) = reg.register_writable("application/octet-stream", 1);
+            let state = reg.get(id).unwrap();
+            let cancel = CancellationToken::new();
+            assert_eq!(state.write_async(b"fits", &cancel).await, 4);
+
+            let mut parked = std::pin::pin!(state.write_async(b"parked", &cancel));
+            assert!(
+                futures::poll!(parked.as_mut()).is_pending(),
+                "a full channel parks the write"
+            );
+            if receiver_first {
+                drop(rx);
+                cancel.cancel();
+            } else {
+                cancel.cancel();
+                drop(rx);
+            }
+            assert_eq!(
+                futures::poll!(parked.as_mut()),
+                std::task::Poll::Ready(STREAM_CLOSED),
+                "receiver_first = {receiver_first}"
+            );
+        }
+    }
+
+    /// A token that has already fired releases a would-be-parked write
+    /// without waiting at all.
+    #[tokio::test]
+    async fn write_under_a_fired_token_does_not_park() {
+        let mut reg = StreamRegistry::new();
+        let (id, _rx) = reg.register_writable("application/octet-stream", 1);
+        let state = reg.get(id).unwrap();
+        let cancel = CancellationToken::new();
+        assert_eq!(state.write_async(b"fits", &cancel).await, 4);
+        cancel.cancel();
+        assert_eq!(
+            state.write_async(b"parked", &cancel).await,
+            STREAM_CANCELLED
+        );
+    }
+
+    /// The token releases a wait; it does not refuse data. A write the
+    /// channel has room for is committed under a fired token, so a
+    /// producer that noticed the cancel can still flush the chunk it
+    /// holds before it stops.
+    #[tokio::test]
+    async fn write_that_fits_is_committed_under_a_fired_token() {
+        let mut reg = StreamRegistry::new();
+        let (id, mut rx) = reg.register_writable("application/octet-stream", 1);
+        let state = reg.get(id).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(state.write_async(b"last", &cancel).await, 4);
+        assert_eq!(rx.try_recv().unwrap().unwrap(), Bytes::from_static(b"last"));
+    }
+
+    /// A receiver that has gone away is `STREAM_CLOSED` even under a
+    /// fired token: the consumer's departure is the more specific
+    /// fact, and a guest finishing on `STREAM_CLOSED` stays correct.
+    #[tokio::test]
+    async fn write_to_a_departed_receiver_is_closed_even_under_a_fired_token() {
+        let mut reg = StreamRegistry::new();
+        let (id, rx) = reg.register_writable("application/octet-stream", 1);
+        drop(rx);
+        let state = reg.get(id).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(state.write_async(b"late", &cancel).await, STREAM_CLOSED);
     }
 
     /// The property the kernel's streaming-callee EOF contract relies

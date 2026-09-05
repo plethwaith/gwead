@@ -4773,7 +4773,10 @@ impl Kernel {
 /// token and then failed for its own reasons is reported for those
 /// reasons, with the deadline noted in the log. A step that answers
 /// the token with a `Failed` or `Thrown` of its own therefore
-/// misreports itself; the typed variant exists so it need not. The
+/// misreports itself; the typed variant exists so it need not. (A
+/// script guest has no typed variant: `step_script` reads a guest
+/// error as the cancellation when a host import had told the guest
+/// of the cancel, and keeps it a failure otherwise.) The
 /// watchdog claims the stop only if nobody had fired the token before
 /// it: a caller's own cancel just ahead of the deadline is reported as
 /// theirs, whatever the timer did.
@@ -4994,6 +4997,9 @@ where
                 abandoned: false,
             }
         }
+        // Guarded on the deadline as well as the shape: a callee
+        // deadline that arrives *before* this caller's has passed is
+        // the callee's failure, and falls through to the arms below.
         Ok(Err(err)) if deadline_reached && stopped_by_cancellation(&err) => {
             tracing::debug!(
                 timeout_ms,
@@ -5029,10 +5035,10 @@ where
 /// `ExecutionTimeout` counts too: when the caller's deadline has
 /// passed and the callee reports a deadline, that is the same event
 /// seen one level down — a callee whose own cap ends on the same tick
-/// as the caller's budget (`Kernel::callee_wallclock`). A callee
-/// deadline that arrives *before* the caller's has passed is not
-/// remapped: it stays the callee's failure.
-fn stopped_by_cancellation(err: &KernelError) -> bool {
+/// as the caller's budget (`Kernel::callee_wallclock`). The shape
+/// alone does not say whose event it was; each caller pairs it with
+/// its own guard.
+pub(crate) fn stopped_by_cancellation(err: &KernelError) -> bool {
     match err {
         KernelError::Cancelled { .. } | KernelError::ExecutionTimeout { .. } => true,
         KernelError::CalleeFailed { source, .. } => stopped_by_cancellation(source),
@@ -5935,6 +5941,24 @@ mod wallclock_timeout_tests {
         })
     }
 
+    /// What a relay body writes under: the `produce` step's
+    /// pre-provisioned writable, the invocation's registry, and its
+    /// cancellation token.
+    fn relay_output(
+        ex: &(dyn host_api::PluginExecution + Send),
+    ) -> (
+        streams::StreamId,
+        streams::SharedStreamRegistry,
+        tokio_util::sync::CancellationToken,
+    ) {
+        let writable = ex
+            .dataflow_outputs()
+            .get(ex.current_step_id())
+            .copied()
+            .expect("a pre-provisioned writable");
+        (writable, ex.streams().clone(), ex.cancel_token())
+    }
+
     /// A producer that writes one chunk to its dataflow output and
     /// then fails — a relay whose upstream fell over mid-stream.
     fn write_then_fail<'a>(
@@ -5948,14 +5972,8 @@ mod wallclock_timeout_tests {
         >,
     > {
         Box::pin(async move {
-            let step_id = ex.current_step_id().to_string();
-            let writable = ex
-                .dataflow_outputs()
-                .get(&step_id)
-                .copied()
-                .expect("a pre-provisioned writable");
-            let streams_arc = ex.streams().clone();
-            let n = streams::write_async_shared(&streams_arc, writable, b"partial").await;
+            let (writable, streams_arc, cancel) = relay_output(&*ex);
+            let n = streams::write_async_shared(&streams_arc, writable, b"partial", &cancel).await;
             assert!(n > 0, "the chunk before the failure is accepted");
             Err(host_api::StepError::Failed("upstream fell over".into()))
         })
@@ -5974,14 +5992,8 @@ mod wallclock_timeout_tests {
         >,
     > {
         Box::pin(async move {
-            let step_id = ex.current_step_id().to_string();
-            let writable = ex
-                .dataflow_outputs()
-                .get(&step_id)
-                .copied()
-                .expect("a pre-provisioned writable");
-            let streams_arc = ex.streams().clone();
-            let n = streams::write_async_shared(&streams_arc, writable, b"partial").await;
+            let (writable, streams_arc, cancel) = relay_output(&*ex);
+            let n = streams::write_async_shared(&streams_arc, writable, b"partial", &cancel).await;
             assert!(n > 0, "the chunk before the failure is accepted");
             streams::lock_shared(&streams_arc).close_handle(writable);
             Err(host_api::StepError::Failed("failed after closing".into()))
@@ -6000,14 +6012,8 @@ mod wallclock_timeout_tests {
         >,
     > {
         Box::pin(async move {
-            let step_id = ex.current_step_id().to_string();
-            let writable = ex
-                .dataflow_outputs()
-                .get(&step_id)
-                .copied()
-                .expect("a pre-provisioned writable");
-            let streams_arc = ex.streams().clone();
-            let n = streams::write_async_shared(&streams_arc, writable, b"all").await;
+            let (writable, streams_arc, cancel) = relay_output(&*ex);
+            let n = streams::write_async_shared(&streams_arc, writable, b"all", &cancel).await;
             assert!(n > 0);
             Ok(host_api::StepOutput::from(Value::Null))
         })
@@ -6029,15 +6035,9 @@ mod wallclock_timeout_tests {
     > {
         Box::pin(async move {
             let chunks = params["chunks"].as_u64().unwrap_or(0);
-            let step_id = ex.current_step_id().to_string();
-            let writable = ex
-                .dataflow_outputs()
-                .get(&step_id)
-                .copied()
-                .expect("a pre-provisioned writable");
-            let streams_arc = ex.streams().clone();
+            let (writable, streams_arc, cancel) = relay_output(&*ex);
             for _ in 0..chunks {
-                let n = streams::write_async_shared(&streams_arc, writable, b"x").await;
+                let n = streams::write_async_shared(&streams_arc, writable, b"x", &cancel).await;
                 assert!(n > 0, "each chunk fits the channel");
             }
             Err(host_api::StepError::Failed(
@@ -6090,17 +6090,71 @@ mod wallclock_timeout_tests {
             })
             .expect("a capped relay has a deadline");
         Box::pin(async move {
-            let step_id = ex.current_step_id().to_string();
-            let writable = ex
-                .dataflow_outputs()
-                .get(&step_id)
-                .copied()
-                .expect("a pre-provisioned writable");
-            let streams_arc = ex.streams().clone();
+            let (writable, streams_arc, cancel) = relay_output(&*ex);
             let text = remaining_ms.to_string();
-            let n = streams::write_async_shared(&streams_arc, writable, text.as_bytes()).await;
+            let n =
+                streams::write_async_shared(&streams_arc, writable, text.as_bytes(), &cancel).await;
             assert!(n > 0);
             Ok(host_api::StepOutput::from(Value::Null))
+        })
+    }
+
+    /// Tags (`params.tag`, when given) of every [`write_until_refused`]
+    /// run whose parked write came back `STREAM_CANCELLED`. A producer
+    /// that was dropped instead — the wallclock grace reaching a write
+    /// the token could not — never gets to record itself, which is how
+    /// a test tells the two apart when the stream looks the same
+    /// either way.
+    static RELEASED_BY_TOKEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn released_by_token(tag: &str) -> bool {
+        RELEASED_BY_TOKEN
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|seen| seen == tag)
+    }
+
+    /// A producer that writes one-byte chunks until the host refuses
+    /// one, and reports how: `STREAM_CANCELLED` is the typed
+    /// cancellation (recorded under `params.tag` in
+    /// [`RELEASED_BY_TOKEN`] first), `STREAM_CLOSED` is a clean finish,
+    /// and anything else is a failure naming the code — which the
+    /// spawned path puts on the stream, so a test that expects no
+    /// error item catches a wrong code. With nobody reading, it fills
+    /// the channel and parks inside `write_async_shared`: the shape of
+    /// a relay whose consumer stalled.
+    fn write_until_refused<'a>(
+        ex: &'a mut (dyn host_api::PluginExecution + Send),
+        params: &'a Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<host_api::StepOutput, host_api::StepError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let tag = params["tag"].as_str().unwrap_or_default().to_string();
+            let (writable, streams_arc, cancel) = relay_output(&*ex);
+            loop {
+                let n = streams::write_async_shared(&streams_arc, writable, b"x", &cancel).await;
+                match n {
+                    n if n >= 0 => continue,
+                    streams::STREAM_CANCELLED => {
+                        if !tag.is_empty() {
+                            RELEASED_BY_TOKEN.lock().unwrap().push(tag);
+                        }
+                        return Err(host_api::StepError::Cancelled);
+                    }
+                    streams::STREAM_CLOSED => return Ok(host_api::StepOutput::from(Value::Null)),
+                    other => {
+                        return Err(host_api::StepError::Failed(format!(
+                            "unexpected write code {other}"
+                        )));
+                    }
+                }
+            }
         })
     }
 
@@ -6351,6 +6405,69 @@ mod wallclock_timeout_tests {
         let items = drain_relay(&mut source).await;
         assert!(items.is_empty(), "no chunk and no error item: {items:?}");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// A callee parked on a full channel — its caller holds the
+    /// readable but never reads — is inside `write_async_shared`,
+    /// where nothing of its own can notice a cancel. The caller's
+    /// token releases the parked write as `STREAM_CANCELLED`; the
+    /// callee answers with the typed cancellation, which the caller's
+    /// cancel makes a plain EOF: the chunks committed before the
+    /// cancel, no error item, and an end long before anything else
+    /// could have produced one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn callers_cancel_releases_a_callee_parked_on_a_full_channel() {
+        let kernel = kernel_with_relay(write_until_refused, "{}");
+        let parent = tokio_util::sync::CancellationToken::new();
+        let started = std::time::Instant::now();
+        let mut source = spawn_relay_under(&kernel, None, Some(parent.clone())).await;
+        // Long enough for the producer to fill the channel and park.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        parent.cancel();
+        let items = drain_relay(&mut source).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(
+            !items.is_empty()
+                && items
+                    .iter()
+                    .all(|item| matches!(item, Ok(b) if &b[..] == b"x")),
+            "the chunks committed arrive, and the cancel is not an error item: {items:?}"
+        );
+    }
+
+    /// The same stall under a wallclock cap and no caller cancel: the
+    /// watchdog fires the token at the deadline, the parked write is
+    /// released, and the callee's cancellation is reported as the
+    /// deadline — an error item after the chunks. The callee ends on
+    /// its own rather than being dropped at the grace, which is what
+    /// lets it report at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wallclock_deadline_releases_a_callee_parked_on_a_full_channel() {
+        let kernel = kernel_with_relay(write_until_refused, r#"{"tag": "wallclock"}"#);
+        let parent_deadline =
+            Some(tokio::time::Instant::now() + std::time::Duration::from_millis(150));
+        let started = std::time::Instant::now();
+        let mut source = spawn_relay(&kernel, parent_deadline).await;
+        let items = drain_relay(&mut source).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let Some((Err(last), chunks)) = items.split_last() else {
+            panic!("expected the chunks then the deadline as an error item, got: {items:?}");
+        };
+        assert!(
+            !chunks.is_empty()
+                && chunks
+                    .iter()
+                    .all(|item| matches!(item, Ok(b) if &b[..] == b"x")),
+            "the chunks that fit the channel arrive first: {chunks:?}"
+        );
+        assert!(
+            last.to_string().contains("wallclock timeout exceeded"),
+            "the release is reported as the deadline: {last}"
+        );
+        assert!(
+            released_by_token("wallclock"),
+            "the write was released by the token, not dropped at the grace"
+        );
     }
 
     /// The other half of holding a sender: it must be released. A

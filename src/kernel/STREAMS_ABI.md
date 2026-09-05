@@ -174,6 +174,18 @@ import is async (`func_wrap_async` → `write_async_shared`): the
 wasmtime fiber suspends until the receiver makes space, without
 tying up a blocking thread.
 
+A write waiting for room on a full channel is raced against the
+step's cancellation token — the one `is_cancelled` reports, which
+the wallclock watchdog also fires. If the token fires while the
+write is waiting, the write returns `STREAM_CANCELLED` and the chunk
+is not committed; the guest should stop producing and return. Only
+the wait is released: the send is polled first, so a write the
+channel has room for is committed even after the token has fired
+(a producer that has already noticed the cancel can still push the
+chunk it holds), and a receiver that has gone away is
+`STREAM_CLOSED` whatever the token says, even when both happened
+while the write was waiting.
+
 ### `stream_close`
 
 Marks the handle closed, drops the underlying source/sender, and
@@ -193,6 +205,7 @@ import).
 | `-4` | `STREAM_CLOSED` | Handle closed via `stream_close`, or (on write) the paired consumer has gone away. |
 | `-5` | `STREAM_IO_ERROR` | Readable source returned an I/O error, or the guest exports no `memory`. |
 | `-6` | `STREAM_OOB` | `buf_ptr + buf_len` exceeded linear memory. |
+| `-7` | `STREAM_CANCELLED` | A write waiting for room on a full channel was released by the step's cancellation token (caller cancel or wallclock deadline). Nothing was committed. |
 
 Defined in [`streams.rs`](streams.rs). Any guest-side binding, ABI
 doc, or host function impl must reference these constants by name to
@@ -227,14 +240,29 @@ illustration, a Lua runtime module might expose the three calls under
 
 ```lua
 local chunk = io.stream.read(handle, 4096)     -- string | nil (EOF)
-io.stream.write(handle, chunk)                 -- returns bytes committed
+io.stream.write(handle, chunk)                 -- bytes committed | false (cancelled)
 io.stream.close(handle)
 ```
 
 A binding like this would raise a language-level error on any
-non-EOF negative code from `read` and any negative code from
-`write`, leaving the guest's usual error-recovery idiom (`pcall` in
-Lua) to plugins that want to treat failures non-fatally.
+non-EOF negative code from `read` and any negative code from `write`
+other than `STREAM_CANCELLED`, leaving the guest's usual
+error-recovery idiom (`pcall` in Lua) to plugins that want to treat
+failures non-fatally. `STREAM_CANCELLED` is not a failure: it is the
+step's own cancel reaching a parked write, the same fact
+`is_cancelled` reports, and a binding should surface it the same way
+— `write` returning `false`, say, so the script stops producing and
+returns normally. A guest has no typed cancellation of its own; a
+script error raised after the step's token has fired is reported by
+the host as the cancellation rather than as a failure — provided a
+host import told the guest about the cancel first (a write returning
+`STREAM_CANCELLED`, `is_cancelled` answering 1, or a plain invoke
+whose callee was stopped by the step's token — a streaming callee's
+stop arrives through `stream_read`, as EOF or as an error item,
+untold either way); a guest that was never told keeps its own
+failure. So a binding that does raise on the code still
+winds down correctly, but the guest's own error text is then only
+logged.
 
 ## Example: a streaming HTTP step (embedder-provided)
 
