@@ -5596,12 +5596,13 @@ pub enum KernelError {
     #[error("Wasm fuel exhausted ({budget} unit budget): {detail}")]
     FuelExhausted { budget: u64, detail: String },
 
-    /// A `script` interpreter tried to grow its linear memory past
-    /// `RuntimeLimits::max_memory_bytes`, at instantiation or through
-    /// `memory.grow`. A failed step, which a `try` may catch. (A `wasm`
-    /// step's denial is not typed: `memory.grow` hands the module `-1`
-    /// and the step may still succeed, while a module whose declared
-    /// minimum exceeds the cap fails to instantiate, reported as
+    /// A `script` interpreter declared more linear memory than
+    /// `RuntimeLimits::max_memory_bytes` allows and failed to
+    /// instantiate. A failed step, which a `try` may catch. That is
+    /// the only typed route to the cap: a `memory.grow` past it is
+    /// refused with `-1` and no trap, for a `script` step and a `wasm`
+    /// step alike, so the step may still succeed. (A `wasm` step whose
+    /// declared minimum exceeds the cap fails to instantiate as
     /// [`Self::Execution`] naming the module.)
     #[error("Wasm memory limit exceeded ({limit_bytes} bytes)")]
     MemoryLimitExceeded { limit_bytes: usize },

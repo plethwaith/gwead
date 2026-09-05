@@ -72,8 +72,9 @@ async fn parallel_branches_are_charged_when_they_merge() {
     assert!(err.contains("Step results exceeded"), "{err}");
 }
 
-/// The wave scheduler (`parallelWaves`) is the third join, and the
-/// only one outside `run_step`. Two independent steps share a wave;
+/// The wave scheduler (`parallelWaves`) is the third join, and with
+/// the dataflow scheduler's one of the two outside `run_step` — only
+/// the `parallel` join sits inside it. Two independent steps share a wave;
 /// each fits an 8 MiB budget in its own fork and the merged total does
 /// not. Without the check after the merge the action resolves `Ok`
 /// with the second result missing.

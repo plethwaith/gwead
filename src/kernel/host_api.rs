@@ -365,12 +365,14 @@ pub(crate) enum ResourceViolation {
     /// runs under the same budget but reports its trap as the step's
     /// own failure, naming the cap in the message.)
     FuelExhausted { budget: u64, detail: String },
-    /// A `script` interpreter sub-instance grew past
-    /// [`RuntimeLimits::max_memory_bytes`](super::RuntimeLimits::max_memory_bytes),
-    /// at instantiation or through `memory.grow`. (A `wasm` step's
-    /// denial is not typed: `memory.grow` hands the module `-1` and
-    /// the step may still succeed; only a declared minimum past the
-    /// cap fails it, at instantiation, naming the module.)
+    /// A `script` interpreter sub-instance declared more linear memory
+    /// than
+    /// [`RuntimeLimits::max_memory_bytes`](super::RuntimeLimits::max_memory_bytes)
+    /// allows and failed to instantiate. That is the only typed route:
+    /// the limiter answers a `memory.grow` past the cap with `-1` and
+    /// no trap, for a `script` step and a `wasm` step alike, so the
+    /// step may still succeed. (A `wasm` step's instantiation failure
+    /// is its own plain failure naming the module.)
     MemoryLimit { bytes: usize },
     /// Cumulative step-result bytes exceeded
     /// [`RuntimeLimits::max_step_results_bytes`](super::RuntimeLimits::max_step_results_bytes),
@@ -2299,9 +2301,10 @@ fn step_invoke<'a>(
 /// Pairs the linear-memory cap pulled from
 /// [`super::RuntimeLimits::max_memory_bytes`] with the
 /// [`wasmtime::ResourceLimiter`] surface so a wasm module that calls
-/// `memory.grow` in a loop traps cleanly via `Trap::OOM` instead of
-/// OOMing the host process. The `script` step type wires this exact
-/// pattern via `ScriptRuntimeStoreData`; the wasm step does it standalone.
+/// `memory.grow` in a loop is refused past the cap — each denied grow
+/// returns `-1` to the module, no trap — instead of OOMing the host
+/// process. The `script` step type wires this exact pattern via
+/// `ScriptRuntimeStoreData`; the wasm step does it standalone.
 struct WasmStoreLimits {
     budget: super::resource_budget::ResourceBudget,
 }
@@ -2383,9 +2386,11 @@ fn step_wasm<'a>(
         // Store data is a `WasmStoreLimits` that doubles as the
         // wasmtime `ResourceLimiter` — fuel covers CPU, the limiter
         // covers `memory.grow`. A wasm module that tries to allocate
-        // past the per-invocation memory cap traps cleanly via
-        // `Trap::OOM` instead of OOMing the host process. Mirrors the
-        // model `ScriptRuntimeStoreData` uses for the `script` step type.
+        // past the per-invocation memory cap is refused: the grow
+        // returns `-1` and the module carries on, so the host never
+        // OOMs and no trap is involved (see the cap naming below).
+        // Mirrors the model `ScriptRuntimeStoreData` uses for the
+        // `script` step type.
         let mut store = wasmtime::Store::new(
             &engine,
             WasmStoreLimits {
