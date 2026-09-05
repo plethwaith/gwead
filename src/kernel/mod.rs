@@ -854,7 +854,9 @@ fn classify_manifest(json: &str) -> Result<ClassifiedManifest, KernelError> {
 pub struct RuntimeLimits {
     /// Wasm fuel budget per guest invocation (a `script` interpreter
     /// run or a `wasm` step). Each instruction consumes 1 unit.
-    /// Exhaustion produces [`KernelError::FuelExhausted`]. Default:
+    /// Exhaustion fails the step: a `script` step's as
+    /// [`KernelError::FuelExhausted`], a `wasm` step's as
+    /// [`KernelError::Execution`] naming the cap. Default:
     /// 1_000_000_000 (1 B — large enough to stream a
     /// multi-hundred-megabyte payload through a script transform,
     /// small enough that a CPU-bound tight
@@ -968,8 +970,13 @@ pub struct RuntimeLimits {
     ///
     /// Cumulative rather than per-value: capping one result still
     /// leaves as many of them as the manifest has steps, and the total
-    /// is what the host has to hold. Exceeding it fails the step with
-    /// [`KernelError::StepResultsLimitExceeded`].
+    /// is what the host has to hold. Exceeding it ends the invocation
+    /// with [`KernelError::StepResultsLimitExceeded`]; like a
+    /// cancellation, and unlike a failed step, a `try` in the manifest
+    /// does not catch it and its `finally` does not run. The budget is
+    /// per invocation: a callee that exceeds its own reaches its caller
+    /// as [`KernelError::CalleeFailed`], a failed step the caller may
+    /// catch, as a callee's deadline does.
     pub max_step_results_bytes: usize,
     /// Capacity of the bounded events channel exposed by
     /// [`DataflowHandle::events`]. Bigger means more lifecycle and
@@ -5587,16 +5594,22 @@ pub enum KernelError {
     #[error("Execution error: {0}")]
     Execution(String),
 
-    /// Wasm consumed its fuel budget. A guest module (a `script`
-    /// interpreter or a `wasm` step) ran longer than
-    /// `RuntimeLimits::fuel_budget` instructions allowed. The action is
-    /// aborted; subsequent steps don't run.
+    /// A `script` interpreter consumed its fuel budget: it ran longer
+    /// than `RuntimeLimits::fuel_budget` instructions allowed. A failed
+    /// step, which a `try` may catch; uncaught, the action is aborted
+    /// and subsequent steps don't run. (A `wasm` step's fuel trap is
+    /// reported as [`Self::Execution`] naming the cap.)
     #[error("Wasm fuel exhausted ({budget} unit budget): {detail}")]
     FuelExhausted { budget: u64, detail: String },
 
-    /// Wasm tried to grow its linear memory past
-    /// `RuntimeLimits::max_memory_bytes`. A guest module allocated more
-    /// than the per-invocation ceiling allowed.
+    /// A `script` interpreter declared more linear memory than
+    /// `RuntimeLimits::max_memory_bytes` allows and failed to
+    /// instantiate. A failed step, which a `try` may catch. That is
+    /// the only typed route to the cap: a `memory.grow` past it is
+    /// refused with `-1` and no trap, for a `script` step and a `wasm`
+    /// step alike, so the step may still succeed. (A `wasm` step whose
+    /// declared minimum exceeds the cap fails to instantiate as
+    /// [`Self::Execution`] naming the module.)
     #[error("Wasm memory limit exceeded ({limit_bytes} bytes)")]
     MemoryLimitExceeded { limit_bytes: usize },
 
@@ -5604,6 +5617,13 @@ pub enum KernelError {
     /// `RuntimeLimits::max_step_results_bytes`. Host-side memory, not
     /// wasm memory — a manifest can compose step results into a
     /// doubling chain without any guest code running at all.
+    ///
+    /// The kernel's cap, not the manifest's logic: within the
+    /// invocation it escapes any enclosing `try`, whether the step sits
+    /// in the body directly or inside a `parallel` branch, and no
+    /// `finally` runs. Across an invoke boundary it is the callee's
+    /// failure, and reaches the caller wrapped in [`Self::CalleeFailed`]
+    /// like any other.
     #[error(
         "Step results exceeded the {limit_bytes}-byte budget (needed {attempted_bytes}). \
          Step results accumulate across an action and one step may reference another's \

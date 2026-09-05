@@ -230,6 +230,7 @@ pub(crate) fn step_script<'a>(
                 if let Some(rest) = e.strip_prefix(SCRIPT_ERR_FUEL) {
                     ex.resource_violation = Some(ResourceViolation::FuelExhausted {
                         budget: limits.fuel_budget,
+                        detail: format!("step '{step_id}': {}", rest.trim()),
                     });
                     return Err(StepError::Failed(format!("FuelExhausted: {}", rest.trim())));
                 }
@@ -911,7 +912,10 @@ mod step_script_tests {
         );
         assert!(matches!(
             state.resource_violation,
-            Some(ResourceViolation::FuelExhausted { budget: 1_000_000 })
+            Some(ResourceViolation::FuelExhausted {
+                budget: 1_000_000,
+                ..
+            })
         ));
     }
 }

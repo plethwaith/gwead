@@ -230,7 +230,7 @@
             "items": {
               "type": "object"
             },
-            "description": "Steps that always run; a finally failure supersedes everything. Optional."
+            "description": "Steps that run after the try or catch steps, whether they failed or not; a finally failure supersedes everything. Not run after a `return` inside the try or catch, nor on an error that ends the invocation (a cancellation, a step-results budget violation), which unwinds without them. Optional."
           }
         }
       },

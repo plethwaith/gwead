@@ -11,22 +11,26 @@
 //! kernel has no dependency on any specific runtime. So the mock lives
 //! here as a test-only artifact compiled inline via [`wat::parse_str`].
 //!
-//! Two mocks share the module's registration path. Both export
+//! Several mocks share the module's registration path. All export
 //! `memory`, `alloc(len) -> ptr`, and `execute(src_ptr, src_len,
-//! args_ptr, args_len) -> i32`, and neither interprets its script
+//! args_ptr, args_len) -> i32`, and none interprets its script
 //! source; a real language runtime lives in its own crate.
 //!
 //! - The standard mock ([`build_wasm_bytes`], what [`register`]
 //!   installs) imports only `gwead1.host_set_result`, writes a
 //!   fixed "mock-script-result" string back, and always returns `1`
-//!   (success). Resource caps and fuel are not exercised.
+//!   (success). Host-import behaviour is NOT exercised — tests that
+//!   care about that have to use a real runtime plugin.
+//! - Two twins trip the resource caps: one spins until the fuel meter
+//!   traps ([`build_spinning_wasm_bytes`]), one declares more memory
+//!   than the cap allows and fails to instantiate
+//!   ([`build_hungry_wasm_bytes`]).
 //! - The write-until-refused mock
 //!   ([`build_write_until_refused_wasm_bytes`]) also imports
 //!   `stream_output`, `stream_write`, and `host_set_error`: its
 //!   `execute` writes to the step's dataflow output until the host
 //!   refuses a write, then reports how, so a test can park a real
-//!   guest inside a host import. Installed with
-//!   [`register_module_for_language`].
+//!   guest inside a host import.
 //!
 //! Registration:
 //! - Compile the wat to wasm once per test via [`build_wasm_bytes`]
@@ -40,7 +44,8 @@
 //!   the permission itself; [`trusting`] supplies the other half.
 //! - Use [`register`] to plug it into that kernel under
 //!   `(script, "lua")` (default) or [`register_for_language`] for a
-//!   different selector value
+//!   different selector value; [`register_spinning_for_language`] and
+//!   [`register_hungry_for_language`] plug in the twins
 //!
 //! This is the only piece of the test stack that knows the wasm ABI
 //! shape; a real runtime lives in its own crate.
@@ -90,6 +95,55 @@ const MOCK_WAT: &str = r#"
     i32.const 20      ;; length
     call $host_set_result
     i32.const 1)      ;; success
+)
+"#;
+
+/// A twin of [`MOCK_WAT`] whose `execute` never returns: it spins
+/// until the fuel meter traps. The one way a test can trip
+/// `RuntimeLimits::fuel_budget` without a real runtime.
+const SPINNING_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (global $next (mut i32) (i32.const 32))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    global.get $next
+    local.set $ptr
+    global.get $next
+    local.get $len
+    i32.add
+    global.set $next
+    local.get $ptr)
+  (func (export "execute") (param $src_ptr i32) (param $src_len i32)
+                           (param $args_ptr i32) (param $args_len i32)
+                           (result i32)
+    (loop $spin br $spin)
+    i32.const 1)
+)
+"#;
+
+/// A twin whose declared memory minimum (64 pages, 4 MiB) exceeds a
+/// small `RuntimeLimits::max_memory_bytes`, so the limiter denies it
+/// at instantiation. The one way a test can trip the memory cap
+/// without a real runtime: a `memory.grow` denial hands the module
+/// `-1` rather than trapping, so a growing module could only spin.
+const HUNGRY_WAT: &str = r#"
+(module
+  (memory (export "memory") 64)
+  (global $next (mut i32) (i32.const 32))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    global.get $next
+    local.set $ptr
+    global.get $next
+    local.get $len
+    i32.add
+    global.set $next
+    local.get $ptr)
+  (func (export "execute") (param $src_ptr i32) (param $src_len i32)
+                           (param $args_ptr i32) (param $args_len i32)
+                           (result i32)
+    i32.const 1)
 )
 "#;
 
@@ -188,6 +242,16 @@ pub fn build_write_until_refused_wasm_bytes(on_cancelled: OnCancelled) -> Vec<u8
     wat::parse_str(&wat).expect("write-until-refused wat parses")
 }
 
+/// Compile the spinning twin — see [`SPINNING_WAT`].
+pub fn build_spinning_wasm_bytes() -> Vec<u8> {
+    wat::parse_str(SPINNING_WAT).expect("spinning script-runtime wat parses")
+}
+
+/// Compile the memory-hungry twin — see [`HUNGRY_WAT`].
+pub fn build_hungry_wasm_bytes() -> Vec<u8> {
+    wat::parse_str(HUNGRY_WAT).expect("hungry script-runtime wat parses")
+}
+
 /// The plugin name the mock registers under for `language`. Tests
 /// need it to put the mock in the kernel's trusted-provider list — see
 /// [`trusting`].
@@ -216,6 +280,25 @@ pub fn register(kernel: &mut Kernel) -> Result<(), KernelError> {
 /// validate selector dispatch route a non-`"lua"` value too.
 pub fn register_for_language(kernel: &mut Kernel, language: &str) -> Result<(), KernelError> {
     register_module_for_language(kernel, language, build_wasm_bytes())
+}
+
+/// Register the spinning twin as the `(script, language)` impl. A
+/// `script` step of that language runs until it exhausts its fuel.
+pub fn register_spinning_for_language(
+    kernel: &mut Kernel,
+    language: &str,
+) -> Result<(), KernelError> {
+    register_module_for_language(kernel, language, build_spinning_wasm_bytes())
+}
+
+/// Register the memory-hungry twin as the `(script, language)` impl.
+/// A `script` step of that language fails to instantiate under a
+/// `max_memory_bytes` below 4 MiB.
+pub fn register_hungry_for_language(
+    kernel: &mut Kernel,
+    language: &str,
+) -> Result<(), KernelError> {
+    register_module_for_language(kernel, language, build_hungry_wasm_bytes())
 }
 
 /// Register `wasm_bytes` as the `(script, language)` impl under the

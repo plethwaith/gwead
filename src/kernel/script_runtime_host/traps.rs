@@ -1,9 +1,12 @@
 //! Wasmtime trap classification for the script runtime.
 //!
-//! Resource-cap trips (fuel exhaustion, memory limit) get sentinel
-//! prefixes so the dispatch entry (`step_script`) can map them onto
-//! structured `ResourceViolation` variants. Generic traps (script
-//! error, host panic) keep a plain `"script runtime trapped: …"` shape.
+//! Resource-cap trips get sentinel prefixes so the dispatch entry
+//! (`step_script`) can map them onto structured `ResourceViolation`
+//! variants: fuel exhaustion here, from the execution trap; the memory
+//! limit in `run_script_runtime`, from the instantiation error, which
+//! is the only place a memory denial is an error. Generic traps
+//! (script error, host panic) keep a plain `"script runtime trapped:
+//! …"` shape.
 
 /// Sentinel prefixes the caller can match on to distinguish a generic
 /// runtime error from a resource-cap trip. These prefixes are the
@@ -27,28 +30,16 @@ pub(super) fn classify_runtime_trap(
             limits.fuel_budget,
         );
     }
-    // wasmtime surfaces a memory-limiter denial as an error chain whose
-    // message contains "memory minimum size of N pages exceeds memory
-    // maximum size" or similar. Detect both that and the explicit
-    // "exceeds maximum" wording the ResourceLimiter path produces.
-    let msg = err.to_string();
+    // No memory-cap arm: the limiter answers a `memory.grow` past the
+    // cap with `-1` and no trap, so a denial never reaches an
+    // execution error. The one memory denial that is an error — a
+    // declared minimum past the cap — happens at instantiation, and
+    // `run_script_runtime` classifies that itself.
     let chain: String = err
         .chain()
         .map(|c| c.to_string())
         .collect::<Vec<_>>()
         .join(" | ");
-    if msg.contains("memory minimum size")
-        || chain.contains("memory minimum size")
-        || msg.contains("exceeds memory maximum")
-        || chain.contains("exceeds memory maximum")
-        || msg.contains("memory grow denied")
-        || chain.contains("memory grow denied")
-    {
-        return format!(
-            "{SCRIPT_ERR_MEMORY} wasm linear memory exceeded {} bytes",
-            limits.max_memory_bytes,
-        );
-    }
     // Report the whole chain, not just the top-level Display — for a
     // host-import trap the root cause (e.g. a bounds-check rejection)
     // lives at the bottom of the chain, and "error while executing at
