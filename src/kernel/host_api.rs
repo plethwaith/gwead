@@ -366,9 +366,11 @@ pub(crate) enum ResourceViolation {
     /// own failure, naming the cap in the message.)
     FuelExhausted { budget: u64, detail: String },
     /// A `script` interpreter sub-instance grew past
-    /// [`RuntimeLimits::max_memory_bytes`](super::RuntimeLimits::max_memory_bytes).
-    /// (As with fuel, a `wasm` step reports the same denial as its own
-    /// failure.)
+    /// [`RuntimeLimits::max_memory_bytes`](super::RuntimeLimits::max_memory_bytes),
+    /// at instantiation or through `memory.grow`. (A `wasm` step's
+    /// denial is not typed: `memory.grow` hands the module `-1` and
+    /// the step may still succeed; only a declared minimum past the
+    /// cap fails it, at instantiation, naming the module.)
     MemoryLimit { bytes: usize },
     /// Cumulative step-result bytes exceeded
     /// [`RuntimeLimits::max_step_results_bytes`](super::RuntimeLimits::max_step_results_bytes),

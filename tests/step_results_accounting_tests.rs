@@ -72,6 +72,35 @@ async fn parallel_branches_are_charged_when_they_merge() {
     assert!(err.contains("Step results exceeded"), "{err}");
 }
 
+/// The wave scheduler (`parallelWaves`) is the third join, and the
+/// only one outside `run_step`. Two independent steps share a wave;
+/// each fits an 8 MiB budget in its own fork and the merged total does
+/// not. Without the check after the merge the action resolves `Ok`
+/// with the second result missing.
+#[tokio::test(flavor = "multi_thread")]
+async fn wave_tasks_are_charged_when_they_merge() {
+    let manifest = json!({
+        "name": "p",
+        "actions": {"go": {
+            "parallelWaves": true,
+            "steps": [
+                {"id": "a", "type": "let", "params": {"value": "x".repeat(5 * MIB)}},
+                {"id": "b", "type": "let", "params": {"value": "y".repeat(5 * MIB)}}
+            ],
+            "resultMapping": {"out": {"path": "$", "source": "b"}}
+        }}
+    })
+    .to_string();
+
+    let err = run(
+        &manifest,
+        RuntimeLimits::default().with_max_step_results_bytes(8 * MIB),
+    )
+    .await
+    .expect_err("10 MiB of merged wave results do not fit in 8 MiB");
+    assert!(err.contains("Step results exceeded"), "{err}");
+}
+
 /// The dataflow scheduler merges through the same funnel and must
 /// raise the same refusal. Two independent steps each fit an 8 MiB
 /// budget in their own forks; their merged total does not. A join that

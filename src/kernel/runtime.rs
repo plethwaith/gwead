@@ -1126,14 +1126,15 @@ fn escape_if_cancelled(store: &Store<ExecutionState>, step_id: &str) -> Result<(
 ///    `action.steps`, execute it. If `catch` itself fails, the whole
 ///    `try` step fails — that error is what propagates after `finally`
 ///    runs.
-/// 3. Regardless of try/catch outcome, splice `finally` onto
+/// 3. Whether try/catch succeeded or failed, splice `finally` onto
 ///    `action.steps` and execute it. A `finally` step failure aborts
-///    the action (and supersedes any prior failure). `finally` runs
-///    after a *failed* step; an error that ends the invocation — a
-///    cancellation, or a resource violation that
+///    the action (and supersedes any prior failure). Two things skip
+///    it: a `return` inside try or catch, which unwinds the action at
+///    once; and an error that ends the invocation — a cancellation,
+///    or a resource violation that
 ///    [escapes `try`](super::host_api::ResourceViolation::escapes_try)
-///    — unwinds through `?` before it, since neither the handler nor
-///    the cleanup could run to any purpose under it.
+///    — which unwinds through `?` before it, since neither the handler
+///    nor the cleanup could run to any purpose under it.
 /// 4. The `try` step's own result composes as follows: try success →
 ///    last try step result; catch recovery → last catch step result;
 ///    empty-catch swallow → `Null`; unrecovered failure → no result

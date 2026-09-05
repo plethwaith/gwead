@@ -60,8 +60,9 @@ fn record(id: &str, mark: &str) -> Value {
     json!({"id": id, "type": "budget_fixture.record", "params": {"mark": mark}})
 }
 
-/// A kernel under `limits` with the recorder step and a `script`
-/// runtime for language `spin` that runs until its fuel is gone.
+/// A kernel under `limits` with the recorder step and two `script`
+/// runtimes: language `spin` runs until its fuel is gone, language
+/// `hungry` declares more memory than a small cap allows.
 fn boot(limits: RuntimeLimits) -> Kernel {
     let mut impls = NativeStepImplTable::empty();
     impls
@@ -71,7 +72,7 @@ fn boot(limits: RuntimeLimits) -> Kernel {
         KernelConfig::default()
             .with_limits(limits)
             .with_native_step_impls(impls),
-        &["spin"],
+        &["spin", "hungry"],
     );
     let mut k = Kernel::boot(config).expect("boot");
     k.register_plugin_from_json(
@@ -89,6 +90,8 @@ fn boot(limits: RuntimeLimits) -> Kernel {
     .expect("fixture registers");
     common::script_runtime_mock::register_spinning_for_language(&mut k, "spin")
         .expect("spinning runtime registers");
+    common::script_runtime_mock::register_hungry_for_language(&mut k, "hungry")
+        .expect("hungry runtime registers");
     k
 }
 
@@ -373,23 +376,34 @@ async fn a_budget_violation_in_a_dataflow_task_escapes_try() {
 /// step is pinned in `intrinsics_tests`, and below for a fuel trip.)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_budget_violation_skips_finally() {
-    const MARK: &str = "a_budget_violation_skips_finally";
-    let err = run_guarded(
-        json!({
-            "id": "guarded",
-            "type": "try",
-            "params": {
-                "try": [over_budget_let()],
-                "finally": [record("cleanup", MARK)]
+    const BEFORE: &str = "a_budget_violation_skips_finally/before";
+    const CLEANUP: &str = "a_budget_violation_skips_finally/cleanup";
+    let manifest = json!({
+        "name": "p",
+        "actions": { "go": { "steps": [
+            // Positive control: the recorder works in this action.
+            record("before", BEFORE),
+            {
+                "id": "guarded",
+                "type": "try",
+                "params": {
+                    "try": [over_budget_let()],
+                    "finally": [record("cleanup", CLEANUP)]
+                }
             }
-        }),
-        false,
+        ] } }
+    })
+    .to_string();
+    let err = run_manifest(
+        &manifest,
+        RuntimeLimits::default().with_max_step_results_bytes(GUARDED_BUDGET),
     )
     .await
     .expect_err("the invocation ends on the budget");
     assert_guarded_error(err);
+    assert!(recorded(BEFORE), "the recorder ran before the try");
     assert!(
-        !recorded(MARK),
+        !recorded(CLEANUP),
         "finally must not run after the budget ends the invocation"
     );
 }
@@ -449,7 +463,7 @@ async fn a_fuel_trip_is_a_failed_step_a_try_can_catch() {
     .to_string();
     let out = run_manifest(&manifest, small_fuel())
         .await
-        .expect("the handler recovers from the callee's fuel trip");
+        .expect("the handler recovers from the fuel trip");
     assert_eq!(out["out"], json!("swallowed"));
 }
 
@@ -481,6 +495,53 @@ async fn a_fuel_trip_runs_finally_in_full() {
         recorded(SECOND),
         "the second finally step ran: the first one's success was not turned into a failure"
     );
+}
+
+/// A `script` step whose runtime declares 4 MiB of memory.
+fn hungry_script() -> Value {
+    json!({"id": "hungry", "type": "script", "params": {"language": "hungry", "source": ""}})
+}
+
+/// A cap the hungry runtime cannot instantiate under.
+const SMALL_MEMORY: usize = 1024 * 1024;
+
+fn small_memory() -> RuntimeLimits {
+    RuntimeLimits::default().with_max_memory_bytes(SMALL_MEMORY)
+}
+
+/// Uncaught, a memory trip is typed. Pins the recorded marker and its
+/// conversion, as the fuel test does for its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_memory_trip_is_typed() {
+    let manifest = json!({
+        "name": "p",
+        "actions": { "go": { "steps": [hungry_script()] } }
+    })
+    .to_string();
+    let err = run_manifest(&manifest, small_memory())
+        .await
+        .expect_err("4 MiB declared does not instantiate under 1 MiB");
+    match err {
+        KernelError::MemoryLimitExceeded { limit_bytes } => assert_eq!(limit_bytes, SMALL_MEMORY),
+        other => panic!("expected MemoryLimitExceeded, got: {other:?}"),
+    }
+}
+
+/// A memory trip is a failed step, and a `try` recovers from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_memory_trip_is_a_failed_step_a_try_can_catch() {
+    let manifest = json!({
+        "name": "p",
+        "actions": { "go": {
+            "steps": [guarded(hungry_script())],
+            "resultMapping": { "out": { "path": "$", "source": "guarded" } }
+        } }
+    })
+    .to_string();
+    let out = run_manifest(&manifest, small_memory())
+        .await
+        .expect("the handler recovers from the memory trip");
+    assert_eq!(out["out"], json!("swallowed"));
 }
 
 // ---------------------------------------------------------------------------
