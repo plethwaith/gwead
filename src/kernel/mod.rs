@@ -968,8 +968,10 @@ pub struct RuntimeLimits {
     ///
     /// Cumulative rather than per-value: capping one result still
     /// leaves as many of them as the manifest has steps, and the total
-    /// is what the host has to hold. Exceeding it fails the step with
-    /// [`KernelError::StepResultsLimitExceeded`].
+    /// is what the host has to hold. Exceeding it ends the invocation
+    /// with [`KernelError::StepResultsLimitExceeded`]; like a
+    /// cancellation, and unlike a failed step, a `try` in the manifest
+    /// does not catch it.
     pub max_step_results_bytes: usize,
     /// Capacity of the bounded events channel exposed by
     /// [`DataflowHandle::events`]. Bigger means more lifecycle and
@@ -5598,6 +5600,10 @@ pub enum KernelError {
     /// `RuntimeLimits::max_step_results_bytes`. Host-side memory, not
     /// wasm memory — a manifest can compose step results into a
     /// doubling chain without any guest code running at all.
+    ///
+    /// The kernel's cap, not the manifest's logic: it escapes any
+    /// enclosing `try`, whether the step sits in the body directly or
+    /// inside a `parallel` branch.
     #[error(
         "Step results exceeded the {limit_bytes}-byte budget (needed {attempted_bytes}). \
          Step results accumulate across an action and one step may reference another's \

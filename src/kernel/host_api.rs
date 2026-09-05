@@ -1671,10 +1671,12 @@ impl ExecutionState {
     ///
     /// Over budget, the result is **not stored** and a
     /// [`ResourceViolation::StepResultsLimit`] is recorded;
-    /// [`super::runtime::run_step`] turns that into a failed step on
-    /// the way out. Refusing to store is what makes the bound real —
-    /// recording a marker and keeping the value would cap the error
-    /// message, not the memory.
+    /// [`super::runtime::run_step`] raises it as
+    /// [`super::KernelError::StepResultsLimitExceeded`] on the way out.
+    /// That is an error, not a failed step: the budget is the kernel's
+    /// cap, so an enclosing `try` does not catch it. Refusing to store
+    /// is what makes the bound real — recording a marker and keeping
+    /// the value would cap the error message, not the memory.
     pub fn store_step_result(&mut self, step_id: &str, value: Value) {
         if self.first_step_id.is_none() {
             self.first_step_id = Some(step_id.to_string());

@@ -16,7 +16,7 @@
 //! as many values as the manifest has steps, and it is the total the
 //! host has to hold.
 
-use gwead::kernel::{Kernel, KernelConfig, RuntimeLimits};
+use gwead::kernel::{Kernel, KernelConfig, KernelError, RuntimeLimits};
 use serde_json::{Value, json};
 
 /// `lines` steps, each doubling the previous one's result.
@@ -154,4 +154,83 @@ async fn a_refused_result_fails_its_step_rather_than_vanishing() {
         !err.is_empty(),
         "the action errors; it does not return an output missing the step"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Catchability
+// ---------------------------------------------------------------------------
+
+/// The over-budget `let` wrapped as `body` inside a `try` whose handler
+/// would otherwise recover, under a 1 KiB budget.
+async fn run_guarded(body: Value) -> Result<Value, KernelError> {
+    let manifest = json!({
+        "name": "p",
+        "actions": { "go": {
+            "steps": [{
+                "id": "guarded",
+                "type": "try",
+                "params": {
+                    "try": [body],
+                    "catch": [{"id": "recovered", "type": "let", "params": {"value": "swallowed"}}]
+                }
+            }],
+            "resultMapping": { "out": { "path": "$", "source": "guarded" } }
+        } }
+    })
+    .to_string();
+    let mut k = Kernel::boot(
+        KernelConfig::default()
+            .with_limits(RuntimeLimits::default().with_max_step_results_bytes(1024)),
+    )
+    .expect("boot");
+    k.register_plugin_from_json(&manifest).expect("registers");
+    k.into_arc()
+        .execute("p", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .map(|r| r.output)
+}
+
+fn over_budget_let() -> Value {
+    json!({"id": "big", "type": "let", "params": {"value": "x".repeat(4096)}})
+}
+
+fn assert_budget_error(err: KernelError) {
+    match err {
+        KernelError::StepResultsLimitExceeded {
+            limit_bytes,
+            attempted_bytes,
+        } => {
+            assert_eq!(limit_bytes, 1024);
+            assert!(attempted_bytes > 1024, "{attempted_bytes}");
+        }
+        other => panic!("expected StepResultsLimitExceeded, got: {other:?}"),
+    }
+}
+
+/// The budget is the kernel's cap, not the manifest's logic, so a
+/// violation is not a step failure a `try` may recover from: it ends
+/// the invocation the way a cancellation does. A handler that caught it
+/// would see a refused result and carry on as if the step had run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_budget_violation_escapes_try() {
+    let err = run_guarded(over_budget_let())
+        .await
+        .expect_err("a resource cap is not catchable");
+    assert_budget_error(err);
+}
+
+/// The same violation inside a `parallel` branch inside the `try`
+/// escapes identically. Catchability must not depend on nesting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_budget_violation_inside_a_parallel_branch_escapes_try() {
+    let err = run_guarded(json!({
+        "id": "fan",
+        "type": "parallel",
+        "params": {"branches": [[over_budget_let()]]}
+    }))
+    .await
+    .expect_err("a resource cap is not catchable through a parallel branch either");
+    assert_budget_error(err);
 }

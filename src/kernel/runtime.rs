@@ -856,7 +856,7 @@ impl WasmRuntime {
                 if let Some(err) = first_error {
                     return Err(err);
                 }
-                if let Some(err) = merge_over_budget(store.data()) {
+                if let Some(err) = over_budget(store.data()) {
                     return Err(err);
                 }
                 // Post-merge: install fan-outs for producers in this wave.
@@ -993,16 +993,28 @@ pub(super) fn run_step<'a>(
             }
         };
 
-        // A resource cap tripped *while the body was succeeding* still
-        // fails the step. `store_step_result` is the case: it refuses
-        // an over-budget result and records the violation, but the body
-        // that called it has already returned `true`. Without this the
-        // step would report success while its result silently did not
-        // exist.
+        // A step-results budget violation is the kernel's cap, not the
+        // manifest's logic, so it is not a step failure: it ends the
+        // invocation the way a cancellation does, as an `Err` no
+        // enclosing `try` can catch. `store_step_result` refuses the
+        // over-budget value and records the violation, but the body
+        // that called it has already returned; raising here is what
+        // turns the refusal into the action's error. Left as a plain
+        // `false`, a `try.catch` around the step would recover from a
+        // result that does not exist and report success, while the
+        // same step inside a `parallel` branch would already escape
+        // through the join — catchability would depend on nesting.
         //
         // Checked here rather than in each body because `run_step` is
         // the single funnel every step type passes through, including
         // the control-flow intrinsics that recurse back into it.
+        if let Some(err) = over_budget(store.data()) {
+            return Err(err);
+        }
+
+        // Any other resource cap that tripped *while the body was
+        // succeeding* still fails the step, so it cannot report success
+        // with a missing or partial result.
         if body_ok && store.data().resource_violation.is_some() {
             return Ok(false);
         }
@@ -1532,7 +1544,7 @@ async fn run_parallel(
     if let Some(err) = first_error {
         return Err(err);
     }
-    if let Some(err) = merge_over_budget(store.data()) {
+    if let Some(err) = over_budget(store.data()) {
         return Err(err);
     }
 
@@ -2184,19 +2196,25 @@ fn join_error(what: &str, join_err: &tokio::task::JoinError) -> KernelError {
     }
 }
 
-/// A budget tripped while merging a finished task's results into the
-/// canonical state.
+/// The step-results budget tripped: the recorded violation, as the
+/// error that ends the invocation.
 ///
 /// `store_step_result` refuses the value and records the violation, but
-/// by then the task has already returned success — so, exactly as on the
-/// sequential path, something after the fact has to turn that into a
-/// failed action. Dropping the value and carrying on would be a silent
-/// wrong answer.
+/// its caller has already returned — so something after the fact has to
+/// turn the refusal into a failed action. Dropping the value and
+/// carrying on would be a silent wrong answer. `run_step` raises it for
+/// the step that stored; the parallel joins raise it again for a merge
+/// that tripped the budget on the canonical state, since a violation
+/// the *task* raised has already ended the task through `run_step`.
 ///
-/// Only `StepResultsLimit` is considered: it is the only violation a
-/// merge itself can raise. A violation the *task* raised has already
-/// failed that task through `run_step`.
-fn merge_over_budget(state: &ExecutionState) -> Option<KernelError> {
+/// It is raised as an `Err` rather than a failed step because the
+/// budget is the kernel's, not the manifest's: a `try` may not catch
+/// it, any more than it may catch a cancellation.
+///
+/// Only `StepResultsLimit` is considered. The fuel and memory
+/// violations belong to one wasm sub-instance and fail its step the
+/// ordinary way, through `step_failure_to_error`.
+fn over_budget(state: &ExecutionState) -> Option<KernelError> {
     match state.resource_violation.clone() {
         Some(host_api::ResourceViolation::StepResultsLimit {
             limit_bytes,
