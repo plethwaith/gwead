@@ -258,8 +258,9 @@ the host as the cancellation rather than as a failure — provided a
 host import told the guest about the cancel first (a write returning
 `STREAM_CANCELLED`, `is_cancelled` answering 1, or a plain invoke
 whose callee was stopped by the step's token — a streaming callee's
-stop arrives as EOF, untold); a guest that was never told keeps its
-own failure. So a binding that does raise on the code still
+stop arrives through `stream_read`, as EOF or as an error item,
+untold either way); a guest that was never told keeps its own
+failure. So a binding that does raise on the code still
 winds down correctly, but the guest's own error text is then only
 logged.
 

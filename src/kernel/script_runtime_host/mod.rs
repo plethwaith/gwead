@@ -732,7 +732,7 @@ mod told_of_cancel_tests {
         let text = outcome
             .result
             .expect_err("the cancelled invoke fails the guest");
-        assert!(text.contains("io.invoke → p.a failed"), "{text}");
+        assert!(text.starts_with("io.invoke → p.a failed"), "{text}");
         assert!(outcome.told_of_cancel, "{text}");
     }
 

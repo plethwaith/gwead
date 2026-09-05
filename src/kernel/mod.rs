@@ -4990,8 +4990,9 @@ where
                 abandoned: false,
             }
         }
-        // A callee deadline that arrives *before* this caller's has
-        // passed is not remapped: it stays the callee's failure.
+        // Guarded on the deadline as well as the shape: a callee
+        // deadline that arrives *before* this caller's has passed is
+        // the callee's failure, and falls through to the arms below.
         Ok(Err(err)) if deadline_reached && stopped_by_cancellation(&err) => {
             tracing::debug!(
                 timeout_ms,

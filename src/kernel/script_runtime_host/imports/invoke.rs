@@ -23,6 +23,22 @@ use serde_json::Value;
 use super::super::store_data::{ScriptRuntimeStoreData, bail_host_call, truncate_for_log};
 use crate::kernel::host_api::INVOKE_MAX_DEPTH;
 
+/// Whether a failed `host_invoke` told the guest of its own cancel:
+/// the step's token has fired, and the callee — which runs under a
+/// child of it — stopped in the shape a cancellation takes, the way a
+/// `STREAM_CANCELLED` write tells it (see `told_of_cancel`). Both
+/// halves matter. A callee's own deadline under a quiet token is the
+/// callee's failure, however cancellation-shaped; under a fired token
+/// it is counted, the deadline being the same event seen one level
+/// down. A callee that failed for its own reasons under a fired token
+/// told the guest nothing.
+fn tells_of_cancel(
+    cancel: &tokio_util::sync::CancellationToken,
+    err: &crate::kernel::KernelError,
+) -> bool {
+    cancel.is_cancelled() && crate::kernel::stopped_by_cancellation(err)
+}
+
 pub(super) fn register(
     linker: &mut wasmtime::Linker<ScriptRuntimeStoreData>,
 ) -> Result<(), String> {
@@ -303,18 +319,7 @@ pub(super) fn register(
                                 error = %e,
                                 "io.invoke failed"
                             );
-                            // A callee that stopped on this step's
-                            // fired token — it runs under a child of
-                            // it — is the guest being told of its own
-                            // cancel, the way a `STREAM_CANCELLED`
-                            // write tells it; see `told_of_cancel`. A
-                            // callee's own deadline under a quiet
-                            // token is the callee's failure, not a
-                            // telling — the shape alone is not enough,
-                            // which is what the token check is for.
-                            if state.cancel.is_cancelled()
-                                && crate::kernel::stopped_by_cancellation(&e)
-                            {
+                            if tells_of_cancel(&state.cancel, &e) {
                                 state.told_of_cancel = true;
                             }
                             state.call_error = Some(
@@ -634,9 +639,11 @@ pub(super) fn register(
                             // a telling: the spawn fails only on lookup,
                             // validation, or a secret pull, none of them
                             // cancellation-shaped. A spawned callee that
-                            // is later stopped by this step's token ends
-                            // its stream with a plain EOF, which reaches
-                            // the guest through `stream_read` untold.
+                            // is later stopped by this step's token
+                            // reaches the guest through `stream_read`,
+                            // as EOF or as the error item a callee's own
+                            // watchdog records at the end of an
+                            // inherited budget; neither is a telling.
                             bail_host_call(
                                 &mut caller,
                                 format!(
@@ -651,4 +658,46 @@ pub(super) fn register(
         .map_err(|e| format!("host_invoke_streaming: {e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tells_of_cancel_tests {
+    use super::tells_of_cancel;
+    use crate::kernel::KernelError;
+    use tokio_util::sync::CancellationToken;
+
+    fn fired() -> CancellationToken {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        cancel
+    }
+
+    fn cancelled() -> KernelError {
+        KernelError::Cancelled {
+            at_step: "s".into(),
+        }
+    }
+
+    fn deadline() -> KernelError {
+        KernelError::ExecutionTimeout { timeout_ms: 50 }
+    }
+
+    fn own_reasons() -> KernelError {
+        KernelError::NotFound("missing".into())
+    }
+
+    /// Every cell of the predicate. The fired-token deadline cell is
+    /// the one a callee's own cap reaching its end under this step's
+    /// fired token lands in: counted, as the same event one level
+    /// down.
+    #[test]
+    fn a_telling_needs_a_fired_token_and_a_cancellation_shape() {
+        let quiet = CancellationToken::new();
+        assert!(!tells_of_cancel(&quiet, &cancelled()));
+        assert!(!tells_of_cancel(&quiet, &deadline()));
+        assert!(!tells_of_cancel(&quiet, &own_reasons()));
+        assert!(tells_of_cancel(&fired(), &cancelled()));
+        assert!(tells_of_cancel(&fired(), &deadline()));
+        assert!(!tells_of_cancel(&fired(), &own_reasons()));
+    }
 }
