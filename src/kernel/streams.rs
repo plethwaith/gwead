@@ -1007,9 +1007,9 @@ pub const STREAM_CLOSED: i32 = -4;
 pub const STREAM_IO_ERROR: i32 = -5;
 /// Buffer pointer + length exceeds the wasm module's linear memory.
 pub const STREAM_OOB: i32 = -6;
-/// A write parked on a full channel was released by the invocation's
-/// cancellation token — the caller's cancel or the wallclock
-/// watchdog — before the consumer made room. Nothing was committed.
+/// A write waiting for room on a full channel was released by the
+/// invocation's cancellation token — the caller's cancel or the
+/// wallclock watchdog. Nothing was committed.
 /// Distinct from [`STREAM_CLOSED`] so a guest can tell a consumer that
 /// went away (finish cleanly) from a stop it was told to make.
 pub const STREAM_CANCELLED: i32 = -7;
@@ -1348,6 +1348,40 @@ mod tests {
             rx.try_recv().is_err(),
             "the released chunk was not committed behind the consumer's back"
         );
+    }
+
+    /// A parked write learns that the receiver has gone before it
+    /// learns that the token fired, whichever order the two happened
+    /// in: a departed consumer is `STREAM_CLOSED`, never
+    /// `STREAM_CANCELLED`. Polled by hand so the write is parked
+    /// before either happens, and both land before its next poll.
+    #[tokio::test]
+    async fn parked_write_reports_a_departed_receiver_over_a_fired_token() {
+        for receiver_first in [true, false] {
+            let mut reg = StreamRegistry::new();
+            let (id, rx) = reg.register_writable("application/octet-stream", 1);
+            let state = reg.get(id).unwrap();
+            let cancel = CancellationToken::new();
+            assert_eq!(state.write_async(b"fits", &cancel).await, 4);
+
+            let mut parked = std::pin::pin!(state.write_async(b"parked", &cancel));
+            assert!(
+                futures::poll!(parked.as_mut()).is_pending(),
+                "a full channel parks the write"
+            );
+            if receiver_first {
+                drop(rx);
+                cancel.cancel();
+            } else {
+                cancel.cancel();
+                drop(rx);
+            }
+            assert_eq!(
+                futures::poll!(parked.as_mut()),
+                std::task::Poll::Ready(STREAM_CLOSED),
+                "receiver_first = {receiver_first}"
+            );
+        }
     }
 
     /// A token that has already fired releases a would-be-parked write

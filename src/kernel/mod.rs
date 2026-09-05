@@ -4766,7 +4766,10 @@ impl Kernel {
 /// token and then failed for its own reasons is reported for those
 /// reasons, with the deadline noted in the log. A step that answers
 /// the token with a `Failed` or `Thrown` of its own therefore
-/// misreports itself; the typed variant exists so it need not. The
+/// misreports itself; the typed variant exists so it need not. (A
+/// script guest has no typed variant: `step_script` reads a guest
+/// error as the cancellation when a host import had told the guest
+/// of the cancel, and keeps it a failure otherwise.) The
 /// watchdog claims the stop only if nobody had fired the token before
 /// it: a caller's own cancel just ahead of the deadline is reported as
 /// theirs, whatever the timer did.
@@ -6073,12 +6076,12 @@ mod wallclock_timeout_tests {
         })
     }
 
-    /// Tags (`params.tag`) of every [`write_until_refused`] run whose
-    /// parked write came back `STREAM_CANCELLED`. A producer that was
-    /// dropped instead — the wallclock grace reaching a write the
-    /// token could not — never gets to record itself, which is how a
-    /// test tells the two apart when the stream looks the same either
-    /// way.
+    /// Tags (`params.tag`, when given) of every [`write_until_refused`]
+    /// run whose parked write came back `STREAM_CANCELLED`. A producer
+    /// that was dropped instead — the wallclock grace reaching a write
+    /// the token could not — never gets to record itself, which is how
+    /// a test tells the two apart when the stream looks the same
+    /// either way.
     static RELEASED_BY_TOKEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
     fn released_by_token(tag: &str) -> bool {
@@ -6116,7 +6119,9 @@ mod wallclock_timeout_tests {
                 match n {
                     n if n >= 0 => continue,
                     streams::STREAM_CANCELLED => {
-                        RELEASED_BY_TOKEN.lock().unwrap().push(tag);
+                        if !tag.is_empty() {
+                            RELEASED_BY_TOKEN.lock().unwrap().push(tag);
+                        }
                         return Err(host_api::StepError::Cancelled);
                     }
                     streams::STREAM_CLOSED => return Ok(host_api::StepOutput::from(Value::Null)),
@@ -6384,9 +6389,9 @@ mod wallclock_timeout_tests {
     /// where nothing of its own can notice a cancel. The caller's
     /// token releases the parked write as `STREAM_CANCELLED`; the
     /// callee answers with the typed cancellation, which the caller's
-    /// cancel makes a plain EOF: every chunk that fit the channel, no
-    /// error item, and an end long before anything else could have
-    /// produced one.
+    /// cancel makes a plain EOF: the chunks committed before the
+    /// cancel, no error item, and an end long before anything else
+    /// could have produced one.
     #[tokio::test(flavor = "multi_thread")]
     async fn callers_cancel_releases_a_callee_parked_on_a_full_channel() {
         let kernel = kernel_with_relay(write_until_refused, "{}");
@@ -6403,7 +6408,7 @@ mod wallclock_timeout_tests {
                 && items
                     .iter()
                     .all(|item| matches!(item, Ok(b) if &b[..] == b"x")),
-            "the chunks that fit arrive, and the cancel is not an error item: {items:?}"
+            "the chunks committed arrive, and the cancel is not an error item: {items:?}"
         );
     }
 

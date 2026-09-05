@@ -72,7 +72,8 @@ fn simple_manifest(name: &str, actions: IndexMap<String, Action>) -> PluginManif
 /// after the current chunk.
 ///
 /// Reports `stopped_on`: the negative `stream_write` code that ended
-/// the loop early, or `null` when every chunk was written.
+/// the loop early, or `null` when it ended any other way (every chunk
+/// written, or the token check between writes).
 ///
 /// Params:
 /// - `chunk_count` (u64, default 10) — how many chunks to write
@@ -1381,25 +1382,46 @@ async fn streaming_handle_cancel_propagates_into_producer() {
 }
 
 /// A kernel whose plugin `p` has one dataflow action, `relay`, with a
-/// single long-running step `producer` of `step_type` and `params`.
-fn kernel_with_relay(kernel: Kernel, step_type: &str, params: Value) -> Arc<Kernel> {
+/// single long-running step `producer` of `step_type` and `params`,
+/// under `wallclock_ms` when given.
+fn kernel_with_relay_under(
+    kernel: Kernel,
+    step_type: &str,
+    params: Value,
+    wallclock_ms: Option<u64>,
+) -> Arc<Kernel> {
     let mut k = kernel;
     let mut actions = IndexMap::new();
-    actions.insert(
-        "relay".to_string(),
-        dataflow_action(vec![long_running_step("producer", step_type, params)]),
-    );
+    let mut relay = dataflow_action(vec![long_running_step("producer", step_type, params)]);
+    relay.wallclock_timeout_ms = wallclock_ms;
+    actions.insert("relay".to_string(), relay);
     k.register_plugin(simple_manifest("p", actions)).unwrap();
     k.into_arc()
 }
 
+/// [`kernel_with_relay_under`] with no wallclock cap.
+fn kernel_with_relay(kernel: Kernel, step_type: &str, params: Value) -> Arc<Kernel> {
+    kernel_with_relay_under(kernel, step_type, params, None)
+}
+
+/// How a stalled relay is brought to an end.
+enum Stall {
+    /// Give the producer time to fill the channel and park, then
+    /// cancel the handle.
+    Cancel,
+    /// Leave it: the action's wallclock cap is what ends it.
+    WaitForDeadline,
+}
+
 /// Run `p.relay` as a dataflow streaming handle whose output is held
-/// open and never read, give the producer time to fill the channel and
-/// park inside its write, cancel, and hand back the pipeline's result.
-/// The result must arrive: before the write backstop this hung
-/// forever, and the timeout is what turns that into a failure.
-async fn cancel_once_parked(
+/// open and never read, so the producer fills the channel and parks
+/// inside its write; end the stall per `stall` and hand back the
+/// pipeline's result. The result must arrive: before the write
+/// backstop this hung forever, and the timeout is what turns that
+/// into a failure.
+async fn relay_unread(
     kernel: &Arc<Kernel>,
+    stall: Stall,
 ) -> Result<gwead::kernel::types::ActionResult, KernelError> {
     let handle = kernel
         .execute("p", "relay", json!({}))
@@ -1407,14 +1429,31 @@ async fn cancel_once_parked(
         .with_exec_ctx(gwead::kernel::ExecutionContext::default())
         .into_dataflow_streaming_handle()
         .expect("handle");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    handle.cancel();
+    if let Stall::Cancel = stall {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.cancel();
+    }
     let result = tokio::time::timeout(Duration::from_secs(5), handle.result)
         .await
-        .expect("the cancel reaches the parked writer and the pipeline ends")
+        .expect("the parked writer is released and the pipeline ends")
         .expect("delivered");
     drop(handle.output);
     result
+}
+
+/// The write-until-refused guest as a kernel's `(script, "lua")`
+/// runtime.
+fn guest_kernel(on_cancelled: common::script_runtime_mock::OnCancelled) -> Kernel {
+    boot_kernel_with(
+        gwead::kernel::RuntimeLimits::default(),
+        common::script_runtime_mock::build_write_until_refused_wasm_bytes(on_cancelled),
+    )
+}
+
+const GUEST_STEP: &str = "script";
+
+fn guest_params(source: &str) -> Value {
+    json!({ "language": "lua", "source": source })
 }
 
 /// A consumer that holds its readable open but never reads leaves the
@@ -1430,7 +1469,7 @@ async fn cancel_releases_a_producer_parked_on_a_stalled_consumer() {
         "test_dataflow_fixture.dataflow_producer",
         json!({ "chunk_count": 100_000, "chunk_size": 16 }),
     );
-    let action_result = cancel_once_parked(&kernel).await.expect("ok");
+    let action_result = relay_unread(&kernel, Stall::Cancel).await.expect("ok");
     let producer = &action_result.step_results["producer"];
     assert_eq!(
         producer["stopped_on"],
@@ -1452,20 +1491,33 @@ async fn cancel_releases_a_producer_parked_on_a_stalled_consumer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_releases_a_wasm_guest_parked_in_stream_write() {
     let kernel = kernel_with_relay(
-        boot_kernel_with(
-            gwead::kernel::RuntimeLimits::default(),
-            common::script_runtime_mock::build_write_until_refused_wasm_bytes(
-                common::script_runtime_mock::OnCancelled::ReturnResult,
-            ),
-        ),
-        "script",
-        json!({ "language": "lua", "source": "-- writes until refused" }),
+        guest_kernel(common::script_runtime_mock::OnCancelled::ReturnResult),
+        GUEST_STEP,
+        guest_params("-- writes until refused"),
     );
-    let action_result = cancel_once_parked(&kernel).await.expect("ok");
+    let action_result = relay_unread(&kernel, Stall::Cancel).await.expect("ok");
     assert_eq!(
         action_result.step_results["producer"],
         json!("cancelled"),
         "the guest's parked write returned STREAM_CANCELLED"
+    );
+}
+
+/// The wallclock watchdog fires the same token: a wasm guest parked in
+/// `stream_write` under the action's cap is released at the deadline
+/// and returns, and the action reports the deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn wallclock_deadline_releases_a_wasm_guest_parked_in_stream_write() {
+    let kernel = kernel_with_relay_under(
+        guest_kernel(common::script_runtime_mock::OnCancelled::ReturnResult),
+        GUEST_STEP,
+        guest_params("-- writes until refused"),
+        Some(150),
+    );
+    let result = relay_unread(&kernel, Stall::WaitForDeadline).await;
+    assert!(
+        matches!(result, Err(KernelError::ExecutionTimeout { .. })),
+        "the release is reported as the deadline: {result:?}"
     );
 }
 
@@ -1477,18 +1529,38 @@ async fn cancel_releases_a_wasm_guest_parked_in_stream_write() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_guest_that_raises_on_stream_cancelled_is_winding_down_not_failing() {
     let kernel = kernel_with_relay(
-        boot_kernel_with(
-            gwead::kernel::RuntimeLimits::default(),
-            common::script_runtime_mock::build_write_until_refused_wasm_bytes(
-                common::script_runtime_mock::OnCancelled::RaiseError,
-            ),
-        ),
-        "script",
-        json!({ "language": "lua", "source": "-- raises when refused" }),
+        guest_kernel(common::script_runtime_mock::OnCancelled::RaiseError),
+        GUEST_STEP,
+        guest_params("-- raises when refused"),
     );
-    let result = cancel_once_parked(&kernel).await;
+    let result = relay_unread(&kernel, Stall::Cancel).await;
+    let action_result = match result {
+        Ok(r) => r,
+        Err(e) => panic!("a guest error after the cancel is the cancel, not a failure: {e}"),
+    };
     assert!(
-        result.is_ok(),
-        "a guest error after the cancel is the cancel, not a failure: {result:?}"
+        action_result.step_results.get("producer").is_none(),
+        "a step that wound down on the cancel recorded no result — the \
+         guest did not merely return under some other code: {:?}",
+        action_result.step_results
+    );
+}
+
+/// The same raising guest under the action's wallclock cap: the guest
+/// is told of the cancel by its parked write, raises, and the host
+/// reads that as the cancellation, which the wallclock wrapper reports
+/// as the deadline — not as the guest's own error text.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guest_that_raises_under_the_wallclock_deadline_reports_the_deadline() {
+    let kernel = kernel_with_relay_under(
+        guest_kernel(common::script_runtime_mock::OnCancelled::RaiseError),
+        GUEST_STEP,
+        guest_params("-- raises when refused"),
+        Some(150),
+    );
+    let result = relay_unread(&kernel, Stall::WaitForDeadline).await;
+    assert!(
+        matches!(result, Err(KernelError::ExecutionTimeout { .. })),
+        "the guest's raise on its cancel is the deadline: {result:?}"
     );
 }

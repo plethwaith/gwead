@@ -204,7 +204,7 @@ pub(crate) fn step_script<'a>(
             dataflow_output = ?dataflow_output,
             "script step starting"
         );
-        let result = run_script_runtime(
+        let outcome = run_script_runtime(
             &engine,
             &runtime_module,
             &source,
@@ -217,7 +217,7 @@ pub(crate) fn step_script<'a>(
         )
         .await;
 
-        match result {
+        match outcome.result {
             Ok(result_json) => {
                 let val: Value = serde_json::from_str(&result_json).unwrap_or(Value::Null);
                 Ok(StepOutput::from(val))
@@ -244,25 +244,28 @@ pub(crate) fn step_script<'a>(
                 }
                 // A guest has no typed cancellation of its own. Its
                 // binding may raise a language-level error when a host
-                // import reports the step's cancel (`STREAM_CANCELLED`
-                // from a parked `stream_write`), or a script may fail
-                // while winding down. Under a fired token that error
-                // is the cancellation surfacing through the guest's
-                // error idiom, and is reported as such, so the
-                // dataflow scheduler sees a step winding down and the
-                // wallclock wrapper sees its deadline rather than a
-                // failure carrying the guest's text. A failure that
-                // merely coincided with the cancel is logged in full
-                // here so it is not lost. Resource-cap violations are
-                // mapped above, before this: a guest that ignores its
-                // cancel until its fuel runs out has still hit the
-                // kernel's limit.
-                if ex.cancel_token().is_cancelled() {
-                    tracing::debug!(
+                // import tells it the step was cancelled —
+                // `STREAM_CANCELLED` from a parked `stream_write`, or
+                // `is_cancelled` answering 1. An error from a guest
+                // that was told is the cancellation surfacing through
+                // the guest's error idiom, and is reported as such, so
+                // the dataflow scheduler sees a step winding down and
+                // the wallclock wrapper sees its deadline rather than a
+                // failure carrying the guest's text. The gate is the
+                // telling, not the token: a guest that never heard of
+                // the cancel and failed for its own reasons keeps its
+                // failure, as the wallclock wrapper promises. The text
+                // has no other home once the step is recorded as
+                // cancelled, so it is logged at info. Resource-cap
+                // violations are mapped above, before this: a guest
+                // that ignores its cancel until its fuel runs out has
+                // still hit the kernel's limit.
+                if outcome.told_of_cancel {
+                    tracing::info!(
                         plugin = %owner_plugin,
                         step_id = %step_id,
                         error = %e,
-                        "Script step failed under a fired cancellation token; reporting cancellation"
+                        "Script step failed after being told of its cancellation; reporting cancellation"
                     );
                     return Err(StepError::Cancelled);
                 }
@@ -286,6 +289,16 @@ pub(crate) fn step_script<'a>(
 /// execution — that's the property that lets the parent step's caller
 /// run another stream op concurrently (e.g. through a host callback
 /// triggered from inside the script) without self-deadlocking.
+/// What a script-runtime run came to, with the one fact about the
+/// guest's view that outlives its store: whether a host import told
+/// it the step was cancelled (see
+/// [`ScriptRuntimeStoreData::told_of_cancel`]).
+pub(crate) struct ScriptOutcome {
+    /// The result JSON on success, or the guest's error text.
+    pub(crate) result: Result<String, String>,
+    pub(crate) told_of_cancel: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_script_runtime(
     engine: &Engine,
@@ -297,16 +310,56 @@ pub(crate) async fn run_script_runtime(
     dataflow_output: Option<crate::kernel::streams::StreamId>,
     cancel: tokio_util::sync::CancellationToken,
     parent: ScriptRuntimeParentContext,
-) -> Result<String, String> {
+) -> ScriptOutcome {
+    let result = drive_script_runtime(
+        engine,
+        runtime_module,
+        source,
+        args_json,
+        streams,
+        limits,
+        dataflow_output,
+        cancel,
+        parent,
+    )
+    .await;
+    match result {
+        Ok((result, told_of_cancel)) => ScriptOutcome {
+            result: Ok(result),
+            told_of_cancel,
+        },
+        Err((err, told_of_cancel)) => ScriptOutcome {
+            result: Err(err),
+            told_of_cancel,
+        },
+    }
+}
+
+/// [`run_script_runtime`]'s body: builds the store, runs the guest,
+/// and pairs whichever way it ended with the store's
+/// `told_of_cancel`. Setup failures before the store exists carry
+/// `false`.
+#[allow(clippy::too_many_arguments)]
+async fn drive_script_runtime(
+    engine: &Engine,
+    runtime_module: &Module,
+    source: &str,
+    args_json: &[u8],
+    streams: &crate::kernel::streams::SharedStreamRegistry,
+    limits: &crate::kernel::RuntimeLimits,
+    dataflow_output: Option<crate::kernel::streams::StreamId>,
+    cancel: tokio_util::sync::CancellationToken,
+    parent: ScriptRuntimeParentContext,
+) -> Result<(String, bool), (String, bool)> {
     let mut linker = wasmtime::Linker::<ScriptRuntimeStoreData>::new(engine);
 
     // Async-required WASI linker. Pairs with `call_async`
     // below so the sub-store can host `.await`-ing imports
     // (`stream_read` / `stream_write`).
     wasmtime_wasi::p1::add_to_linker_async(&mut linker, |data| &mut data.wasi)
-        .map_err(|e| format!("WASI linker setup failed: {e}"))?;
+        .map_err(|e| (format!("WASI linker setup failed: {e}"), false))?;
 
-    imports::register_all(&mut linker)?;
+    imports::register_all(&mut linker).map_err(|e| (e, false))?;
 
     // Create WASI context (sandboxed: no filesystem, no env, no args)
     let wasi_p1 = wasmtime_wasi::WasiCtxBuilder::new().build_p1();
@@ -327,119 +380,233 @@ pub(crate) async fn run_script_runtime(
         parent_deadline: parent.deadline,
         call_result: None,
         call_error: None,
+        told_of_cancel: false,
     };
     let mut store = wasmtime::Store::new(engine, store_data);
 
-    // Apply per-invocation resource caps. The engine itself was
-    // constructed with `consume_fuel(true)`, so this just sets the
-    // budget for THIS invocation. `limiter` installs the
-    // `ResourceLimiter` impl on `ScriptRuntimeStoreData` so `memory.grow`
-    // calls are gated by `max_memory`.
-    store
-        .set_fuel(limits.fuel_budget)
-        .map_err(|e| format!("Failed to set fuel budget: {e}"))?;
-    // Yield back to tokio every ~100k fuel units. Without this, a
-    // CPU-bound guest with no host-import await points pins its tokio
-    // worker for the entire fuel budget (seconds at 1e9 units) — and
-    // the wallclock/cancellation timers that are supposed to catch it
-    // can't get polled on that worker in the meantime.
-    store
-        .fuel_async_yield_interval(Some(FUEL_ASYNC_YIELD_INTERVAL))
-        .map_err(|e| format!("Failed to set fuel yield interval: {e}"))?;
-    store.limiter(|data| data as &mut dyn wasmtime::ResourceLimiter);
+    let result: Result<String, String> = async {
+        // Apply per-invocation resource caps. The engine itself was
+        // constructed with `consume_fuel(true)`, so this just sets the
+        // budget for THIS invocation. `limiter` installs the
+        // `ResourceLimiter` impl on `ScriptRuntimeStoreData` so `memory.grow`
+        // calls are gated by `max_memory`.
+        store
+            .set_fuel(limits.fuel_budget)
+            .map_err(|e| format!("Failed to set fuel budget: {e}"))?;
+        // Yield back to tokio every ~100k fuel units. Without this, a
+        // CPU-bound guest with no host-import await points pins its tokio
+        // worker for the entire fuel budget (seconds at 1e9 units) — and
+        // the wallclock/cancellation timers that are supposed to catch it
+        // can't get polled on that worker in the meantime.
+        store
+            .fuel_async_yield_interval(Some(FUEL_ASYNC_YIELD_INTERVAL))
+            .map_err(|e| format!("Failed to set fuel yield interval: {e}"))?;
+        store.limiter(|data| data as &mut dyn wasmtime::ResourceLimiter);
 
-    // Instantiate. Memory limiter denials can fire here when the
-    // module's declared minimum memory exceeds the configured cap —
-    // surface that with the sentinel prefix too so the runtime can
-    // map it onto `KernelError::MemoryLimitExceeded`.
-    let instance = linker
-        .instantiate_async(&mut store, runtime_module)
-        .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            let chain: String = e
-                .chain()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join(" | ");
-            if msg.contains("memory minimum size")
-                || chain.contains("memory minimum size")
-                || msg.contains("memory limit")
-                || chain.contains("memory limit")
-            {
-                format!(
-                    "{SCRIPT_ERR_MEMORY} wasm linear memory exceeded {} bytes (at instantiate)",
-                    limits.max_memory_bytes,
-                )
-            } else {
-                format!("script runtime instantiation failed: {e}")
-            }
-        })?;
+        // Instantiate. Memory limiter denials can fire here when the
+        // module's declared minimum memory exceeds the configured cap —
+        // surface that with the sentinel prefix too so the runtime can
+        // map it onto `KernelError::MemoryLimitExceeded`.
+        let instance = linker
+            .instantiate_async(&mut store, runtime_module)
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                let chain: String = e
+                    .chain()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                if msg.contains("memory minimum size")
+                    || chain.contains("memory minimum size")
+                    || msg.contains("memory limit")
+                    || chain.contains("memory limit")
+                {
+                    format!(
+                        "{SCRIPT_ERR_MEMORY} wasm linear memory exceeded {} bytes (at instantiate)",
+                        limits.max_memory_bytes,
+                    )
+                } else {
+                    format!("script runtime instantiation failed: {e}")
+                }
+            })?;
 
-    // Get the alloc and execute exports
-    let alloc_fn = instance
-        .get_typed_func::<i32, i32>(&mut store, "alloc")
-        .map_err(|e| format!("No 'alloc' export: {e}"))?;
+        // Get the alloc and execute exports
+        let alloc_fn = instance
+            .get_typed_func::<i32, i32>(&mut store, "alloc")
+            .map_err(|e| format!("No 'alloc' export: {e}"))?;
 
-    let execute_fn = instance
-        .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "execute")
-        .map_err(|e| format!("No 'execute' export: {e}"))?;
+        let execute_fn = instance
+            .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "execute")
+            .map_err(|e| format!("No 'execute' export: {e}"))?;
 
-    let memory = instance
-        .get_memory(&mut store, "memory")
-        .ok_or("No 'memory' export")?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or("No 'memory' export")?;
 
-    // Allocate and write source, then args.
-    //
-    // The guest chooses the offset here — this is the host→guest
-    // direction, where the host trusts a value the *guest* returned.
-    // Every guest→host import bounds-checks its pointers
-    // (`imports::result::read_guest_slice` and friends); this
-    // direction needs the same check: a guest whose `alloc` returns
-    // -1, a huge offset, or an offset that overflows past the end of
-    // linear memory would otherwise panic the host process on the
-    // slice index below. There is no `catch_unwind` anywhere in the
-    // crate, so that panic would be a host kill, not a failed step.
-    // `write_guest_slice` makes it an ordinary step error.
-    let source_bytes = source.as_bytes();
-    let source_ptr = alloc_fn
-        .call_async(&mut store, source_bytes.len() as i32)
-        .await
-        .map_err(|e| format!("alloc source: {e}"))?;
-    write_guest_slice(&memory, &mut store, source_ptr, source_bytes, "source")?;
+        // Allocate and write source, then args.
+        //
+        // The guest chooses the offset here — this is the host→guest
+        // direction, where the host trusts a value the *guest* returned.
+        // Every guest→host import bounds-checks its pointers
+        // (`imports::result::read_guest_slice` and friends); this
+        // direction needs the same check: a guest whose `alloc` returns
+        // -1, a huge offset, or an offset that overflows past the end of
+        // linear memory would otherwise panic the host process on the
+        // slice index below. There is no `catch_unwind` anywhere in the
+        // crate, so that panic would be a host kill, not a failed step.
+        // `write_guest_slice` makes it an ordinary step error.
+        let source_bytes = source.as_bytes();
+        let source_ptr = alloc_fn
+            .call_async(&mut store, source_bytes.len() as i32)
+            .await
+            .map_err(|e| format!("alloc source: {e}"))?;
+        write_guest_slice(&memory, &mut store, source_ptr, source_bytes, "source")?;
 
-    let args_ptr = alloc_fn
-        .call_async(&mut store, args_json.len() as i32)
-        .await
-        .map_err(|e| format!("alloc args: {e}"))?;
-    write_guest_slice(&memory, &mut store, args_ptr, args_json, "args")?;
+        let args_ptr = alloc_fn
+            .call_async(&mut store, args_json.len() as i32)
+            .await
+            .map_err(|e| format!("alloc args: {e}"))?;
+        write_guest_slice(&memory, &mut store, args_ptr, args_json, "args")?;
 
-    // Call execute. Resource-cap traps get sentinel-prefixed
-    // error strings so `step_script` can map them into the structured
-    // `KernelError` variants via `ExecutionState::resource_violation`.
-    let success = execute_fn
-        .call_async(
-            &mut store,
-            (
-                source_ptr,
-                source_bytes.len() as i32,
-                args_ptr,
-                args_json.len() as i32,
-            ),
+        // Call execute. Resource-cap traps get sentinel-prefixed
+        // error strings so `step_script` can map them into the structured
+        // `KernelError` variants via `ExecutionState::resource_violation`.
+        let success = execute_fn
+            .call_async(
+                &mut store,
+                (
+                    source_ptr,
+                    source_bytes.len() as i32,
+                    args_ptr,
+                    args_json.len() as i32,
+                ),
+            )
+            .await
+            .map_err(|e| classify_runtime_trap(&e, limits))?;
+
+        if success == 1 {
+            let result = store.data().result.clone().unwrap_or_else(|| "null".into());
+            Ok(result)
+        } else {
+            let err = store
+                .data()
+                .error
+                .clone()
+                .unwrap_or_else(|| "script runtime reported an error with no message".into());
+            Err(err)
+        }
+    }
+    .await;
+    let told_of_cancel = store.data().told_of_cancel;
+    match result {
+        Ok(result) => Ok((result, told_of_cancel)),
+        Err(err) => Err((err, told_of_cancel)),
+    }
+}
+
+#[cfg(test)]
+mod told_of_cancel_tests {
+    //! The gate on reading a guest's error as its cancellation is
+    //! whether a host import told the guest about the cancel, not
+    //! whether the token has fired.
+    use super::*;
+
+    /// A guest that asks `is_cancelled` and raises if the answer is 1,
+    /// or raises unasked when `ask` is false.
+    fn raising_guest(ask: bool) -> Vec<u8> {
+        let m = crate::kernel::abi::ABI_MODULE;
+        let decide = if ask {
+            "(call $is_cancelled)"
+        } else {
+            "(i32.const 1)"
+        };
+        let wat = format!(
+            r#"
+            (module
+              (import "{m}" "host_set_result" (func $host_set_result (param i32 i32)))
+              (import "{m}" "host_set_error" (func $host_set_error (param i32 i32)))
+              (import "{m}" "is_cancelled" (func $is_cancelled (result i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 0) "null")
+              (data (i32.const 8) "guest raised")
+              (global $next (mut i32) (i32.const 32))
+              (func (export "alloc") (param $len i32) (result i32)
+                (local $ptr i32)
+                global.get $next
+                local.set $ptr
+                global.get $next
+                local.get $len
+                i32.add
+                global.set $next
+                local.get $ptr)
+              (func (export "execute") (param i32 i32 i32 i32) (result i32)
+                (if (result i32) {decide}
+                  (then (call $host_set_error (i32.const 8) (i32.const 12)) (i32.const 0))
+                  (else (call $host_set_result (i32.const 0) (i32.const 4)) (i32.const 1))))
+            )
+            "#
+        );
+        wat::parse_str(&wat).expect("wat parses")
+    }
+
+    async fn run(guest: Vec<u8>, cancel: tokio_util::sync::CancellationToken) -> ScriptOutcome {
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config).expect("engine");
+        let module = Module::new(&engine, &guest).expect("module compiles");
+        let parent = ScriptRuntimeParentContext {
+            kernel: None,
+            plugin: "p".into(),
+            config: Value::Null,
+            secret_resolver: None,
+            exec_ctx: Default::default(),
+            invoke_depth: 0,
+            deadline: None,
+        };
+        run_script_runtime(
+            &engine,
+            &module,
+            "",
+            b"{}",
+            &Default::default(),
+            &crate::kernel::RuntimeLimits::default(),
+            None,
+            cancel,
+            parent,
         )
         .await
-        .map_err(|e| classify_runtime_trap(&e, limits))?;
+    }
 
-    if success == 1 {
-        let result = store.data().result.clone().unwrap_or_else(|| "null".into());
-        Ok(result)
-    } else {
-        let err = store
-            .data()
-            .error
-            .clone()
-            .unwrap_or_else(|| "script runtime reported an error with no message".into());
-        Err(err)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_told_by_is_cancelled_that_raises_was_told() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let outcome = run(raising_guest(true), cancel).await;
+        assert_eq!(outcome.result, Err("guest raised".into()));
+        assert!(outcome.told_of_cancel);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_that_asked_under_a_quiet_token_was_not_told() {
+        let outcome = run(
+            raising_guest(true),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(outcome.result, Ok("null".into()));
+        assert!(!outcome.told_of_cancel);
+    }
+
+    /// The token has fired, but nothing told the guest: its error is
+    /// its own, and `step_script` must keep it a failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_that_raises_unasked_under_a_fired_token_was_not_told() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let outcome = run(raising_guest(false), cancel).await;
+        assert_eq!(outcome.result, Err("guest raised".into()));
+        assert!(!outcome.told_of_cancel);
     }
 }
 
@@ -584,6 +751,7 @@ mod abi_alignment_tests {
             parent_deadline: None,
             call_result: None,
             call_error: None,
+            told_of_cancel: false,
         };
         let mut store = wasmtime::Store::new(&engine, store_data);
 

@@ -11,15 +11,22 @@
 //! kernel has no dependency on any specific runtime. So the mock lives
 //! here as a test-only artifact compiled inline via [`wat::parse_str`].
 //!
-//! What the mock provides:
-//! - Three exports: `memory`, `alloc(len) -> ptr`, `execute(src_ptr,
-//!   src_len, args_ptr, args_len) -> i32`
-//! - One import: `gwead1.host_set_result(ptr, len)` — called from
-//!   `execute` to write a fixed-payload "mock-script-result" UTF-8
-//!   string back to the host
-//! - Always returns `1` from `execute` (success). Resource caps, fuel,
-//!   and host-import behaviour are NOT exercised — tests that care
-//!   about those have to use a real runtime plugin.
+//! Two mocks share the module's registration path. Both export
+//! `memory`, `alloc(len) -> ptr`, and `execute(src_ptr, src_len,
+//! args_ptr, args_len) -> i32`, and neither interprets its script
+//! source; a real language runtime lives in its own crate.
+//!
+//! - The standard mock ([`build_wasm_bytes`], what [`register`]
+//!   installs) imports only `gwead1.host_set_result`, writes a
+//!   fixed "mock-script-result" string back, and always returns `1`
+//!   (success). Resource caps and fuel are not exercised.
+//! - The write-until-refused mock
+//!   ([`build_write_until_refused_wasm_bytes`]) also imports
+//!   `stream_output`, `stream_write`, and `host_set_error`: its
+//!   `execute` writes to the step's dataflow output until the host
+//!   refuses a write, then reports how, so a test can park a real
+//!   guest inside a host import. Installed with
+//!   [`register_module_for_language`].
 //!
 //! Registration:
 //! - Compile the wat to wasm once per test via [`build_wasm_bytes`]

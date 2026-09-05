@@ -10,6 +10,9 @@
 //! - `is_cancelled() -> i32` — 1 if the parent step's cancellation
 //!   token has fired; 0 otherwise. The same token releases a
 //!   `stream_write` parked on a full channel (`STREAM_CANCELLED`).
+//!   Either answer records on the store that the guest was told
+//!   (`told_of_cancel`), which is what lets `step_script` read a
+//!   later guest error as the cancellation.
 //!
 //! Read + write are `func_wrap_async` so `.await` happens directly on
 //! the underlying channel — no `block_in_place`, no `block_on`, no
@@ -90,13 +93,17 @@ pub(super) fn register(
                     // (`STREAM_CANCELLED`); a guest parked inside this
                     // import cannot poll `is_cancelled` itself.
                     let data = caller.data();
-                    crate::kernel::streams::write_async_shared(
+                    let n = crate::kernel::streams::write_async_shared(
                         &data.streams,
                         id,
                         &buf,
                         &data.cancel,
                     )
-                    .await
+                    .await;
+                    if n == crate::kernel::streams::STREAM_CANCELLED {
+                        caller.data_mut().told_of_cancel = true;
+                    }
+                    n
                 })
             },
         )
@@ -151,8 +158,9 @@ pub(super) fn register(
         .func_wrap(
             crate::kernel::abi::ABI_MODULE,
             "is_cancelled",
-            |caller: wasmtime::Caller<'_, ScriptRuntimeStoreData>| -> i32 {
+            |mut caller: wasmtime::Caller<'_, ScriptRuntimeStoreData>| -> i32 {
                 if caller.data().cancel.is_cancelled() {
+                    caller.data_mut().told_of_cancel = true;
                     1
                 } else {
                     0

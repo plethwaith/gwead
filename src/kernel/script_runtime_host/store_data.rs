@@ -54,6 +54,14 @@ pub(super) struct ScriptRuntimeStoreData {
     /// a never-cancelled token for invocations without a real
     /// cancellation surface.
     pub(super) cancel: tokio_util::sync::CancellationToken,
+    /// Whether a host import has told the guest its step was
+    /// cancelled: `is_cancelled` answered 1, or a `stream_write`
+    /// returned `STREAM_CANCELLED`. A guest has no typed cancellation
+    /// of its own, so `step_script` reads a script error from a guest
+    /// that was told as the cancellation surfacing through the guest's
+    /// error idiom — and only then; a guest that never heard of the
+    /// cancel keeps its own failure.
+    pub(super) told_of_cancel: bool,
     // ── Recurse-into-kernel support ─────────────────────────────
     //
     // Snapshotted from the parent action's `ExecutionState` at sub-instance
