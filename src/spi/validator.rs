@@ -11,6 +11,15 @@
 //!   intentional — but it also means load order decides whether a
 //!   contract is ever checked. Embedders that want contracts enforced
 //!   must register SPI defs before dependent plugins.
+//! - **Informational (reported, not warned about):** an action the
+//!   plugin provides beyond what its role requires
+//!   ([`ValidationWarning::ExtraAction`]). A role contract is a floor,
+//!   not a ceiling — a provider with private helper actions dispatched
+//!   from the role action is the normal shape — so the kernel logs
+//!   these at DEBUG and leaves the WARN level to findings the plugin
+//!   author is meant to act on. Tooling that wants the full list still
+//!   gets it from [`ValidationResult::warnings`]; see
+//!   [`ValidationWarning::is_informational`].
 
 use super::definition::SpiDefinition;
 use super::loader::SpiRegistry;
@@ -38,7 +47,13 @@ pub enum ValidationError {
     MissingAction { role: String, action: String },
 }
 
-/// A validation warning — the plugin can be loaded but something is off.
+/// A validation warning — the plugin can be loaded, but the validator
+/// noticed something worth reporting.
+///
+/// Not every variant is a problem. [`Self::is_informational`] separates
+/// the ones that may need the plugin author's attention from the ones
+/// that merely describe the plugin; the kernel logs the former at WARN
+/// and the latter at DEBUG.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ValidationWarning {
@@ -46,8 +61,30 @@ pub enum ValidationWarning {
     /// Could be a custom role — warn but don't fail.
     UnknownRole { role: String },
     /// Plugin provides actions beyond what the SPI requires.
-    /// Not an error — plugins can extend the contract.
+    /// Not an error, and not a mistake either — a role contract says
+    /// what a plugin must provide, and providing more (private helper
+    /// actions, extensions) is how plugins are expected to be built.
+    /// Informational: see [`Self::is_informational`].
     ExtraAction { role: String, action: String },
+}
+
+impl ValidationWarning {
+    /// Whether this warning only describes the plugin, as opposed to
+    /// pointing at something its author may need to change.
+    ///
+    /// An informational warning has no fix attached: the plugin is doing
+    /// what the SPI intends and there is nothing to act on. The kernel
+    /// logs informational warnings at DEBUG so that the WARN level stays
+    /// reserved for findings that can be a misconfiguration (an
+    /// [`UnknownRole`](Self::UnknownRole) claimed by a plugin loaded
+    /// before its SPI, say). The validator still returns them, so tooling
+    /// that wants to list a plugin's extensions can.
+    pub fn is_informational(&self) -> bool {
+        match self {
+            ValidationWarning::UnknownRole { .. } => false,
+            ValidationWarning::ExtraAction { .. } => true,
+        }
+    }
 }
 
 impl std::fmt::Display for ValidationError {
@@ -112,7 +149,7 @@ pub fn validate_manifest(
 }
 
 /// Check that the plugin provides all actions required by the SPI,
-/// and warn about any extra actions not in the SPI.
+/// and report any extra actions not in the SPI.
 fn check_actions(
     manifest: &PluginManifest,
     role: &str,
@@ -137,7 +174,9 @@ fn check_actions(
         }
     }
 
-    // Warn about extra actions (not in SPI — could be intentional extensions)
+    // Report extra actions (not in SPI). These are informational —
+    // extending a role is intentional by construction — and the kernel
+    // logs them at DEBUG; see `ValidationWarning::is_informational`.
     for manifest_action_name in manifest.actions.keys() {
         if !spi.actions.contains_key(manifest_action_name) {
             warnings.push(ValidationWarning::ExtraAction {
@@ -295,6 +334,30 @@ mod tests {
         assert_eq!(result.warnings.len(), 1);
         assert!(
             matches!(&result.warnings[0], ValidationWarning::ExtraAction { action, .. } if action == "suggest")
+        );
+    }
+
+    /// The policy the kernel's registration log follows: an extra action
+    /// is informational (DEBUG), an unknown role is not (WARN). Pinned
+    /// per variant so that adding a variant, or flipping one, has to
+    /// state its level here.
+    #[test]
+    fn extra_action_is_informational_and_unknown_role_is_not() {
+        let extra = ValidationWarning::ExtraAction {
+            role: "METADATA_PROVIDER".to_string(),
+            action: "suggest".to_string(),
+        };
+        assert!(
+            extra.is_informational(),
+            "an action beyond the role contract is not something to act on"
+        );
+
+        let unknown = ValidationWarning::UnknownRole {
+            role: "CUSTOM_THING".to_string(),
+        };
+        assert!(
+            !unknown.is_informational(),
+            "a role with no SPI definition may be a load-order or naming mistake"
         );
     }
 

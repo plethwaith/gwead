@@ -19,6 +19,10 @@
 //! - A plugin that claims a role the kernel has never heard of is
 //!   **warned about and accepted** — the embedder may legitimately
 //!   register the SPI later, or never.
+//! - A plugin that provides *more* actions than its role requires is
+//!   **accepted and noted at DEBUG**. A contract is a floor; helper
+//!   actions alongside the role's are the normal shape of a provider,
+//!   not a finding.
 //!
 //! That second case makes load order matter, and it is not re-checked:
 //! register the SPI *before* the plugins that claim its role, or a

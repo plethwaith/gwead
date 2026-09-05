@@ -2241,10 +2241,18 @@ impl Kernel {
         }
 
         // Validate against SPI definitions: a registered contract is
-        // enforced, an unknown role only warns.
+        // enforced, an unknown role only warns, and an action provided
+        // beyond the role contract is merely noted. The warning type
+        // owns that last distinction (`ValidationWarning::is_informational`)
+        // so the level a finding lands at is decided next to its
+        // definition rather than here.
         let validation = validator::validate_manifest(&manifest, namespace, &self.spi_registry);
         for warning in &validation.warnings {
-            tracing::warn!(plugin = %plugin_name, "{warning}");
+            if warning.is_informational() {
+                tracing::debug!(plugin = %plugin_name, "{warning}");
+            } else {
+                tracing::warn!(plugin = %plugin_name, "{warning}");
+            }
         }
         if !validation.is_valid() {
             let errors: Vec<String> = validation.errors.iter().map(|e| e.to_string()).collect();
