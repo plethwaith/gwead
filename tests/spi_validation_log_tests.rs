@@ -3,86 +3,82 @@
 //!
 //! The validator's return value is covered by its own unit tests; these
 //! pin the *level* each finding reaches the log at, because that is
-//! what an operator sees. A plugin that provides an action beyond what
-//! its role requires is doing exactly what the SPI intends, so it is
-//! noted at DEBUG. A plugin claiming a role no SPI has been registered
-//! for may be a misconfiguration, so it stays at WARN — and it doubles
-//! as the positive control proving the capture below sees WARN lines.
+//! what an operator sees. A plugin that provides actions beyond what
+//! its roles name is doing exactly what the SPI intends, so it is noted
+//! at DEBUG. A plugin claiming a role no SPI has been registered for
+//! may be a misconfiguration, so it stays at WARN — and it doubles as
+//! the positive control proving the recorder below sees WARN events.
 
-use std::io;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use gwead::kernel::types::{Action, PluginManifest, StepDef};
 use gwead::kernel::{Kernel, KernelConfig};
 use indexmap::IndexMap;
 use serde_json::json;
-use tracing_subscriber::fmt::MakeWriter;
+use tracing::Level;
+use tracing::field::{Field, Visit};
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
 mod common;
 
 // ---------------------------------------------------------------------------
-// Log capture
+// Event recording
 // ---------------------------------------------------------------------------
 
-/// A `MakeWriter` that appends every formatted event to a shared buffer,
-/// so a test can install a subscriber for the duration of a registration
-/// and read back what was logged, level and all.
+/// One recorded event: its level, its message, and its other fields
+/// rendered with `Debug`, so a test can look at what was logged without
+/// depending on how a formatter would have laid it out.
+#[derive(Debug)]
+struct Recorded {
+    level: Level,
+    message: String,
+    fields: Vec<(&'static str, String)>,
+}
+
+impl Recorded {
+    fn field(&self, name: &str) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+impl Visit for Recorded {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            name => self.fields.push((name, format!("{value:?}"))),
+        }
+    }
+}
+
+/// A `Layer` that keeps every event it sees.
 #[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<u8>>>);
+struct Recorder(Arc<Mutex<Vec<Recorded>>>);
 
-impl Capture {
-    fn lines(&self) -> Vec<String> {
-        String::from_utf8(self.0.lock().unwrap().clone())
-            .expect("fmt output is UTF-8")
-            .lines()
-            .map(str::to_string)
-            .collect()
+impl<S: tracing::Subscriber> Layer<S> for Recorder {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let mut recorded = Recorded {
+            level: *event.metadata().level(),
+            message: String::new(),
+            fields: Vec::new(),
+        };
+        event.record(&mut recorded);
+        self.0.lock().unwrap().push(recorded);
     }
 }
 
-struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
-
-impl io::Write for CaptureWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for Capture {
-    type Writer = CaptureWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        CaptureWriter(Arc::clone(&self.0))
-    }
-}
-
-/// Run `f` with every `gwead` event down to TRACE captured, and return
-/// the formatted lines. The subscriber is installed as the thread-local
-/// default, which overrides any global one another test installed;
-/// `register_plugin` logs on the calling thread, so nothing escapes.
-fn capture_logs(f: impl FnOnce()) -> Vec<String> {
-    let capture = Capture::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(capture.clone())
-        .with_max_level(tracing::Level::TRACE)
-        .with_ansi(false)
-        .without_time()
-        .finish();
+/// Run `f` with every event recorded, and return them in order. The
+/// subscriber is installed as the thread-local default, which overrides
+/// any global one another test installed; `register_plugin` logs on the
+/// calling thread, so nothing escapes.
+fn record_events(f: impl FnOnce()) -> Vec<Recorded> {
+    let recorder = Recorder::default();
+    let subscriber = tracing_subscriber::registry().with(recorder.clone());
     tracing::subscriber::with_default(subscriber, f);
-    capture.lines()
-}
-
-/// The level a formatted line was emitted at: `fmt` puts it first once
-/// timestamps are off.
-fn level_of(line: &str) -> &str {
-    line.split_whitespace()
-        .next()
-        .expect("a log line names its level")
+    std::mem::take(&mut *recorder.0.lock().unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -122,8 +118,14 @@ fn manifest(name: &str, roles: &[&str], action_names: &[&str]) -> PluginManifest
     m
 }
 
-fn lines_mentioning<'a>(lines: &'a [String], needle: &str) -> Vec<&'a String> {
-    lines.iter().filter(|l| l.contains(needle)).collect()
+/// Events that mention `needle` anywhere: in the message or a field.
+/// Deliberately broad — the kernel's own "Plugin registered" event lists
+/// the plugin's actions too, and a level check has to cover it.
+fn mentioning<'a>(events: &'a [Recorded], needle: &str) -> Vec<&'a Recorded> {
+    events
+        .iter()
+        .filter(|e| e.message.contains(needle) || e.fields.iter().any(|(_, v)| v.contains(needle)))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -132,12 +134,13 @@ fn lines_mentioning<'a>(lines: &'a [String], needle: &str) -> Vec<&'a String> {
 
 /// Issue #2: a provider with helper actions beyond its role used to
 /// produce one WARN per extra action on every boot, with nothing for
-/// the author to change. The finding is still made — it reaches the
-/// log — but at DEBUG.
+/// the author to change. The extras still reach the log — once per
+/// plugin, listed together — but at DEBUG, and no WARN so much as
+/// mentions them.
 #[test]
-fn extra_action_is_logged_at_debug_not_warn() {
+fn extra_actions_are_logged_once_at_debug_and_never_warned_about() {
     let mut kernel = boot();
-    let lines = capture_logs(|| {
+    let events = record_events(|| {
         kernel
             .register_plugin(manifest(
                 "extended_mp",
@@ -147,49 +150,61 @@ fn extra_action_is_logged_at_debug_not_warn() {
             .expect("extra actions do not fail registration");
     });
 
+    let noted: Vec<&Recorded> = events
+        .iter()
+        .filter(|e| e.field("extra_actions").is_some())
+        .collect();
+    assert_eq!(
+        noted.len(),
+        1,
+        "the extras are reported in exactly one event; got {events:#?}"
+    );
+    let noted = noted[0];
+    assert_eq!(
+        noted.level,
+        Level::DEBUG,
+        "extras are informational: {noted:?}"
+    );
+    assert_eq!(noted.field("plugin"), Some("extended_mp"));
+    assert_eq!(
+        noted.field("extra_actions"),
+        Some(r#"["fetch_buffered", "fetch_streamed"]"#),
+        "both extras, in manifest order, on the one event: {noted:?}"
+    );
+
     for extra in ["fetch_buffered", "fetch_streamed"] {
-        let needle = format!("Plugin provides action '{extra}' not declared in SPI '{ROLE}'");
-        let mentions = lines_mentioning(&lines, &needle);
-        assert_eq!(
-            mentions.len(),
-            1,
-            "the extra action '{extra}' is reported exactly once; got {lines:#?}"
-        );
-        assert_eq!(
-            level_of(mentions[0]),
-            "DEBUG",
-            "an extra action is informational: {}",
-            mentions[0]
+        assert!(
+            mentioning(&events, extra)
+                .iter()
+                .all(|e| e.level > Level::WARN),
+            "no WARN or ERROR mentions '{extra}'; got {events:#?}"
         );
     }
-    assert!(
-        !lines.iter().any(|l| level_of(l) == "WARN"),
-        "a plugin extending its role has nothing to warn about; got {lines:#?}"
-    );
 }
 
-/// Positive control for the test above, and the contract the demotion
+/// Positive control for the test above, and the contract the change
 /// leaves alone: an unknown role can be a real misconfiguration, so it
-/// still lands at WARN — which also proves the capture sees WARN lines.
+/// still lands at WARN — which also proves the recorder sees WARN.
 #[test]
 fn unknown_role_is_still_logged_at_warn() {
     let mut kernel = boot();
-    let lines = capture_logs(|| {
+    let events = record_events(|| {
         kernel
             .register_plugin(manifest("custom_plugin", &["CUSTOM_THING"], &["do_stuff"]))
             .expect("an unknown role does not fail registration");
     });
 
-    let mentions = lines_mentioning(&lines, "Unknown SPI role 'CUSTOM_THING'");
+    let warned = mentioning(&events, "Unknown SPI role 'CUSTOM_THING'");
     assert_eq!(
-        mentions.len(),
+        warned.len(),
         1,
-        "the unknown role is reported exactly once; got {lines:#?}"
+        "the unknown role is reported exactly once; got {events:#?}"
     );
     assert_eq!(
-        level_of(mentions[0]),
-        "WARN",
-        "an unknown role may need the author's attention: {}",
-        mentions[0]
+        warned[0].level,
+        Level::WARN,
+        "an unknown role may need the author's attention: {:?}",
+        warned[0]
     );
+    assert_eq!(warned[0].field("plugin"), Some("custom_plugin"));
 }

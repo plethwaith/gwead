@@ -11,15 +11,12 @@
 //!   intentional — but it also means load order decides whether a
 //!   contract is ever checked. Embedders that want contracts enforced
 //!   must register SPI defs before dependent plugins.
-//! - **Informational (reported, not warned about):** an action the
-//!   plugin provides beyond what its role requires
-//!   ([`ValidationWarning::ExtraAction`]). A role contract is a floor,
-//!   not a ceiling — a provider with private helper actions dispatched
-//!   from the role action is the normal shape — so the kernel logs
-//!   these at DEBUG and leaves the WARN level to findings the plugin
-//!   author is meant to act on. Tooling that wants the full list still
-//!   gets it from [`ValidationResult::warnings`]; see
-//!   [`ValidationWarning::is_informational`].
+//! - **Informational (reported, not a finding):** actions the plugin
+//!   provides that no resolved role names
+//!   ([`ValidationResult::extra_actions`]). A role contract is a floor,
+//!   not a ceiling, so these are neither errors nor warnings; they are
+//!   returned for tooling that wants them and the kernel notes them at
+//!   DEBUG.
 
 use super::definition::SpiDefinition;
 use super::loader::SpiRegistry;
@@ -31,6 +28,29 @@ pub struct ValidationResult {
     pub plugin_name: String,
     pub errors: Vec<ValidationError>,
     pub warnings: Vec<ValidationWarning>,
+    /// Actions the plugin provides that none of its *resolved* roles
+    /// names, required or optional, in manifest order.
+    ///
+    /// Not a finding: a role contract says what a plugin must provide,
+    /// and a provider whose role action dispatches to private helper
+    /// actions is the normal shape, not a mistake. Nothing here needs
+    /// changing, so the kernel logs the list at DEBUG rather than WARN.
+    ///
+    /// Computed against the union of every role that resolved, so a
+    /// plugin claiming two roles and providing exactly their actions
+    /// has nothing here. A role with no SPI definition contributes no
+    /// contract: its actions land here alongside the
+    /// [`UnknownRole`](ValidationWarning::UnknownRole) warning. Empty
+    /// when no role resolved, since there is then nothing to compare
+    /// against.
+    ///
+    /// One case this cannot tell apart: a misspelled *optional* action.
+    /// An optional action may be omitted, so a typo is not a
+    /// [`MissingAction`](ValidationError::MissingAction); the misspelt
+    /// name simply appears here, and the plugin is found wanting at
+    /// runtime instead. Tooling holding both this list and the SPI
+    /// definition can flag near misses; the validator does not guess.
+    pub extra_actions: Vec<String>,
 }
 
 impl ValidationResult {
@@ -47,44 +67,16 @@ pub enum ValidationError {
     MissingAction { role: String, action: String },
 }
 
-/// A validation warning — the plugin can be loaded, but the validator
-/// noticed something worth reporting.
-///
-/// Not every variant is a problem. [`Self::is_informational`] separates
-/// the ones that may need the plugin author's attention from the ones
-/// that merely describe the plugin; the kernel logs the former at WARN
-/// and the latter at DEBUG.
+/// A validation warning — the plugin can be loaded but something may
+/// need the author's attention. Every variant is logged at WARN;
+/// anything that is merely descriptive belongs on [`ValidationResult`]
+/// as its own field (see [`ValidationResult::extra_actions`]), not here.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ValidationWarning {
     /// Plugin claims a role that has no known SPI definition.
     /// Could be a custom role — warn but don't fail.
     UnknownRole { role: String },
-    /// Plugin provides actions beyond what the SPI requires.
-    /// Not an error, and not a mistake either — a role contract says
-    /// what a plugin must provide, and providing more (private helper
-    /// actions, extensions) is how plugins are expected to be built.
-    /// Informational: see [`Self::is_informational`].
-    ExtraAction { role: String, action: String },
-}
-
-impl ValidationWarning {
-    /// Whether this warning only describes the plugin, as opposed to
-    /// pointing at something its author may need to change.
-    ///
-    /// An informational warning has no fix attached: the plugin is doing
-    /// what the SPI intends and there is nothing to act on. The kernel
-    /// logs informational warnings at DEBUG so that the WARN level stays
-    /// reserved for findings that can be a misconfiguration (an
-    /// [`UnknownRole`](Self::UnknownRole) claimed by a plugin loaded
-    /// before its SPI, say). The validator still returns them, so tooling
-    /// that wants to list a plugin's extensions can.
-    pub fn is_informational(&self) -> bool {
-        match self {
-            ValidationWarning::UnknownRole { .. } => false,
-            ValidationWarning::ExtraAction { .. } => true,
-        }
-    }
 }
 
 impl std::fmt::Display for ValidationError {
@@ -106,12 +98,6 @@ impl std::fmt::Display for ValidationWarning {
             ValidationWarning::UnknownRole { role } => {
                 write!(f, "Unknown SPI role '{role}' — no definition found")
             }
-            ValidationWarning::ExtraAction { role, action } => {
-                write!(
-                    f,
-                    "Plugin provides action '{action}' not declared in SPI '{role}'"
-                )
-            }
         }
     }
 }
@@ -129,11 +115,13 @@ pub fn validate_manifest(
 ) -> ValidationResult {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
+    let mut resolved = Vec::new();
 
     for role in &manifest.roles {
         match registry.resolve(namespace, role) {
             Some((_, spi)) => {
-                check_actions(manifest, role, spi, &mut errors, &mut warnings);
+                check_required_actions(manifest, role, spi, &mut errors);
+                resolved.push(spi);
             }
             None => {
                 warnings.push(ValidationWarning::UnknownRole { role: role.clone() });
@@ -145,23 +133,21 @@ pub fn validate_manifest(
         plugin_name: manifest.name.clone(),
         errors,
         warnings,
+        extra_actions: extra_actions(manifest, &resolved),
     }
 }
 
-/// Check that the plugin provides all actions required by the SPI,
-/// and report any extra actions not in the SPI.
-fn check_actions(
+/// Check that the plugin provides every action the SPI requires.
+fn check_required_actions(
     manifest: &PluginManifest,
     role: &str,
     spi: &SpiDefinition,
     errors: &mut Vec<ValidationError>,
-    warnings: &mut Vec<ValidationWarning>,
 ) {
-    // Check required actions are present. Actions marked `optional: true`
-    // in the SPI definition may be omitted by plugins — this is how
-    // additive minor-version extensions (an action added in a later
-    // minor revision of a role) stay backward-compatible with 1.0
-    // plugins.
+    // Actions marked `optional: true` in the SPI definition may be
+    // omitted by plugins — this is how additive minor-version extensions
+    // (an action added in a later minor revision of a role) stay
+    // backward-compatible with 1.0 plugins.
     for (spi_action_name, spi_action) in &spi.actions {
         if spi_action.optional {
             continue;
@@ -173,18 +159,24 @@ fn check_actions(
             });
         }
     }
+}
 
-    // Report extra actions (not in SPI). These are informational —
-    // extending a role is intentional by construction — and the kernel
-    // logs them at DEBUG; see `ValidationWarning::is_informational`.
-    for manifest_action_name in manifest.actions.keys() {
-        if !spi.actions.contains_key(manifest_action_name) {
-            warnings.push(ValidationWarning::ExtraAction {
-                role: role.to_string(),
-                action: manifest_action_name.clone(),
-            });
-        }
+/// The plugin's actions that none of `resolved` names — the contract
+/// is the union of every resolved role, not any one of them, so a
+/// multi-role plugin is not charged one role's actions as extras of
+/// another. Empty when nothing resolved: there is no contract to
+/// compare against, and a roleless plugin's actions are simply its
+/// actions.
+fn extra_actions(manifest: &PluginManifest, resolved: &[&SpiDefinition]) -> Vec<String> {
+    if resolved.is_empty() {
+        return Vec::new();
     }
+    manifest
+        .actions
+        .keys()
+        .filter(|name| !resolved.iter().any(|spi| spi.actions.contains_key(*name)))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -291,6 +283,7 @@ mod tests {
         let result = validate_manifest(&m, "", &registry);
         assert!(result.is_valid(), "Errors: {:?}", result.errors);
         assert!(result.warnings.is_empty());
+        assert!(result.extra_actions.is_empty());
     }
 
     #[test]
@@ -321,44 +314,100 @@ mod tests {
         );
     }
 
+    /// An action beyond the role contract is reported, in manifest
+    /// order, and is neither an error nor a warning.
     #[test]
-    fn extra_action_is_warning() {
+    fn extra_action_is_reported_not_warned() {
         let registry = test_registry();
         let m = manifest(
             "extended_mp",
             &["METADATA_PROVIDER"],
-            &["search", "fetch", "suggest"],
+            &["search", "suggest", "fetch", "fetch_streamed"],
+        );
+        let result = validate_manifest(&m, "", &registry);
+        assert!(result.is_valid());
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.extra_actions, ["suggest", "fetch_streamed"]);
+    }
+
+    /// Extras are judged against the union of the plugin's resolved
+    /// roles. Per-role bookkeeping would charge `embed` as an extra of
+    /// LLM_CHAT and `chat` as an extra of EMBEDDING_PROVIDER, which is
+    /// what the validator used to do.
+    #[test]
+    fn multi_role_plugin_providing_exactly_its_contracts_has_no_extras() {
+        let registry = test_registry();
+        let m = manifest(
+            "multi_role",
+            &["LLM_CHAT", "EMBEDDING_PROVIDER"],
+            &["chat", "embed"],
+        );
+        let result = validate_manifest(&m, "", &registry);
+        assert!(result.is_valid(), "Errors: {:?}", result.errors);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(
+            result.extra_actions.is_empty(),
+            "one role's action is not another role's extra: {:?}",
+            result.extra_actions
+        );
+    }
+
+    /// A multi-role plugin's genuine extras are still found — the union
+    /// is a wider contract, not a blanket pass.
+    #[test]
+    fn multi_role_plugin_still_reports_actions_outside_every_contract() {
+        let registry = test_registry();
+        let m = manifest(
+            "multi_role_extended",
+            &["LLM_CHAT", "EMBEDDING_PROVIDER"],
+            &["chat", "embed", "tokenize"],
+        );
+        let result = validate_manifest(&m, "", &registry);
+        assert!(result.is_valid(), "Errors: {:?}", result.errors);
+        assert_eq!(result.extra_actions, ["tokenize"]);
+    }
+
+    /// An unknown role has no contract to contribute, so its actions
+    /// count as extras of the roles that did resolve. The `UnknownRole`
+    /// warning alongside says why.
+    #[test]
+    fn unknown_role_contributes_no_contract_to_extras() {
+        let registry = test_registry();
+        let m = manifest(
+            "half_known",
+            &["LLM_CHAT", "CUSTOM_THING"],
+            &["chat", "do_stuff"],
         );
         let result = validate_manifest(&m, "", &registry);
         assert!(result.is_valid());
         assert_eq!(result.warnings.len(), 1);
-        assert!(
-            matches!(&result.warnings[0], ValidationWarning::ExtraAction { action, .. } if action == "suggest")
-        );
+        assert_eq!(result.extra_actions, ["do_stuff"]);
     }
 
-    /// The policy the kernel's registration log follows: an extra action
-    /// is informational (DEBUG), an unknown role is not (WARN). Pinned
-    /// per variant so that adding a variant, or flipping one, has to
-    /// state its level here.
+    /// The documented blind spot: an optional action may be omitted, so
+    /// misspelling it is not a missing action. The misspelt name shows
+    /// up as an extra, and only there.
     #[test]
-    fn extra_action_is_informational_and_unknown_role_is_not() {
-        let extra = ValidationWarning::ExtraAction {
-            role: "METADATA_PROVIDER".to_string(),
-            action: "suggest".to_string(),
-        };
-        assert!(
-            extra.is_informational(),
-            "an action beyond the role contract is not something to act on"
-        );
-
-        let unknown = ValidationWarning::UnknownRole {
-            role: "CUSTOM_THING".to_string(),
-        };
-        assert!(
-            !unknown.is_informational(),
-            "a role with no SPI definition may be a load-order or naming mistake"
-        );
+    fn misspelled_optional_action_is_an_extra_not_an_error() {
+        let mut registry = test_registry();
+        registry
+            .register(
+                "SUMMARIZER",
+                r#"{
+                    "name": "SUMMARIZER",
+                    "version": "1.1",
+                    "actions": {
+                        "summarize": {"input": {"type": "object"}, "output": {"type": "object"}},
+                        "outline": {"input": {"type": "object"}, "output": {"type": "object"}, "optional": true}
+                    }
+                }"#,
+            )
+            .unwrap();
+        let m = manifest("typo", &["SUMMARIZER"], &["summarize", "outlien"]);
+        let result = validate_manifest(&m, "", &registry);
+        assert!(result.is_valid(), "Errors: {:?}", result.errors);
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.extra_actions, ["outlien"]);
     }
 
     #[test]
@@ -368,19 +417,10 @@ mod tests {
         let result = validate_manifest(&m, "", &registry);
         assert!(result.is_valid());
         assert!(result.warnings.is_empty());
-    }
-
-    #[test]
-    fn multiple_roles_validated_independently() {
-        let registry = test_registry();
-        // Plugin claims both LLM_CHAT (needs "chat") and EMBEDDING_PROVIDER (needs "embed")
-        let m = manifest(
-            "multi_role",
-            &["LLM_CHAT", "EMBEDDING_PROVIDER"],
-            &["chat", "embed"],
+        assert!(
+            result.extra_actions.is_empty(),
+            "no contract, so nothing is extra"
         );
-        let result = validate_manifest(&m, "", &registry);
-        assert!(result.is_valid(), "Errors: {:?}", result.errors);
     }
 
     #[test]
