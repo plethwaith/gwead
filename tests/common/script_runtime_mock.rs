@@ -17,9 +17,11 @@
 //! - One import: `gwead1.host_set_result(ptr, len)` — called from
 //!   `execute` to write a fixed-payload "mock-script-result" UTF-8
 //!   string back to the host
-//! - Always returns `1` from `execute` (success). Resource caps, fuel,
-//!   and host-import behaviour are NOT exercised — tests that care
-//!   about those have to use a real runtime plugin.
+//! - Always returns `1` from `execute` (success). Host-import
+//!   behaviour is NOT exercised — tests that care about that have to
+//!   use a real runtime plugin. Two twins trip the resource caps: one
+//!   spins until the fuel meter traps, one declares more memory than
+//!   the cap allows and fails to instantiate.
 //!
 //! Registration:
 //! - Compile the wat to wasm once per test via [`build_wasm_bytes`]
@@ -33,7 +35,8 @@
 //!   the permission itself; [`trusting`] supplies the other half.
 //! - Use [`register`] to plug it into that kernel under
 //!   `(script, "lua")` (default) or [`register_for_language`] for a
-//!   different selector value
+//!   different selector value; [`register_spinning_for_language`] and
+//!   [`register_hungry_for_language`] plug in the twins
 //!
 //! This is the only piece of the test stack that knows the wasm ABI
 //! shape; a real runtime lives in its own crate.
@@ -86,10 +89,69 @@ const MOCK_WAT: &str = r#"
 )
 "#;
 
+/// A twin of [`MOCK_WAT`] whose `execute` never returns: it spins
+/// until the fuel meter traps. The one way a test can trip
+/// `RuntimeLimits::fuel_budget` without a real runtime.
+const SPINNING_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (global $next (mut i32) (i32.const 32))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    global.get $next
+    local.set $ptr
+    global.get $next
+    local.get $len
+    i32.add
+    global.set $next
+    local.get $ptr)
+  (func (export "execute") (param $src_ptr i32) (param $src_len i32)
+                           (param $args_ptr i32) (param $args_len i32)
+                           (result i32)
+    (loop $spin br $spin)
+    i32.const 1)
+)
+"#;
+
+/// A twin whose declared memory minimum (64 pages, 4 MiB) exceeds a
+/// small `RuntimeLimits::max_memory_bytes`, so the limiter denies it
+/// at instantiation. The one way a test can trip the memory cap
+/// without a real runtime: a `memory.grow` denial hands the module
+/// `-1` rather than trapping, so a growing module could only spin.
+const HUNGRY_WAT: &str = r#"
+(module
+  (memory (export "memory") 64)
+  (global $next (mut i32) (i32.const 32))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    global.get $next
+    local.set $ptr
+    global.get $next
+    local.get $len
+    i32.add
+    global.set $next
+    local.get $ptr)
+  (func (export "execute") (param $src_ptr i32) (param $src_len i32)
+                           (param $args_ptr i32) (param $args_len i32)
+                           (result i32)
+    i32.const 1)
+)
+"#;
+
 /// Compile the mock wat → wasm bytes. Caching is unnecessary —
 /// compilation is fast and each test typically calls this once.
 pub fn build_wasm_bytes() -> Vec<u8> {
     wat::parse_str(MOCK_WAT).expect("mock script-runtime wat parses")
+}
+
+/// Compile the spinning twin — see [`SPINNING_WAT`].
+pub fn build_spinning_wasm_bytes() -> Vec<u8> {
+    wat::parse_str(SPINNING_WAT).expect("spinning script-runtime wat parses")
+}
+
+/// Compile the memory-hungry twin — see [`HUNGRY_WAT`].
+pub fn build_hungry_wasm_bytes() -> Vec<u8> {
+    wat::parse_str(HUNGRY_WAT).expect("hungry script-runtime wat parses")
 }
 
 /// The plugin name the mock registers under for `language`. Tests
@@ -119,8 +181,34 @@ pub fn register(kernel: &mut Kernel) -> Result<(), KernelError> {
 /// Register the mock as the `(script, language)` impl. Lets tests that
 /// validate selector dispatch route a non-`"lua"` value too.
 pub fn register_for_language(kernel: &mut Kernel, language: &str) -> Result<(), KernelError> {
+    register_module_for_language(kernel, language, build_wasm_bytes())
+}
+
+/// Register the spinning twin as the `(script, language)` impl. A
+/// `script` step of that language runs until it exhausts its fuel.
+pub fn register_spinning_for_language(
+    kernel: &mut Kernel,
+    language: &str,
+) -> Result<(), KernelError> {
+    register_module_for_language(kernel, language, build_spinning_wasm_bytes())
+}
+
+/// Register the memory-hungry twin as the `(script, language)` impl.
+/// A `script` step of that language fails to instantiate under a
+/// `max_memory_bytes` below 4 MiB.
+pub fn register_hungry_for_language(
+    kernel: &mut Kernel,
+    language: &str,
+) -> Result<(), KernelError> {
+    register_module_for_language(kernel, language, build_hungry_wasm_bytes())
+}
+
+fn register_module_for_language(
+    kernel: &mut Kernel,
+    language: &str,
+    wasm_bytes: Vec<u8>,
+) -> Result<(), KernelError> {
     use base64::Engine as _;
-    let wasm_bytes = build_wasm_bytes();
     let base64_bytes = base64::engine::general_purpose::STANDARD.encode(&wasm_bytes);
     let manifest = serde_json::json!({
         "name": plugin_name(language),

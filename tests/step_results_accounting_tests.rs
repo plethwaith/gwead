@@ -24,7 +24,7 @@
 //! budget. The merges route through the same charging funnel, the
 //! accumulator is charged as it grows, and the width is capped.
 
-use gwead::kernel::{Kernel, KernelConfig, RuntimeLimits};
+use gwead::kernel::{DataflowEvent, Kernel, KernelConfig, RuntimeLimits};
 use serde_json::{Value, json};
 
 const MIB: usize = 1024 * 1024;
@@ -70,6 +70,143 @@ async fn parallel_branches_are_charged_when_they_merge() {
     .await
     .expect_err("18 MiB of branch results do not fit in 8 MiB");
     assert!(err.contains("Step results exceeded"), "{err}");
+}
+
+/// The wave scheduler (`parallelWaves`) is the third join, and with
+/// the dataflow scheduler's one of the two outside `run_step` — only
+/// the `parallel` join sits inside it. Two independent steps share a wave;
+/// each fits an 8 MiB budget in its own fork and the merged total does
+/// not. Without the check after the merge the action resolves `Ok`
+/// with the second result missing.
+#[tokio::test(flavor = "multi_thread")]
+async fn wave_tasks_are_charged_when_they_merge() {
+    let manifest = json!({
+        "name": "p",
+        "actions": {"go": {
+            "parallelWaves": true,
+            "steps": [
+                {"id": "a", "type": "let", "params": {"value": "x".repeat(5 * MIB)}},
+                {"id": "b", "type": "let", "params": {"value": "y".repeat(5 * MIB)}}
+            ],
+            "resultMapping": {"out": {"path": "$", "source": "b"}}
+        }}
+    })
+    .to_string();
+
+    let err = run(
+        &manifest,
+        RuntimeLimits::default().with_max_step_results_bytes(8 * MIB),
+    )
+    .await
+    .expect_err("10 MiB of merged wave results do not fit in 8 MiB");
+    assert!(err.contains("Step results exceeded"), "{err}");
+}
+
+/// The dataflow scheduler merges through the same funnel and must
+/// raise the same refusal. Two independent steps each fit an 8 MiB
+/// budget in their own forks; their merged total does not. A join that
+/// merged the second and carried on would resolve the pipeline `Ok`
+/// with that step's result missing. (The tiny long-running `let` is
+/// what makes the action a dataflow one.)
+#[tokio::test(flavor = "multi_thread")]
+async fn dataflow_tasks_are_charged_when_they_merge() {
+    let manifest = json!({
+        "name": "p",
+        "actions": {"go": {
+            "dataflow": true,
+            "steps": [
+                {"id": "prod", "type": "let", "params": {"value": "p"}, "longRunning": true},
+                {"id": "a", "type": "let", "params": {"value": "x".repeat(5 * MIB)}},
+                {"id": "b", "type": "let", "params": {"value": "y".repeat(5 * MIB)}}
+            ],
+            "resultMapping": {"out": {"path": "$", "source": "b"}}
+        }}
+    })
+    .to_string();
+
+    let err = run(
+        &manifest,
+        RuntimeLimits::default().with_max_step_results_bytes(8 * MIB),
+    )
+    .await
+    .expect_err("10 MiB of merged task results do not fit in 8 MiB");
+    assert!(err.contains("Step results exceeded"), "{err}");
+}
+
+/// On the handle path the step whose merge tripped the budget gets one
+/// lifecycle event, `StepFailed` carrying the budget error — not a
+/// `StepCompleted` for the body and then a `StepFailed` for the merge.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dataflow_merge_that_trips_the_budget_reports_one_event_for_the_step() {
+    let manifest = json!({
+        "name": "p",
+        "actions": {"go": {
+            "dataflow": true,
+            "steps": [
+                {"id": "prod", "type": "let", "params": {"value": "p"}, "longRunning": true},
+                {"id": "a", "type": "let", "params": {"value": "x".repeat(5 * MIB)}},
+                {"id": "b", "type": "let", "params": {"value": "y".repeat(5 * MIB)}}
+            ]
+        }}
+    })
+    .to_string();
+    let mut k = Kernel::boot(
+        KernelConfig::default()
+            .with_limits(RuntimeLimits::default().with_max_step_results_bytes(8 * MIB)),
+    )
+    .expect("boot");
+    k.register_plugin_from_json(&manifest).expect("registers");
+    let handle = k
+        .into_arc()
+        .execute("p", "go", json!({}))
+        .with_config(&Value::Null)
+        .into_dataflow_handle()
+        .expect("a dataflow action hands back a handle");
+
+    let events_task = tokio::spawn(async move {
+        let mut events = handle.events;
+        let mut out = Vec::new();
+        while let Some(e) = events.recv().await {
+            out.push(e);
+        }
+        out
+    });
+    let err = handle
+        .result
+        .await
+        .expect("result delivered")
+        .expect_err("10 MiB of merged task results do not fit in 8 MiB")
+        .to_string();
+    assert!(err.contains("Step results exceeded"), "{err}");
+    let events = events_task.await.expect("events task did not panic");
+
+    // Whichever of `a` and `b` merged second is the one that tripped.
+    let failed: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            DataflowEvent::StepFailed { step_id, error } => {
+                assert!(error.contains("Step results exceeded"), "{error}");
+                Some(step_id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failed.len(), 1, "one step failed: {events:?}");
+    let completed_too = events.iter().any(|e| {
+        matches!(e,
+        DataflowEvent::StepCompleted { step_id, .. } if step_id == failed[0])
+    });
+    assert!(
+        !completed_too,
+        "the failed step must not also have completed: {events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(DataflowEvent::PipelineCompleted { ok: false })
+        ),
+        "{events:?}"
+    );
 }
 
 /// The counter must not be left under-counting after a merge. If the

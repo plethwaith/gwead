@@ -856,7 +856,11 @@ impl WasmRuntime {
                 if let Some(err) = first_error {
                     return Err(err);
                 }
-                if let Some(err) = merge_over_budget(store.data()) {
+                // A merge can trip the budget on the canonical state
+                // when every task fit its own fork. A later step would
+                // raise the sticky marker, but only after running on
+                // the missing result.
+                if let Some(err) = escaping_violation(store.data()) {
                     return Err(err);
                 }
                 // Post-merge: install fan-outs for producers in this wave.
@@ -993,18 +997,26 @@ pub(super) fn run_step<'a>(
             }
         };
 
-        // A resource cap tripped *while the body was succeeding* still
-        // fails the step. `store_step_result` is the case: it refuses
-        // an over-budget result and records the violation, but the body
-        // that called it has already returned `true`. Without this the
-        // step would report success while its result silently did not
-        // exist.
+        // A violation that ends the invocation is raised here, as an
+        // `Err` no enclosing `try` can catch, rather than reported as a
+        // failed step. `store_step_result` is the case: it refuses an
+        // over-budget value and records the violation, but the body
+        // that called it has already returned `true`, so this is what
+        // turns the refusal into the action's error. Left as a plain
+        // `false`, a `try.catch` around the step would recover from a
+        // result that does not exist and report success, while the
+        // same step inside a `parallel` branch would already escape
+        // through the join — catchability would depend on nesting.
         //
         // Checked here rather than in each body because `run_step` is
         // the single funnel every step type passes through, including
-        // the control-flow intrinsics that recurse back into it.
-        if body_ok && store.data().resource_violation.is_some() {
-            return Ok(false);
+        // the control-flow intrinsics that recurse back into it. The
+        // fuel and memory violations need no check here: the step that
+        // trips one has already answered `false`, and a marker left
+        // behind by a `try` without a `catch` must not fail the
+        // `finally` steps that run before the failure propagates.
+        if let Some(err) = escaping_violation(store.data()) {
+            return Err(err);
         }
 
         // The `try` step type is the only failure-handling primitive: a
@@ -1101,7 +1113,7 @@ fn escape_if_cancelled(store: &Store<ExecutionState>, step_id: &str) -> Result<(
 ///   "params": {
 ///     "try":     [<step>, ...],   // body
 ///     "catch":   [<step>, ...],   // runs on body failure; sees {{$.error}}
-///     "finally": [<step>, ...]    // always runs after try (and catch)
+///     "finally": [<step>, ...]    // runs after try (and catch), failed or not
 ///   }
 /// }
 /// ```
@@ -1114,9 +1126,15 @@ fn escape_if_cancelled(store: &Store<ExecutionState>, step_id: &str) -> Result<(
 ///    `action.steps`, execute it. If `catch` itself fails, the whole
 ///    `try` step fails — that error is what propagates after `finally`
 ///    runs.
-/// 3. Regardless of try/catch outcome, splice `finally` onto
+/// 3. Whether try/catch succeeded or failed, splice `finally` onto
 ///    `action.steps` and execute it. A `finally` step failure aborts
-///    the action (and supersedes any prior failure).
+///    the action (and supersedes any prior failure). Two things skip
+///    it: a `return` inside try or catch, which unwinds the action at
+///    once; and an error that ends the invocation — a cancellation,
+///    or a resource violation that
+///    [escapes `try`](super::host_api::ResourceViolation::escapes_try)
+///    — which unwinds through `?` before it, since neither the handler
+///    nor the cleanup could run to any purpose under it.
 /// 4. The `try` step's own result composes as follows: try success →
 ///    last try step result; catch recovery → last catch step result;
 ///    empty-catch swallow → `Null`; unrecovered failure → no result
@@ -1271,7 +1289,11 @@ async fn run_try(
         }
     }
 
-    // === Finally block (always runs, unless `return` already fired) ===
+    // === Finally block ===
+    //
+    // Runs after a try or catch failure alike, unless `return` already
+    // fired. An invocation-ending error has unwound through `?` above
+    // and never reaches it.
     if !finally_steps.is_empty() && store.data().return_signal.is_none() {
         let inner_offset = store.data().action.steps.len();
         store
@@ -1532,9 +1554,9 @@ async fn run_parallel(
     if let Some(err) = first_error {
         return Err(err);
     }
-    if let Some(err) = merge_over_budget(store.data()) {
-        return Err(err);
-    }
+    // A merge that tripped the budget on the canonical state is raised
+    // by `run_step`, this function's only caller, right after it
+    // returns.
 
     store
         .data_mut()
@@ -1611,8 +1633,9 @@ fn merge_parallel_branch_state(
     // `finally` runs, and a `parallel` in that `finally` supersedes
     // them the way a direct step would. A later branch's richer marker
     // cannot outrank the first branch's plainer one this way. The one
-    // exception is a resource violation, merged from any branch and
-    // preferred by `step_failure_to_error`.
+    // exception is a resource violation, merged from any branch: a
+    // fuel or memory trip is preferred by `step_failure_to_error`, and
+    // a budget trip ends the invocation through `escaping_violation`.
     if takes_failure {
         canonical_state.last_error = task_state.last_error;
         canonical_state.plugin_error = task_state.plugin_error;
@@ -1942,10 +1965,11 @@ async fn run_iteration(
                     let committed = store.data().step_results_bytes;
                     let projected = committed.saturating_add(collected_bytes);
                     if projected > limit {
-                        return Err(KernelError::StepResultsLimitExceeded {
+                        return Err(host_api::ResourceViolation::StepResultsLimit {
                             limit_bytes: limit,
                             attempted_bytes: projected,
-                        });
+                        }
+                        .into());
                     }
                     collected.push(value);
                 }
@@ -2184,29 +2208,29 @@ fn join_error(what: &str, join_err: &tokio::task::JoinError) -> KernelError {
     }
 }
 
-/// A budget tripped while merging a finished task's results into the
-/// canonical state.
+/// The recorded violation as the error that ends the invocation, if it
+/// is one that does ([`ResourceViolation::escapes_try`]).
 ///
 /// `store_step_result` refuses the value and records the violation, but
-/// by then the task has already returned success — so, exactly as on the
-/// sequential path, something after the fact has to turn that into a
-/// failed action. Dropping the value and carrying on would be a silent
-/// wrong answer.
+/// its caller has already returned — so something after the fact has to
+/// turn the refusal into the action's error. Dropping the value and
+/// carrying on would be a silent wrong answer. `run_step` raises it for
+/// the step that stored, which covers every nesting `run_step` reaches,
+/// including a `parallel` step's join. The two scheduler joins that sit
+/// outside `run_step` — the wave loop and the dataflow scheduler — raise
+/// it again for a merge that tripped the budget on the canonical state
+/// when every task fit its own fork.
 ///
-/// Only `StepResultsLimit` is considered: it is the only violation a
-/// merge itself can raise. A violation the *task* raised has already
-/// failed that task through `run_step`.
-fn merge_over_budget(state: &ExecutionState) -> Option<KernelError> {
-    match state.resource_violation.clone() {
-        Some(host_api::ResourceViolation::StepResultsLimit {
-            limit_bytes,
-            attempted_bytes,
-        }) => Some(KernelError::StepResultsLimitExceeded {
-            limit_bytes,
-            attempted_bytes,
-        }),
-        _ => None,
-    }
+/// A violation that fails its step instead is typed by
+/// [`step_failure_to_error`] once the step has answered `false`.
+///
+/// [`ResourceViolation::escapes_try`]: host_api::ResourceViolation::escapes_try
+pub(super) fn escaping_violation(state: &ExecutionState) -> Option<KernelError> {
+    state
+        .resource_violation
+        .clone()
+        .filter(host_api::ResourceViolation::escapes_try)
+        .map(KernelError::from)
 }
 
 /// Map a failed step's `ExecutionState` scratch fields into the matching
@@ -2219,25 +2243,7 @@ fn merge_over_budget(state: &ExecutionState) -> Option<KernelError> {
 /// can branch on the variant instead of parsing strings.
 pub(super) fn step_failure_to_error(state: &ExecutionState, step: &StepDef) -> KernelError {
     if let Some(violation) = state.resource_violation.clone() {
-        return match violation {
-            host_api::ResourceViolation::FuelExhausted { budget } => {
-                let detail = state
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| format!("step '{}'", step.id));
-                KernelError::FuelExhausted { budget, detail }
-            }
-            host_api::ResourceViolation::MemoryLimit { bytes } => {
-                KernelError::MemoryLimitExceeded { limit_bytes: bytes }
-            }
-            host_api::ResourceViolation::StepResultsLimit {
-                limit_bytes,
-                attempted_bytes,
-            } => KernelError::StepResultsLimitExceeded {
-                limit_bytes,
-                attempted_bytes,
-            },
-        };
+        return violation.into();
     }
     if state.cancelled {
         return KernelError::Cancelled {
@@ -2309,7 +2315,9 @@ pub(super) fn populate_fanout_overrides_on_state(
 /// wave dispatched, so we can detect which variable entries the task
 /// added vs. inherited from before. Errors take first-non-`None` wins
 /// across tasks — see [`step_failure_to_error`] for how those map to
-/// the action's `KernelError`.
+/// the action's `KernelError`. A merge that trips the step-results
+/// budget on the canonical state is the caller's to raise, through
+/// [`escaping_violation`].
 pub(super) fn merge_task_state(
     canonical: &mut Store<ExecutionState>,
     task_state: ExecutionState,

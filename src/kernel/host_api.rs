@@ -348,17 +348,32 @@ impl StepTypeAccess {
     }
 }
 
-/// Captured trap kind for a sub-instance that exceeded its
-/// [`super::RuntimeLimits`] cap.
+/// A [`super::RuntimeLimits`] cap that tripped during a step, recorded
+/// on the execution state for the runtime to surface.
+///
+/// Which error a violation surfaces as is the [`From`] impl here;
+/// whether it fails the step or ends the invocation is
+/// [`Self::escapes_try`]. Both live on the type so the runtime's
+/// checks cannot disagree. Crate-private: it is reachable only through
+/// [`ExecutionState::resource_violation`], and what a caller sees is
+/// the [`super::KernelError`] it converts to.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum ResourceViolation {
-    FuelExhausted {
-        budget: u64,
-    },
-    MemoryLimit {
-        bytes: usize,
-    },
+pub(crate) enum ResourceViolation {
+    /// A `script` interpreter sub-instance consumed its
+    /// [`RuntimeLimits::fuel_budget`](super::RuntimeLimits::fuel_budget).
+    /// `detail` names the step and what the trap said. (A `wasm` step
+    /// runs under the same budget but reports its trap as the step's
+    /// own failure, naming the cap in the message.)
+    FuelExhausted { budget: u64, detail: String },
+    /// A `script` interpreter sub-instance declared more linear memory
+    /// than
+    /// [`RuntimeLimits::max_memory_bytes`](super::RuntimeLimits::max_memory_bytes)
+    /// allows and failed to instantiate. That is the only typed route:
+    /// the limiter answers a `memory.grow` past the cap with `-1` and
+    /// no trap, for a `script` step and a `wasm` step alike, so the
+    /// step may still succeed. (A `wasm` step's instantiation failure
+    /// is its own plain failure naming the module.)
+    MemoryLimit { bytes: usize },
     /// Cumulative step-result bytes exceeded
     /// [`RuntimeLimits::max_step_results_bytes`](super::RuntimeLimits::max_step_results_bytes),
     /// recorded when a step's result is refused rather than stored.
@@ -366,6 +381,49 @@ pub enum ResourceViolation {
         limit_bytes: usize,
         attempted_bytes: usize,
     },
+}
+
+impl ResourceViolation {
+    /// Whether the violation ends the invocation rather than failing
+    /// the step it tripped in.
+    ///
+    /// The fuel and memory caps belong to one wasm sub-instance: the
+    /// step that ran it failed, and a `try` around it may recover the
+    /// way it recovers from any failed step. The step-results budget
+    /// is the invocation's — the host memory every step's result
+    /// shares — so a trip is the kernel's stop, not the manifest's
+    /// logic. It propagates past any enclosing `try` the way a
+    /// cancellation does, in every nesting, so that a handler cannot
+    /// recover from a result that does not exist.
+    pub(crate) fn escapes_try(&self) -> bool {
+        match self {
+            Self::FuelExhausted { .. } | Self::MemoryLimit { .. } => false,
+            Self::StepResultsLimit { .. } => true,
+        }
+    }
+}
+
+/// The error a recorded violation surfaces as. The one mapping, used
+/// both where a violation ends the invocation and where it types a
+/// failed step.
+impl From<ResourceViolation> for super::KernelError {
+    fn from(violation: ResourceViolation) -> Self {
+        match violation {
+            ResourceViolation::FuelExhausted { budget, detail } => {
+                Self::FuelExhausted { budget, detail }
+            }
+            ResourceViolation::MemoryLimit { bytes } => {
+                Self::MemoryLimitExceeded { limit_bytes: bytes }
+            }
+            ResourceViolation::StepResultsLimit {
+                limit_bytes,
+                attempted_bytes,
+            } => Self::StepResultsLimitExceeded {
+                limit_bytes,
+                attempted_bytes,
+            },
+        }
+    }
 }
 
 /// Approximate the host bytes a step result holds.
@@ -1671,10 +1729,12 @@ impl ExecutionState {
     ///
     /// Over budget, the result is **not stored** and a
     /// [`ResourceViolation::StepResultsLimit`] is recorded;
-    /// [`super::runtime::run_step`] turns that into a failed step on
-    /// the way out. Refusing to store is what makes the bound real —
-    /// recording a marker and keeping the value would cap the error
-    /// message, not the memory.
+    /// [`super::runtime::run_step`] raises it as
+    /// [`super::KernelError::StepResultsLimitExceeded`] on the way out.
+    /// That is an error, not a failed step: the budget is the kernel's
+    /// cap, so an enclosing `try` does not catch it. Refusing to store
+    /// is what makes the bound real — recording a marker and keeping
+    /// the value would cap the error message, not the memory.
     pub fn store_step_result(&mut self, step_id: &str, value: Value) {
         if self.first_step_id.is_none() {
             self.first_step_id = Some(step_id.to_string());
@@ -2241,9 +2301,10 @@ fn step_invoke<'a>(
 /// Pairs the linear-memory cap pulled from
 /// [`super::RuntimeLimits::max_memory_bytes`] with the
 /// [`wasmtime::ResourceLimiter`] surface so a wasm module that calls
-/// `memory.grow` in a loop traps cleanly via `Trap::OOM` instead of
-/// OOMing the host process. The `script` step type wires this exact
-/// pattern via `ScriptRuntimeStoreData`; the wasm step does it standalone.
+/// `memory.grow` in a loop is refused past the cap — each denied grow
+/// returns `-1` to the module, no trap — instead of OOMing the host
+/// process. The `script` step type wires this exact pattern via
+/// `ScriptRuntimeStoreData`; the wasm step does it standalone.
 struct WasmStoreLimits {
     budget: super::resource_budget::ResourceBudget,
 }
@@ -2325,9 +2386,11 @@ fn step_wasm<'a>(
         // Store data is a `WasmStoreLimits` that doubles as the
         // wasmtime `ResourceLimiter` — fuel covers CPU, the limiter
         // covers `memory.grow`. A wasm module that tries to allocate
-        // past the per-invocation memory cap traps cleanly via
-        // `Trap::OOM` instead of OOMing the host process. Mirrors the
-        // model `ScriptRuntimeStoreData` uses for the `script` step type.
+        // past the per-invocation memory cap is refused: the grow
+        // returns `-1` and the module carries on, so the host never
+        // OOMs and no trap is involved (see the cap naming below).
+        // Mirrors the model `ScriptRuntimeStoreData` uses for the
+        // `script` step type.
         let mut store = wasmtime::Store::new(
             &engine,
             WasmStoreLimits {
