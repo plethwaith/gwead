@@ -388,6 +388,29 @@ pub(super) async fn execute_dag_dataflow(
                     &step.id,
                     &baseline_variables,
                 );
+                // The merge itself can trip the step-results budget on
+                // the canonical state when every task fit its own
+                // fork. The task has answered `Ok(true)` by then and
+                // nothing later reads the marker, so this join has to
+                // raise it, as the wave scheduler's does. The marker is
+                // sticky, so once the pipeline is failing it is not
+                // consulted again for the steps winding down behind
+                // the first error.
+                let merge_error = if first_error.is_none() && candidate_error.is_none() {
+                    super::runtime::escaping_violation(canonical_store.data())
+                } else {
+                    None
+                };
+                if let Some(err) = &merge_error {
+                    emit_event(
+                        dataflow_events.as_ref(),
+                        super::DataflowEvent::StepFailed {
+                            step_id: step.id.clone(),
+                            error: err.to_string(),
+                        },
+                    );
+                }
+                let candidate_error = candidate_error.or(merge_error);
                 if first_error.is_none() && candidate_error.is_some() {
                     first_error = candidate_error;
                     // Fire the cancel token so every still-running

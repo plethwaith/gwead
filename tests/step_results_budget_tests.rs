@@ -42,29 +42,49 @@ fn doubling_chain(lines: usize) -> String {
     .to_string()
 }
 
-async fn run_chain(lines: usize, limits: RuntimeLimits) -> Result<Value, String> {
+/// Register `manifest` under `limits` and run its `go` action.
+async fn run_manifest(manifest: &str, limits: RuntimeLimits) -> Result<Value, KernelError> {
     let mut k = Kernel::boot(KernelConfig::default().with_limits(limits)).expect("boot");
-    k.register_plugin_from_json(&doubling_chain(lines))
-        .expect("a doubling chain is a well-formed manifest; the budget is a runtime bound");
-    let arc = k.into_arc();
-    arc.execute("p", "go", json!({}))
+    k.register_plugin_from_json(manifest)
+        .expect("the manifest is well-formed; the budget is a runtime bound");
+    k.into_arc()
+        .execute("p", "go", json!({}))
         .with_config(&Value::Null)
         .run()
         .await
         .map(|r| r.output)
-        .map_err(|e| e.to_string())
 }
 
+async fn run_chain(lines: usize, limits: RuntimeLimits) -> Result<Value, KernelError> {
+    run_manifest(&doubling_chain(lines), limits).await
+}
+
+/// The invocation ended on the budget, with the limit it ran under and
+/// an attempted size past it.
+fn assert_budget_error(err: KernelError, limit: usize) -> usize {
+    match err {
+        KernelError::StepResultsLimitExceeded {
+            limit_bytes,
+            attempted_bytes,
+        } => {
+            assert_eq!(limit_bytes, limit);
+            assert!(attempted_bytes > limit, "{attempted_bytes}");
+            attempted_bytes
+        }
+        other => panic!("expected StepResultsLimitExceeded, got: {other:?}"),
+    }
+}
+
+/// A refused result ends the invocation with the typed error. It does
+/// not return an output missing the step, which would be a silent
+/// wrong answer in the budget's place.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_doubling_chain_is_stopped_by_the_budget() {
     let started = std::time::Instant::now();
     let err = run_chain(24, RuntimeLimits::default())
         .await
         .expect_err("24 doublings from 16 bytes is 134 MB");
-    assert!(
-        err.contains("Step results exceeded"),
-        "stopped for the stated reason: {err}"
-    );
+    assert_budget_error(err, RuntimeLimits::default().max_step_results_bytes);
     assert!(
         started.elapsed() < std::time::Duration::from_secs(5),
         "the budget bites while the chain is still cheap, which is the \
@@ -93,21 +113,13 @@ async fn the_budget_is_cumulative_across_steps() {
     })
     .to_string();
 
-    let mut k = Kernel::boot(
-        KernelConfig::default()
-            .with_limits(RuntimeLimits::default().with_max_step_results_bytes(4 * 1024 * 1024)),
+    let err = run_manifest(
+        &manifest,
+        RuntimeLimits::default().with_max_step_results_bytes(4 * 1024 * 1024),
     )
-    .expect("boot");
-    k.register_plugin_from_json(&manifest).expect("registers");
-    let arc = k.into_arc();
-    let err = arc
-        .execute("p", "go", json!({}))
-        .with_config(&Value::Null)
-        .run()
-        .await
-        .expect_err("twelve 1 MiB results do not fit in 4 MiB")
-        .to_string();
-    assert!(err.contains("Step results exceeded"), "{err}");
+    .await
+    .expect_err("twelve 1 MiB results do not fit in 4 MiB");
+    assert_budget_error(err, 4 * 1024 * 1024);
 }
 
 /// Ordinary manifests must not notice. The default is 64 MiB; a chain
@@ -128,7 +140,10 @@ async fn an_ordinary_chain_is_unaffected() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_budget_is_the_operators_to_set() {
     let limits = RuntimeLimits::default().with_max_step_results_bytes(1024);
-    let err = run_chain(12, limits).await.expect_err("64 KiB over 1 KiB");
+    let err = run_chain(12, limits)
+        .await
+        .expect_err("64 KiB over 1 KiB")
+        .to_string();
     assert!(
         err.contains("max_step_results_bytes"),
         "the message names the knob: {err}"
@@ -142,95 +157,156 @@ async fn the_budget_is_the_operators_to_set() {
     .expect("the same chain fits once the operator allows it");
 }
 
-/// A step whose result was refused must **fail**, not report success
-/// with a missing result. Otherwise the budget would install a silent
-/// wrong answer in its place.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_refused_result_fails_its_step_rather_than_vanishing() {
-    let err = run_chain(24, RuntimeLimits::default())
-        .await
-        .expect_err("over budget");
-    assert!(
-        !err.is_empty(),
-        "the action errors; it does not return an output missing the step"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Catchability
 // ---------------------------------------------------------------------------
+//
+// The budget is the kernel's cap, not the manifest's logic, so a
+// violation is not a step failure a `try` may recover from: it ends the
+// invocation the way a cancellation does, in every nesting. A handler
+// that caught it would see a refused result and carry on as if the step
+// had run.
 
-/// The over-budget `let` wrapped as `body` inside a `try` whose handler
-/// would otherwise recover, under a 1 KiB budget.
-async fn run_guarded(body: Value) -> Result<Value, KernelError> {
+/// The budget the catchability tests run under.
+const GUARDED_BUDGET: usize = 1024;
+
+/// A `let` four times the guarded budget.
+fn over_budget_let() -> Value {
+    json!({"id": "big", "type": "let", "params": {"value": "x".repeat(4 * GUARDED_BUDGET)}})
+}
+
+/// `body` inside a `try` whose handler would recover from any ordinary
+/// failure.
+fn guarded(body: Value) -> Value {
+    json!({
+        "id": "guarded",
+        "type": "try",
+        "params": {
+            "try": [body],
+            "catch": [{"id": "recovered", "type": "let", "params": {"value": "swallowed"}}]
+        }
+    })
+}
+
+/// Run one step as the whole action, under [`GUARDED_BUDGET`]. A
+/// dataflow action needs a long-running producer to be one; a tiny
+/// `let` serves, and is charged well inside the budget.
+async fn run_guarded(step: Value, dataflow: bool) -> Result<Value, KernelError> {
+    let mut steps = vec![step];
+    if dataflow {
+        steps.push(
+            json!({"id": "prod", "type": "let", "params": {"value": "p"}, "longRunning": true}),
+        );
+    }
     let manifest = json!({
         "name": "p",
         "actions": { "go": {
-            "steps": [{
-                "id": "guarded",
-                "type": "try",
-                "params": {
-                    "try": [body],
-                    "catch": [{"id": "recovered", "type": "let", "params": {"value": "swallowed"}}]
-                }
-            }],
+            "dataflow": dataflow,
+            "steps": steps,
             "resultMapping": { "out": { "path": "$", "source": "guarded" } }
         } }
     })
     .to_string();
-    let mut k = Kernel::boot(
-        KernelConfig::default()
-            .with_limits(RuntimeLimits::default().with_max_step_results_bytes(1024)),
+    run_manifest(
+        &manifest,
+        RuntimeLimits::default().with_max_step_results_bytes(GUARDED_BUDGET),
     )
-    .expect("boot");
-    k.register_plugin_from_json(&manifest).expect("registers");
-    k.into_arc()
-        .execute("p", "go", json!({}))
-        .with_config(&Value::Null)
-        .run()
-        .await
-        .map(|r| r.output)
+    .await
 }
 
-fn over_budget_let() -> Value {
-    json!({"id": "big", "type": "let", "params": {"value": "x".repeat(4096)}})
+/// The refused value was charged in full: the attempted size is at
+/// least the payload, not merely past the limit.
+fn assert_guarded_error(err: KernelError) {
+    let attempted = assert_budget_error(err, GUARDED_BUDGET);
+    assert!(attempted >= 4 * GUARDED_BUDGET, "{attempted}");
 }
 
-fn assert_budget_error(err: KernelError) {
-    match err {
-        KernelError::StepResultsLimitExceeded {
-            limit_bytes,
-            attempted_bytes,
-        } => {
-            assert_eq!(limit_bytes, 1024);
-            assert!(attempted_bytes > 1024, "{attempted_bytes}");
-        }
-        other => panic!("expected StepResultsLimitExceeded, got: {other:?}"),
-    }
-}
-
-/// The budget is the kernel's cap, not the manifest's logic, so a
-/// violation is not a step failure a `try` may recover from: it ends
-/// the invocation the way a cancellation does. A handler that caught it
-/// would see a refused result and carry on as if the step had run.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_budget_violation_escapes_try() {
-    let err = run_guarded(over_budget_let())
+    let err = run_guarded(guarded(over_budget_let()), false)
         .await
         .expect_err("a resource cap is not catchable");
-    assert_budget_error(err);
+    assert_guarded_error(err);
 }
 
-/// The same violation inside a `parallel` branch inside the `try`
-/// escapes identically. Catchability must not depend on nesting.
+/// Inside a `parallel` branch the violation reaches the `try` through
+/// the branch join rather than the step directly.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_budget_violation_inside_a_parallel_branch_escapes_try() {
-    let err = run_guarded(json!({
-        "id": "fan",
-        "type": "parallel",
-        "params": {"branches": [[over_budget_let()]]}
-    }))
+    let err = run_guarded(
+        guarded(json!({
+            "id": "fan",
+            "type": "parallel",
+            "params": {"branches": [[over_budget_let()]]}
+        })),
+        false,
+    )
     .await
     .expect_err("a resource cap is not catchable through a parallel branch either");
-    assert_budget_error(err);
+    assert_guarded_error(err);
+}
+
+/// Inside a loop body it reaches the `try` through the iteration.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_budget_violation_inside_a_loop_escapes_try() {
+    let err = run_guarded(
+        guarded(json!({
+            "id": "loop",
+            "type": "repeat",
+            "params": {"count": 1, "steps": [over_budget_let()]}
+        })),
+        false,
+    )
+    .await
+    .expect_err("a resource cap is not catchable through a loop either");
+    assert_guarded_error(err);
+}
+
+/// Inside a taken `ifs` branch it reaches the `try` through the branch.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_budget_violation_inside_an_ifs_branch_escapes_try() {
+    let err = run_guarded(
+        guarded(json!({
+            "id": "route",
+            "type": "ifs",
+            "params": {"ifs": [{"test": "true", "then": [over_budget_let()]}]}
+        })),
+        false,
+    )
+    .await
+    .expect_err("a resource cap is not catchable through an ifs branch either");
+    assert_guarded_error(err);
+}
+
+/// Under the dataflow scheduler the `try` runs inside a spawned task,
+/// and the task's error is the pipeline's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_budget_violation_in_a_dataflow_task_escapes_try() {
+    let err = run_guarded(guarded(over_budget_let()), true)
+        .await
+        .expect_err("a resource cap is not catchable inside a dataflow task either");
+    assert_guarded_error(err);
+}
+
+/// An error that ends the invocation unwinds past `finally` as well,
+/// as a cancellation does: a `finally` that would otherwise supersede
+/// the failure with its own thrown error never runs, and the budget
+/// error is what comes out. (`finally` after a failed step is pinned
+/// in `intrinsics_tests`.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_budget_violation_skips_finally() {
+    let err = run_guarded(
+        json!({
+            "id": "guarded",
+            "type": "try",
+            "params": {
+                "try": [over_budget_let()],
+                "finally": [{"id": "cleanup", "type": "throw_error", "params": {"code": "E_FINALLY", "message": "ran"}}]
+            }
+        }),
+        false,
+    )
+    .await
+    .expect_err("the invocation ends on the budget");
+    assert_guarded_error(err);
 }

@@ -72,6 +72,37 @@ async fn parallel_branches_are_charged_when_they_merge() {
     assert!(err.contains("Step results exceeded"), "{err}");
 }
 
+/// The dataflow scheduler merges through the same funnel and must
+/// raise the same refusal. Two independent steps each fit an 8 MiB
+/// budget in their own forks; their merged total does not. A join that
+/// merged the second and carried on would resolve the pipeline `Ok`
+/// with that step's result missing. (The tiny long-running `let` is
+/// what makes the action a dataflow one.)
+#[tokio::test(flavor = "multi_thread")]
+async fn dataflow_tasks_are_charged_when_they_merge() {
+    let manifest = json!({
+        "name": "p",
+        "actions": {"go": {
+            "dataflow": true,
+            "steps": [
+                {"id": "prod", "type": "let", "params": {"value": "p"}, "longRunning": true},
+                {"id": "a", "type": "let", "params": {"value": "x".repeat(5 * MIB)}},
+                {"id": "b", "type": "let", "params": {"value": "y".repeat(5 * MIB)}}
+            ],
+            "resultMapping": {"out": {"path": "$", "source": "b"}}
+        }}
+    })
+    .to_string();
+
+    let err = run(
+        &manifest,
+        RuntimeLimits::default().with_max_step_results_bytes(8 * MIB),
+    )
+    .await
+    .expect_err("10 MiB of merged task results do not fit in 8 MiB");
+    assert!(err.contains("Step results exceeded"), "{err}");
+}
+
 /// The counter must not be left under-counting after a merge. If the
 /// canonical total still read ~0 after the branches merged, a subsequent
 /// sequential step would be admitted, so the leak would weaken the

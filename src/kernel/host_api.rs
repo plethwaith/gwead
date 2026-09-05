@@ -348,17 +348,23 @@ impl StepTypeAccess {
     }
 }
 
-/// Captured trap kind for a sub-instance that exceeded its
-/// [`super::RuntimeLimits`] cap.
+/// A [`super::RuntimeLimits`] cap that tripped during a step, recorded
+/// on the execution state for the runtime to surface.
+///
+/// Which error a violation surfaces as is the [`From`] impl here;
+/// whether it fails the step or ends the invocation is the variant's
+/// `escapes_try`. Both live on the type so the runtime's checks cannot
+/// disagree.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ResourceViolation {
-    FuelExhausted {
-        budget: u64,
-    },
-    MemoryLimit {
-        bytes: usize,
-    },
+    /// A wasm sub-instance consumed its
+    /// [`RuntimeLimits::fuel_budget`](super::RuntimeLimits::fuel_budget).
+    /// `detail` names the step and what the trap said.
+    FuelExhausted { budget: u64, detail: String },
+    /// A wasm sub-instance grew past
+    /// [`RuntimeLimits::max_memory_bytes`](super::RuntimeLimits::max_memory_bytes).
+    MemoryLimit { bytes: usize },
     /// Cumulative step-result bytes exceeded
     /// [`RuntimeLimits::max_step_results_bytes`](super::RuntimeLimits::max_step_results_bytes),
     /// recorded when a step's result is refused rather than stored.
@@ -366,6 +372,49 @@ pub enum ResourceViolation {
         limit_bytes: usize,
         attempted_bytes: usize,
     },
+}
+
+impl ResourceViolation {
+    /// Whether the violation ends the invocation rather than failing
+    /// the step it tripped in.
+    ///
+    /// The fuel and memory caps belong to one wasm sub-instance: the
+    /// step that ran it failed, and a `try` around it may recover the
+    /// way it recovers from any failed step. The step-results budget
+    /// is the invocation's — the host memory every step's result
+    /// shares — so a trip is the kernel's stop, not the manifest's
+    /// logic. It propagates past any enclosing `try` the way a
+    /// cancellation does, in every nesting, so that a handler cannot
+    /// recover from a result that does not exist.
+    pub(crate) fn escapes_try(&self) -> bool {
+        match self {
+            Self::FuelExhausted { .. } | Self::MemoryLimit { .. } => false,
+            Self::StepResultsLimit { .. } => true,
+        }
+    }
+}
+
+/// The error a recorded violation surfaces as. The one mapping, used
+/// both where a violation ends the invocation and where it types a
+/// failed step.
+impl From<ResourceViolation> for super::KernelError {
+    fn from(violation: ResourceViolation) -> Self {
+        match violation {
+            ResourceViolation::FuelExhausted { budget, detail } => {
+                Self::FuelExhausted { budget, detail }
+            }
+            ResourceViolation::MemoryLimit { bytes } => {
+                Self::MemoryLimitExceeded { limit_bytes: bytes }
+            }
+            ResourceViolation::StepResultsLimit {
+                limit_bytes,
+                attempted_bytes,
+            } => Self::StepResultsLimitExceeded {
+                limit_bytes,
+                attempted_bytes,
+            },
+        }
+    }
 }
 
 /// Approximate the host bytes a step result holds.
