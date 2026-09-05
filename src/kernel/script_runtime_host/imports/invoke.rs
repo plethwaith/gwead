@@ -303,6 +303,19 @@ pub(super) fn register(
                                 error = %e,
                                 "io.invoke failed"
                             );
+                            // A callee that stopped on this step's
+                            // fired token — it runs under a child of
+                            // it — is the guest being told of its own
+                            // cancel, the way a `STREAM_CANCELLED`
+                            // write tells it; see `told_of_cancel`. A
+                            // callee's own deadline under a quiet
+                            // token is the callee's failure, not a
+                            // telling.
+                            if state.cancel.is_cancelled()
+                                && crate::kernel::stopped_by_cancellation(&e)
+                            {
+                                state.told_of_cancel = true;
+                            }
                             state.call_error = Some(
                                 format!("io.invoke → {plugin_name}.{action_name} failed: {e}")
                                     .into_bytes(),
@@ -616,6 +629,14 @@ pub(super) fn register(
                                 error = %e,
                                 "io.invoke_streaming failed"
                             );
+                            // As for `host_invoke`: a callee stopped by
+                            // this step's fired token tells the guest
+                            // of its cancel.
+                            if caller.data().cancel.is_cancelled()
+                                && crate::kernel::stopped_by_cancellation(&e)
+                            {
+                                caller.data_mut().told_of_cancel = true;
+                            }
                             bail_host_call(
                                 &mut caller,
                                 format!(

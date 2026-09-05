@@ -1416,14 +1416,17 @@ enum Stall {
 /// Run `p.relay` as a dataflow streaming handle whose output is held
 /// open and never read, so the producer fills the channel and parks
 /// inside its write; end the stall per `stall` and hand back the
-/// pipeline's result. The result must arrive: before the write
-/// backstop this hung forever, and the timeout is what turns that
-/// into a failure.
+/// pipeline's result and every event it emitted. The result must
+/// arrive: before the write backstop this hung forever, and the
+/// timeout is what turns that into a failure.
 async fn relay_unread(
     kernel: &Arc<Kernel>,
     stall: Stall,
-) -> Result<gwead::kernel::types::ActionResult, KernelError> {
-    let handle = kernel
+) -> (
+    Result<gwead::kernel::types::ActionResult, KernelError>,
+    Vec<DataflowEvent>,
+) {
+    let mut handle = kernel
         .execute("p", "relay", json!({}))
         .with_config(&json!({}))
         .with_exec_ctx(gwead::kernel::ExecutionContext::default())
@@ -1437,8 +1440,23 @@ async fn relay_unread(
         .await
         .expect("the parked writer is released and the pipeline ends")
         .expect("delivered");
+    let mut events = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_secs(1), handle.events.recv()).await
+    {
+        events.push(event);
+    }
     drop(handle.output);
-    result
+    (result, events)
+}
+
+/// Whether the producer step finished on its own — `StepCompleted`,
+/// whatever its `ok` — rather than being dropped mid-write. A task
+/// abandoned by the wallclock grace emits nothing.
+fn producer_completed(events: &[DataflowEvent]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, DataflowEvent::StepCompleted { step_id, .. } if step_id == "producer"))
 }
 
 /// The write-until-refused guest as a kernel's `(script, "lua")`
@@ -1469,7 +1487,8 @@ async fn cancel_releases_a_producer_parked_on_a_stalled_consumer() {
         "test_dataflow_fixture.dataflow_producer",
         json!({ "chunk_count": 100_000, "chunk_size": 16 }),
     );
-    let action_result = relay_unread(&kernel, Stall::Cancel).await.expect("ok");
+    let (result, _) = relay_unread(&kernel, Stall::Cancel).await;
+    let action_result = result.expect("ok");
     let producer = &action_result.step_results["producer"];
     assert_eq!(
         producer["stopped_on"],
@@ -1495,7 +1514,8 @@ async fn cancel_releases_a_wasm_guest_parked_in_stream_write() {
         GUEST_STEP,
         guest_params("-- writes until refused"),
     );
-    let action_result = relay_unread(&kernel, Stall::Cancel).await.expect("ok");
+    let (result, _) = relay_unread(&kernel, Stall::Cancel).await;
+    let action_result = result.expect("ok");
     assert_eq!(
         action_result.step_results["producer"],
         json!("cancelled"),
@@ -1505,7 +1525,10 @@ async fn cancel_releases_a_wasm_guest_parked_in_stream_write() {
 
 /// The wallclock watchdog fires the same token: a wasm guest parked in
 /// `stream_write` under the action's cap is released at the deadline
-/// and returns, and the action reports the deadline.
+/// and returns, and the action reports the deadline. The step's
+/// `StepCompleted` is what shows the guest returned on its own rather
+/// than being dropped at the grace, which would report the same
+/// deadline.
 #[tokio::test(flavor = "multi_thread")]
 async fn wallclock_deadline_releases_a_wasm_guest_parked_in_stream_write() {
     let kernel = kernel_with_relay_under(
@@ -1514,18 +1537,23 @@ async fn wallclock_deadline_releases_a_wasm_guest_parked_in_stream_write() {
         guest_params("-- writes until refused"),
         Some(150),
     );
-    let result = relay_unread(&kernel, Stall::WaitForDeadline).await;
+    let (result, events) = relay_unread(&kernel, Stall::WaitForDeadline).await;
     assert!(
         matches!(result, Err(KernelError::ExecutionTimeout { .. })),
         "the release is reported as the deadline: {result:?}"
+    );
+    assert!(
+        producer_completed(&events),
+        "the guest returned on its own, not dropped at the grace: {events:?}"
     );
 }
 
 /// A binding that raises on `STREAM_CANCELLED` instead of letting its
 /// script return: the guest has no typed cancellation of its own, so
-/// the host reads a script error under a fired token as the cancel.
-/// The pipeline winds down as it does for a guest that returned —
-/// `Ok`, not a step failure carrying the guest's error text.
+/// the host reads an error from a guest its parked write told of the
+/// cancel as the cancel. The pipeline winds down as it does for a
+/// guest that returned — `Ok`, not a step failure carrying the guest's
+/// error text.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_guest_that_raises_on_stream_cancelled_is_winding_down_not_failing() {
     let kernel = kernel_with_relay(
@@ -1533,7 +1561,7 @@ async fn a_guest_that_raises_on_stream_cancelled_is_winding_down_not_failing() {
         GUEST_STEP,
         guest_params("-- raises when refused"),
     );
-    let result = relay_unread(&kernel, Stall::Cancel).await;
+    let (result, _) = relay_unread(&kernel, Stall::Cancel).await;
     let action_result = match result {
         Ok(r) => r,
         Err(e) => panic!("a guest error after the cancel is the cancel, not a failure: {e}"),
@@ -1558,9 +1586,13 @@ async fn a_guest_that_raises_under_the_wallclock_deadline_reports_the_deadline()
         guest_params("-- raises when refused"),
         Some(150),
     );
-    let result = relay_unread(&kernel, Stall::WaitForDeadline).await;
+    let (result, events) = relay_unread(&kernel, Stall::WaitForDeadline).await;
     assert!(
         matches!(result, Err(KernelError::ExecutionTimeout { .. })),
         "the guest's raise on its cancel is the deadline: {result:?}"
+    );
+    assert!(
+        producer_completed(&events),
+        "the guest raised on its own, not dropped at the grace: {events:?}"
     );
 }

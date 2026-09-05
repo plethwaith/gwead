@@ -5028,7 +5028,7 @@ where
 /// as the caller's budget (`Kernel::callee_wallclock`). A callee
 /// deadline that arrives *before* the caller's has passed is not
 /// remapped: it stays the callee's failure.
-fn stopped_by_cancellation(err: &KernelError) -> bool {
+pub(crate) fn stopped_by_cancellation(err: &KernelError) -> bool {
     match err {
         KernelError::Cancelled { .. } | KernelError::ExecutionTimeout { .. } => true,
         KernelError::CalleeFailed { source, .. } => stopped_by_cancellation(source),

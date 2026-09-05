@@ -10,7 +10,7 @@
 //! - `is_cancelled() -> i32` — 1 if the parent step's cancellation
 //!   token has fired; 0 otherwise. The same token releases a
 //!   `stream_write` parked on a full channel (`STREAM_CANCELLED`).
-//!   Either answer records on the store that the guest was told
+//!   An answer of 1 records on the store that the guest was told
 //!   (`told_of_cancel`), which is what lets `step_script` read a
 //!   later guest error as the cancellation.
 //!
