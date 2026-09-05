@@ -854,7 +854,9 @@ fn classify_manifest(json: &str) -> Result<ClassifiedManifest, KernelError> {
 pub struct RuntimeLimits {
     /// Wasm fuel budget per guest invocation (a `script` interpreter
     /// run or a `wasm` step). Each instruction consumes 1 unit.
-    /// Exhaustion produces [`KernelError::FuelExhausted`]. Default:
+    /// Exhaustion fails the step: a `script` step's as
+    /// [`KernelError::FuelExhausted`], a `wasm` step's as
+    /// [`KernelError::Execution`] naming the cap. Default:
     /// 1_000_000_000 (1 B — large enough to stream a
     /// multi-hundred-megabyte payload through a script transform,
     /// small enough that a CPU-bound tight
@@ -5586,16 +5588,18 @@ pub enum KernelError {
     #[error("Execution error: {0}")]
     Execution(String),
 
-    /// Wasm consumed its fuel budget. A guest module (a `script`
-    /// interpreter or a `wasm` step) ran longer than
-    /// `RuntimeLimits::fuel_budget` instructions allowed. The action is
-    /// aborted; subsequent steps don't run.
+    /// A `script` interpreter consumed its fuel budget: it ran longer
+    /// than `RuntimeLimits::fuel_budget` instructions allowed. A failed
+    /// step, which a `try` may catch; uncaught, the action is aborted
+    /// and subsequent steps don't run. (A `wasm` step's fuel trap is
+    /// reported as [`Self::Execution`] naming the cap.)
     #[error("Wasm fuel exhausted ({budget} unit budget): {detail}")]
     FuelExhausted { budget: u64, detail: String },
 
-    /// Wasm tried to grow its linear memory past
-    /// `RuntimeLimits::max_memory_bytes`. A guest module allocated more
-    /// than the per-invocation ceiling allowed.
+    /// A `script` interpreter tried to grow its linear memory past
+    /// `RuntimeLimits::max_memory_bytes`. A failed step, which a `try`
+    /// may catch. (A `wasm` step's denial is reported as
+    /// [`Self::Execution`] naming the cap.)
     #[error("Wasm memory limit exceeded ({limit_bytes} bytes)")]
     MemoryLimitExceeded { limit_bytes: usize },
 

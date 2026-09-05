@@ -86,10 +86,39 @@ const MOCK_WAT: &str = r#"
 )
 "#;
 
+/// A twin of [`MOCK_WAT`] whose `execute` never returns: it spins
+/// until the fuel meter traps. The one way a test can trip
+/// `RuntimeLimits::fuel_budget` without a real runtime.
+const SPINNING_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (global $next (mut i32) (i32.const 32))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    global.get $next
+    local.set $ptr
+    global.get $next
+    local.get $len
+    i32.add
+    global.set $next
+    local.get $ptr)
+  (func (export "execute") (param $src_ptr i32) (param $src_len i32)
+                           (param $args_ptr i32) (param $args_len i32)
+                           (result i32)
+    (loop $spin br $spin)
+    i32.const 1)
+)
+"#;
+
 /// Compile the mock wat → wasm bytes. Caching is unnecessary —
 /// compilation is fast and each test typically calls this once.
 pub fn build_wasm_bytes() -> Vec<u8> {
     wat::parse_str(MOCK_WAT).expect("mock script-runtime wat parses")
+}
+
+/// Compile the spinning twin — see [`SPINNING_WAT`].
+pub fn build_spinning_wasm_bytes() -> Vec<u8> {
+    wat::parse_str(SPINNING_WAT).expect("spinning script-runtime wat parses")
 }
 
 /// The plugin name the mock registers under for `language`. Tests
@@ -119,8 +148,24 @@ pub fn register(kernel: &mut Kernel) -> Result<(), KernelError> {
 /// Register the mock as the `(script, language)` impl. Lets tests that
 /// validate selector dispatch route a non-`"lua"` value too.
 pub fn register_for_language(kernel: &mut Kernel, language: &str) -> Result<(), KernelError> {
+    register_module_for_language(kernel, language, build_wasm_bytes())
+}
+
+/// Register the spinning twin as the `(script, language)` impl. A
+/// `script` step of that language runs until it exhausts its fuel.
+pub fn register_spinning_for_language(
+    kernel: &mut Kernel,
+    language: &str,
+) -> Result<(), KernelError> {
+    register_module_for_language(kernel, language, build_spinning_wasm_bytes())
+}
+
+fn register_module_for_language(
+    kernel: &mut Kernel,
+    language: &str,
+    wasm_bytes: Vec<u8>,
+) -> Result<(), KernelError> {
     use base64::Engine as _;
-    let wasm_bytes = build_wasm_bytes();
     let base64_bytes = base64::engine::general_purpose::STANDARD.encode(&wasm_bytes);
     let manifest = serde_json::json!({
         "name": plugin_name(language),

@@ -857,8 +857,9 @@ impl WasmRuntime {
                     return Err(err);
                 }
                 // A merge can trip the budget on the canonical state
-                // when every task fit its own fork; nothing after this
-                // wave would raise it.
+                // when every task fit its own fork. A later step would
+                // raise the sticky marker, but only after running on
+                // the missing result.
                 if let Some(err) = escaping_violation(store.data()) {
                     return Err(err);
                 }
@@ -1112,7 +1113,7 @@ fn escape_if_cancelled(store: &Store<ExecutionState>, step_id: &str) -> Result<(
 ///   "params": {
 ///     "try":     [<step>, ...],   // body
 ///     "catch":   [<step>, ...],   // runs on body failure; sees {{$.error}}
-///     "finally": [<step>, ...]    // always runs after try (and catch)
+///     "finally": [<step>, ...]    // runs after try (and catch), failed or not
 ///   }
 /// }
 /// ```

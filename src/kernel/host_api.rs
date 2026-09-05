@@ -352,18 +352,23 @@ impl StepTypeAccess {
 /// on the execution state for the runtime to surface.
 ///
 /// Which error a violation surfaces as is the [`From`] impl here;
-/// whether it fails the step or ends the invocation is the variant's
-/// `escapes_try`. Both live on the type so the runtime's checks cannot
-/// disagree.
+/// whether it fails the step or ends the invocation is
+/// [`Self::escapes_try`]. Both live on the type so the runtime's
+/// checks cannot disagree. Crate-private: it is reachable only through
+/// [`ExecutionState::resource_violation`], and what a caller sees is
+/// the [`super::KernelError`] it converts to.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum ResourceViolation {
-    /// A wasm sub-instance consumed its
+pub(crate) enum ResourceViolation {
+    /// A `script` interpreter sub-instance consumed its
     /// [`RuntimeLimits::fuel_budget`](super::RuntimeLimits::fuel_budget).
-    /// `detail` names the step and what the trap said.
+    /// `detail` names the step and what the trap said. (A `wasm` step
+    /// runs under the same budget but reports its trap as the step's
+    /// own failure, naming the cap in the message.)
     FuelExhausted { budget: u64, detail: String },
-    /// A wasm sub-instance grew past
+    /// A `script` interpreter sub-instance grew past
     /// [`RuntimeLimits::max_memory_bytes`](super::RuntimeLimits::max_memory_bytes).
+    /// (As with fuel, a `wasm` step reports the same denial as its own
+    /// failure.)
     MemoryLimit { bytes: usize },
     /// Cumulative step-result bytes exceeded
     /// [`RuntimeLimits::max_step_results_bytes`](super::RuntimeLimits::max_step_results_bytes),

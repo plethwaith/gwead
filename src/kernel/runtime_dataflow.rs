@@ -360,12 +360,34 @@ pub(super) async fn execute_dag_dataflow(
                     // `try.catch`.
                     Ok(false) => Some(super::runtime::step_failure_to_error(&task_state, &step)),
                 };
-                // Emit the per-step lifecycle event. `StepFailed` carries
-                // the textual error so a UI can show it without waiting
-                // for the pipeline-final ActionResult; `StepCompleted`
-                // carries `ok`: `true` for a normal finish, `false` for
-                // a step that wound down on the pipeline's own cancel.
-                // Any failure is reported as `StepFailed` instead.
+                super::runtime::merge_task_state(
+                    &mut canonical_store,
+                    task_state,
+                    &step.id,
+                    &baseline_variables,
+                );
+                // The merge itself can trip the step-results budget on
+                // the canonical state when every task fit its own
+                // fork. The task has answered `Ok(true)` by then, and a
+                // later step would raise the sticky marker only after
+                // running on the missing result, so this join raises
+                // it, as the wave scheduler's does. Once the pipeline
+                // is failing the marker is not consulted again for the
+                // steps winding down behind the first error.
+                let candidate_error = candidate_error.or_else(|| {
+                    first_error
+                        .is_none()
+                        .then(|| super::runtime::escaping_violation(canonical_store.data()))
+                        .flatten()
+                });
+                // Emit the per-step lifecycle event, after the merge so
+                // a step whose merge failed gets one event. `StepFailed`
+                // carries the textual error so a UI can show it without
+                // waiting for the pipeline-final ActionResult;
+                // `StepCompleted` carries `ok`: `true` for a normal
+                // finish, `false` for a step that wound down on the
+                // pipeline's own cancel. Any failure is reported as
+                // `StepFailed` instead.
                 match &candidate_error {
                     Some(err) => emit_event(
                         dataflow_events.as_ref(),
@@ -382,35 +404,6 @@ pub(super) async fn execute_dag_dataflow(
                         },
                     ),
                 }
-                super::runtime::merge_task_state(
-                    &mut canonical_store,
-                    task_state,
-                    &step.id,
-                    &baseline_variables,
-                );
-                // The merge itself can trip the step-results budget on
-                // the canonical state when every task fit its own
-                // fork. The task has answered `Ok(true)` by then and
-                // nothing later reads the marker, so this join has to
-                // raise it, as the wave scheduler's does. The marker is
-                // sticky, so once the pipeline is failing it is not
-                // consulted again for the steps winding down behind
-                // the first error.
-                let merge_error = if first_error.is_none() && candidate_error.is_none() {
-                    super::runtime::escaping_violation(canonical_store.data())
-                } else {
-                    None
-                };
-                if let Some(err) = &merge_error {
-                    emit_event(
-                        dataflow_events.as_ref(),
-                        super::DataflowEvent::StepFailed {
-                            step_id: step.id.clone(),
-                            error: err.to_string(),
-                        },
-                    );
-                }
-                let candidate_error = candidate_error.or(merge_error);
                 if first_error.is_none() && candidate_error.is_some() {
                     first_error = candidate_error;
                     // Fire the cancel token so every still-running
