@@ -57,12 +57,17 @@ pub(super) struct ScriptRuntimeStoreData {
     /// Whether a host import has told the guest its step was
     /// cancelled. Exactly three imports set it: `is_cancelled`
     /// answering 1, a `stream_write` returning `STREAM_CANCELLED`, and
-    /// `host_invoke` / `host_invoke_streaming` failing because the
-    /// callee stopped on this step's fired token. A guest has no typed
-    /// cancellation of its own, so `step_script` reads a script error
-    /// from a guest that was told as the cancellation surfacing through
-    /// the guest's error idiom — and only then; a guest that was never
-    /// told keeps its own failure.
+    /// `host_invoke` failing because the callee stopped on this step's
+    /// fired token. A callee's own deadline under a quiet token is the
+    /// callee's failure and sets nothing; under a fired token it is
+    /// counted as a telling, the deadline being the same event seen
+    /// one level down. A streaming callee stopped by the token ends
+    /// its stream with a plain EOF, so `host_invoke_streaming` and
+    /// `stream_read` never set it. A guest has no typed cancellation
+    /// of its own, so `step_script` reads a script error from a guest
+    /// that was told as the cancellation surfacing through the guest's
+    /// error idiom — and only then; a guest that was never told keeps
+    /// its own failure.
     pub(super) told_of_cancel: bool,
     // ── Recurse-into-kernel support ─────────────────────────────
     //

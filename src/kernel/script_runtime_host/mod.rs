@@ -246,8 +246,8 @@ pub(crate) fn step_script<'a>(
                 // binding may raise a language-level error when a host
                 // import tells it the step was cancelled —
                 // `STREAM_CANCELLED` from a parked `stream_write`,
-                // `is_cancelled` answering 1, or an `io.invoke` whose
-                // callee stopped on this step's token. An error from a guest
+                // `is_cancelled` answering 1, or a plain `io.invoke`
+                // whose callee stopped on this step's token. An error from a guest
                 // that was told is the cancellation surfacing through
                 // the guest's error idiom, and is reported as such, so
                 // the dataflow scheduler sees a step winding down and
@@ -647,18 +647,41 @@ mod told_of_cancel_tests {
         wat::parse_str(&wat).expect("wat parses")
     }
 
-    /// A kernel with plugin `p` and its one-step action `a`, as the
-    /// invoking guest's parent.
+    /// A step body that sleeps two seconds without racing the token.
+    fn sleep_ignoring_token<'a>(
+        _ex: &'a mut (dyn crate::kernel::host_api::PluginExecution + Send),
+        _params: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = Result<StepOutput, StepError>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            Ok(StepOutput::from(Value::Null))
+        })
+    }
+
+    /// A kernel with plugin `p` as the invoking guest's parent: its
+    /// one-step action `a`, and `slow`, whose own 50 ms wallclock cap
+    /// ends a two-second sleep.
     fn kernel_with_p() -> std::sync::Arc<crate::kernel::Kernel> {
-        let mut kernel =
-            crate::kernel::Kernel::boot(crate::kernel::KernelConfig::default()).expect("boot");
+        let mut config = crate::kernel::KernelConfig::default();
+        config
+            .native_step_impls
+            .insert("test.p.sleep", sleep_ignoring_token)
+            .expect("fresh table");
+        let mut kernel = crate::kernel::Kernel::boot(config).expect("boot");
         kernel
             .register_plugin_from_json(
                 r#"{
                     "name": "p",
                     "version": "0.0.0",
+                    "stepTypeDefs": [{"name": "p.sleep", "freelyUsable": true}],
+                    "stepTypeImpls": [{"stepType": "p.sleep", "kind": "native",
+                                       "implRef": "test.p.sleep"}],
                     "actions": {
-                        "a": {"steps": [{"id": "v", "type": "let", "params": {"value": 1}}]}
+                        "a": {"steps": [{"id": "v", "type": "let", "params": {"value": 1}}]},
+                        "slow": {
+                            "wallclockTimeoutMs": 50,
+                            "steps": [{"id": "s", "type": "p.sleep", "params": {}}]
+                        }
                     }
                 }"#,
             )
@@ -726,9 +749,29 @@ mod told_of_cancel_tests {
             let text = outcome
                 .result
                 .expect_err("the invoke of a missing action fails");
-            assert!(text.contains("missing"), "fired = {fired}: {text}");
+            assert!(
+                text.starts_with("io.invoke → p.missing failed"),
+                "the error arm was reached; fired = {fired}: {text}"
+            );
             assert!(!outcome.told_of_cancel, "fired = {fired}: {text}");
         }
+    }
+
+    /// A callee that hit its own, shorter cap under a quiet parent
+    /// token has failed for its own reasons, however cancellation-
+    /// shaped the error: the guard on the token is what keeps it from
+    /// counting as a telling.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_whose_callee_hit_its_own_deadline_under_a_quiet_token_was_not_told() {
+        let outcome = run_invoking("slow", tokio_util::sync::CancellationToken::new()).await;
+        let text = outcome
+            .result
+            .expect_err("the callee's deadline fails the invoke");
+        assert!(
+            text.starts_with("io.invoke → p.slow failed") && text.contains("wallclock"),
+            "{text}"
+        );
+        assert!(!outcome.told_of_cancel, "{text}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

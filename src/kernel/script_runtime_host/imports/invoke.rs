@@ -310,7 +310,8 @@ pub(super) fn register(
                             // write tells it; see `told_of_cancel`. A
                             // callee's own deadline under a quiet
                             // token is the callee's failure, not a
-                            // telling.
+                            // telling — the shape alone is not enough,
+                            // which is what the token check is for.
                             if state.cancel.is_cancelled()
                                 && crate::kernel::stopped_by_cancellation(&e)
                             {
@@ -629,14 +630,13 @@ pub(super) fn register(
                                 error = %e,
                                 "io.invoke_streaming failed"
                             );
-                            // As for `host_invoke`: a callee stopped by
-                            // this step's fired token tells the guest
-                            // of its cancel.
-                            if caller.data().cancel.is_cancelled()
-                                && crate::kernel::stopped_by_cancellation(&e)
-                            {
-                                caller.data_mut().told_of_cancel = true;
-                            }
+                            // Unlike `host_invoke`, nothing here can be
+                            // a telling: the spawn fails only on lookup,
+                            // validation, or a secret pull, none of them
+                            // cancellation-shaped. A spawned callee that
+                            // is later stopped by this step's token ends
+                            // its stream with a plain EOF, which reaches
+                            // the guest through `stream_read` untold.
                             bail_host_call(
                                 &mut caller,
                                 format!(

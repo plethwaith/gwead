@@ -1440,6 +1440,9 @@ async fn relay_unread(
         .await
         .expect("the parked writer is released and the pipeline ends")
         .expect("delivered");
+    // The events channel is bounded and a full channel drops rather
+    // than blocks; a one-step relay emits a handful, nowhere near the
+    // buffer, so nothing asserted on below can have been dropped.
     let mut events = Vec::new();
     while let Ok(Some(event)) =
         tokio::time::timeout(Duration::from_secs(1), handle.events.recv()).await
