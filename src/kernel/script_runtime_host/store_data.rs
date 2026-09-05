@@ -6,7 +6,7 @@
 //! - Result / error slots the wasm side writes via `host_set_result` /
 //!   `host_set_error`
 //! - A shared stream registry handle (for `stream_read` / `stream_write` /
-//!   `stream_close`)
+//!   `stream_close` / `stream_last_error`)
 //! - The dataflow output id (for `io.stream.output` if the step is
 //!   `long_running` in a dataflow action — `None` otherwise)
 //! - A cancellation token (for `is_cancelled`)

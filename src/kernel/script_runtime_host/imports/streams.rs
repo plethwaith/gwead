@@ -1,9 +1,14 @@
 //! Stream-handle host imports.
 //!
-//! Five imports the script runtime always provides:
+//! Six imports the script runtime always provides:
 //! - `stream_read(handle, buf_ptr, buf_len) -> i32` (async)
 //! - `stream_write(handle, buf_ptr, buf_len) -> i32` (async)
 //! - `stream_close(handle) -> i32`
+//! - `stream_last_error(handle, buf_ptr, buf_len) -> i32` — copies
+//!   the text behind the handle's last `STREAM_IO_ERROR` or
+//!   `STREAM_CANCELLED` into guest memory and returns the text's
+//!   full length, so one call with `buf_len` 0 sizes the buffer and
+//!   a second fills it. `0` when nothing is recorded.
 //! - `stream_output() -> i32` — returns the pre-resolved dataflow
 //!   output handle if the step is `long_running` in a dataflow action;
 //!   `STREAM_INVALID_HANDLE` otherwise.
@@ -123,6 +128,55 @@ pub(super) fn register(
             },
         )
         .map_err(|e| format!("stream_close: {e}"))?;
+
+    // The text behind a handle's last reasoned failure. Sync: the
+    // registry lock is taken only to clone the `Arc` out, and the
+    // per-stream lock only to clone the text.
+    //
+    // snprintf-shaped rather than the two-import call-result protocol:
+    // the text stays on the handle (`StreamState::last_error`), so a
+    // size probe is a zero-length call against the same slot, and a
+    // copy that did not fit is retried at the returned length. A
+    // truncated copy may end mid-codepoint; the return value is what
+    // a binding sizes by, not the bytes it got.
+    linker
+        .func_wrap(
+            crate::kernel::abi::ABI_MODULE,
+            "stream_last_error",
+            |mut caller: wasmtime::Caller<'_, ScriptRuntimeStoreData>,
+             handle: i32,
+             buf_ptr: i32,
+             buf_len: i32|
+             -> i32 {
+                let Some(id) = std::num::NonZeroU32::new(handle as u32) else {
+                    return crate::kernel::streams::STREAM_INVALID_HANDLE;
+                };
+                let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+                    return crate::kernel::streams::STREAM_IO_ERROR;
+                };
+                let state = {
+                    let streams_arc = caller.data().streams.clone();
+                    let reg = crate::kernel::streams::lock_shared(&streams_arc);
+                    match reg.get(id) {
+                        Some(s) => s,
+                        None => return crate::kernel::streams::STREAM_INVALID_HANDLE,
+                    }
+                };
+                let Some(text) = state.last_error() else {
+                    return 0;
+                };
+                let mem_data = mem.data_mut(&mut caller);
+                let start = buf_ptr as usize;
+                let copy_len = text.len().min(buf_len.max(0) as usize);
+                let end = match start.checked_add(copy_len) {
+                    Some(e) if e <= mem_data.len() => e,
+                    _ => return crate::kernel::streams::STREAM_OOB,
+                };
+                mem_data[start..end].copy_from_slice(&text.as_bytes()[..copy_len]);
+                text.len().min(i32::MAX as usize) as i32
+            },
+        )
+        .map_err(|e| format!("stream_last_error: {e}"))?;
 
     // Dataflow helper — sync, pure ExecutionState lookup.
     linker

@@ -120,14 +120,16 @@ host_set_error(ptr: i32, len: i32)
 host_set_result(ptr: i32, len: i32)
 is_cancelled() -> i32
 stream_close(handle: i32) -> i32
+stream_last_error(handle: i32, buf_ptr: i32, buf_len: i32) -> i32
 stream_output() -> i32
 stream_read(handle: i32, buf_ptr: i32, buf_len: i32) -> i32
 stream_write(handle: i32, buf_ptr: i32, buf_len: i32) -> i32
 ```
 
-The sections below detail the three core stream calls. The result,
-invoke, and call-result-protocol imports are registered and documented
-in [`script_runtime_host/imports/`](script_runtime_host/imports/).
+The sections below detail the three core stream calls and the call
+that explains a failed one. The result, invoke, and
+call-result-protocol imports are registered and documented in
+[`script_runtime_host/imports/`](script_runtime_host/imports/).
 
 ### `stream_read`
 
@@ -194,6 +196,29 @@ too. A handle of `0` or one not in the registry returns
 `STREAM_INVALID_HANDLE` (the same holds for every handle-taking
 import).
 
+### `stream_last_error`
+
+The text behind the last `STREAM_IO_ERROR` or `STREAM_CANCELLED` the
+handle returned: for a read, the source's own error (a streaming
+callee's is `"<plugin>.<action> failed: <error>"`, or `"… panicked:
+…"`); for a write, why it was released. Copies up to `buf_len` bytes
+of it into linear memory at `buf_ptr` and returns the text's **full**
+byte length, so a first call with `buf_len` `0` sizes the buffer and
+a second call fills it. Returns `0` when the handle has recorded
+nothing, `STREAM_INVALID_HANDLE` for an unknown handle, and
+`STREAM_OOB` when the copy would overrun linear memory. The other
+codes are self-describing and record no text.
+
+The text stays on the handle until a later failure replaces it:
+fetching it does not clear it, and neither does closing the handle,
+so a binding can tidy up first and explain afterwards. A copy that
+did not fit may end mid-codepoint; size by the return value, not by
+what arrived.
+
+The same failure is logged at `warn` by the read that found it,
+naming the stream id and the text, so an operator can correlate a
+guest's error with the callee's own warning.
+
 ## Return-code contract
 
 | Code | Constant | Meaning |
@@ -203,9 +228,9 @@ import).
 | `-2` | `STREAM_INVALID_HANDLE` | Handle not in the registry. |
 | `-3` | `STREAM_DIRECTION_MISMATCH` | Read on writable, write on readable. |
 | `-4` | `STREAM_CLOSED` | Handle closed via `stream_close`, or (on write) the paired consumer has gone away. |
-| `-5` | `STREAM_IO_ERROR` | Readable source returned an I/O error, or the guest exports no `memory`. |
+| `-5` | `STREAM_IO_ERROR` | Readable source returned an I/O error (its text is kept for `stream_last_error`), or the guest exports no `memory`. |
 | `-6` | `STREAM_OOB` | `buf_ptr + buf_len` exceeded linear memory. |
-| `-7` | `STREAM_CANCELLED` | A write waiting for room on a full channel was released by the step's cancellation token (caller cancel or wallclock deadline). Nothing was committed. |
+| `-7` | `STREAM_CANCELLED` | A write waiting for room on a full channel was released by the step's cancellation token (caller cancel or wallclock deadline). Nothing was committed. A text saying so is kept for `stream_last_error`. |
 
 Defined in [`streams.rs`](streams.rs). Any guest-side binding, ABI
 doc, or host function impl must reference these constants by name to
@@ -246,7 +271,10 @@ io.stream.close(handle)
 
 A binding like this would raise a language-level error on any
 non-EOF negative code from `read` and any negative code from `write`
-other than `STREAM_CANCELLED`, leaving the guest's usual
+other than `STREAM_CANCELLED` — with the text `stream_last_error`
+hands back as the error's message when the code is
+`STREAM_IO_ERROR`, so a relay's error says what its upstream said
+rather than only that it failed — leaving the guest's usual
 error-recovery idiom (`pcall` in Lua) to plugins that want to treat
 failures non-fatally. `STREAM_CANCELLED` is not a failure: it is the
 step's own cancel reaching a parked write, the same fact

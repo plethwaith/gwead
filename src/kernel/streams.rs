@@ -192,6 +192,15 @@ pub struct StreamInner {
     /// gone". A guest that conflates them will treat a use-after-close
     /// bug as a normal end of stream.
     pub closed: bool,
+    /// The text behind the last negative code this handle returned
+    /// that a code alone cannot carry: the source's error for
+    /// `STREAM_IO_ERROR`, and why a write was released for
+    /// `STREAM_CANCELLED`. Kept until a later failure replaces it —
+    /// reading it does not clear it, and a close does not either, so
+    /// a guest can size a buffer with one call and fill it with the
+    /// next, or read the text after it has closed the handle. The
+    /// other codes are self-describing and record nothing.
+    last_error: Option<String>,
 }
 
 impl StreamState {
@@ -202,6 +211,7 @@ impl StreamState {
             inner: Mutex::new(StreamInner {
                 direction,
                 closed: false,
+                last_error: None,
             }),
             read_gate: tokio::sync::Mutex::new(()),
         })
@@ -234,6 +244,16 @@ impl StreamState {
     /// Has this stream been closed? Takes the per-stream lock briefly.
     pub fn is_closed(&self) -> bool {
         self.lock_inner().closed
+    }
+
+    /// The text behind the last `STREAM_IO_ERROR` or `STREAM_CANCELLED`
+    /// this handle returned, if any: the source's error for a read,
+    /// [`STREAM_CANCELLED_TEXT`] for a released write. Kept until a
+    /// later failure replaces it — fetching it does not clear it, and
+    /// a close does not either. What the `stream_last_error` host
+    /// import hands a guest. Takes the per-stream lock briefly.
+    pub fn last_error(&self) -> Option<String> {
+        self.lock_inner().last_error.clone()
     }
 }
 
@@ -785,7 +805,7 @@ impl StreamState {
         };
 
         // Step 2: pull next chunk if needed, no lock held.
-        let mut io_error = false;
+        let mut io_error: Option<std::io::Error> = None;
         let mut eof = false;
         if leftover.is_none() {
             // Skip empty chunks rather than reporting them as EOF.
@@ -807,8 +827,8 @@ impl StreamState {
                         leftover = Some(chunk);
                         break;
                     }
-                    Some(Err(_)) => {
-                        io_error = true;
+                    Some(Err(err)) => {
+                        io_error = Some(err);
                         break;
                     }
                     None => {
@@ -822,7 +842,7 @@ impl StreamState {
         // Step 3: copy leftover into buf.
         let mut bytes_written: i32 = 0;
         let new_leftover = if !eof
-            && !io_error
+            && io_error.is_none()
             && let Some(chunk) = leftover.take()
         {
             let n = buf.len().min(chunk.len());
@@ -856,8 +876,24 @@ impl StreamState {
         // `read_reports_an_error_item_once_and_then_eof` pins. Making
         // the error sticky too would turn one failed read into a
         // stream that can never report its EOF.
+        //
+        // The error's text is kept on the handle and logged here. The
+        // code the guest gets says only that the source failed; the
+        // text says why, and a guest fetches it through
+        // `stream_last_error` to put in its own error. The log is the
+        // operator's side of the same correlation: a spawned streaming
+        // callee warns when it fails, and this is the read that found
+        // that failure.
         {
             let mut inner = self.lock_inner();
+            if let Some(err) = &io_error {
+                tracing::warn!(
+                    stream_id = self.id.get(),
+                    error = %err,
+                    "stream_read: the source failed; the reader gets STREAM_IO_ERROR"
+                );
+                inner.last_error = Some(err.to_string());
+            }
             if !inner.closed
                 && let StreamDirection::Readable {
                     source: cur_source,
@@ -873,7 +909,7 @@ impl StreamState {
             }
         }
 
-        if io_error {
+        if io_error.is_some() {
             STREAM_IO_ERROR
         } else if eof {
             STREAM_EOF
@@ -927,7 +963,15 @@ impl StreamState {
                 Ok(()) => data.len() as i32,
                 Err(_) => STREAM_CLOSED,
             },
-            () = cancel.cancelled() => STREAM_CANCELLED,
+            () = cancel.cancelled() => {
+                // Recorded for `stream_last_error` like a read's
+                // failure text, so a guest binding that reports every
+                // negative code through one path finds a reason here
+                // too.
+                self.lock_inner().last_error =
+                    Some(STREAM_CANCELLED_TEXT.to_string());
+                STREAM_CANCELLED
+            }
         }
     }
 }
@@ -1013,6 +1057,10 @@ pub const STREAM_OOB: i32 = -6;
 /// Distinct from [`STREAM_CLOSED`] so a guest can tell a consumer that
 /// went away (finish cleanly) from a stop it was told to make.
 pub const STREAM_CANCELLED: i32 = -7;
+/// The text [`StreamState::last_error`] carries for a write that
+/// returned [`STREAM_CANCELLED`].
+pub const STREAM_CANCELLED_TEXT: &str =
+    "write released by the step's cancellation token; nothing was committed";
 
 #[cfg(test)]
 mod tests {
@@ -1287,6 +1335,41 @@ mod tests {
         assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
     }
 
+    /// The code says the source failed; the text says why, and the
+    /// handle keeps it: through the EOF that follows the error item,
+    /// through repeated fetches, and through a close — the ways a
+    /// guest binding that reports the failure after tidying up gets
+    /// to it.
+    #[tokio::test]
+    async fn read_keeps_the_error_text_on_the_handle() {
+        let mut reg = StreamRegistry::new();
+        let items = vec![
+            Ok(Bytes::from_static(b"ab")),
+            Err(std::io::Error::other("upstream fell over")),
+        ];
+        let source: ReadableSource = Box::pin(futures::stream::iter(items));
+        let id = reg.register_readable("application/octet-stream", source);
+        let state = reg.get(id).unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(state.read_async(&mut buf).await, 2);
+        assert_eq!(state.last_error(), None, "a clean read records nothing");
+        assert_eq!(state.read_async(&mut buf).await, STREAM_IO_ERROR);
+        assert_eq!(state.last_error().as_deref(), Some("upstream fell over"));
+        assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
+        assert_eq!(
+            state.last_error().as_deref(),
+            Some("upstream fell over"),
+            "the EOF after the error item does not clear it"
+        );
+        assert_eq!(reg.close_handle(id), 0);
+        assert_eq!(state.read_async(&mut buf).await, STREAM_CLOSED);
+        assert_eq!(
+            state.last_error().as_deref(),
+            Some("upstream fell over"),
+            "a close does not clear it either"
+        );
+    }
+
     #[tokio::test]
     async fn write_async_sends_bytes_to_paired_receiver() {
         let mut reg = StreamRegistry::new();
@@ -1337,10 +1420,20 @@ mod tests {
             })
         };
         assert_eq!(
+            state.last_error(),
+            None,
+            "a committed write records nothing"
+        );
+        assert_eq!(
             state.write_async(b"parked", &cancel).await,
             STREAM_CANCELLED
         );
         firing.await.unwrap();
+        assert_eq!(
+            state.last_error().as_deref(),
+            Some(STREAM_CANCELLED_TEXT),
+            "the released write records why, for stream_last_error"
+        );
 
         let queued = rx.try_recv().unwrap().unwrap();
         assert_eq!(queued, Bytes::from_static(b"fits"));

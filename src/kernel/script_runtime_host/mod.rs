@@ -494,6 +494,249 @@ async fn execute_in_store(
 }
 
 #[cfg(test)]
+mod stream_last_error_tests {
+    //! What a guest learns of a streaming callee's failure through
+    //! `stream_last_error`: the text behind the `STREAM_IO_ERROR` its
+    //! `stream_read` returned, or nothing after a clean EOF.
+    use super::*;
+
+    type StepFuture<'a> = Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        crate::kernel::host_api::StepOutput,
+                        crate::kernel::host_api::StepError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >;
+
+    /// Write one chunk to the step's dataflow output, then end as
+    /// `params.then` says: `"ok"`, `"fail"` or `"panic"`.
+    fn write_then<'a>(
+        ex: &'a mut (dyn crate::kernel::host_api::PluginExecution + Send),
+        params: &'a Value,
+    ) -> StepFuture<'a> {
+        Box::pin(async move {
+            let writable = ex
+                .dataflow_outputs()
+                .get(ex.current_step_id())
+                .copied()
+                .expect("a pre-provisioned writable");
+            let n = crate::kernel::streams::write_async_shared(
+                ex.streams(),
+                writable,
+                b"partial",
+                &ex.cancel_token(),
+            )
+            .await;
+            assert!(n > 0, "the chunk before the end is accepted");
+            match params["then"].as_str() {
+                Some("fail") => Err(crate::kernel::host_api::StepError::Failed(
+                    "upstream fell over".into(),
+                )),
+                Some("panic") => panic!("relay body fell over"),
+                _ => Ok(crate::kernel::host_api::StepOutput::from(Value::Null)),
+            }
+        })
+    }
+
+    /// A kernel with plugin `p` as the relaying guest's parent, and
+    /// three dataflow actions whose one long-running step writes a
+    /// chunk and then ends cleanly (`ok`), fails (`fail`), or panics
+    /// (`boom`).
+    fn kernel_with_p() -> std::sync::Arc<crate::kernel::Kernel> {
+        let mut config = crate::kernel::KernelConfig::default();
+        config
+            .native_step_impls
+            .insert("test.p.write_then", write_then)
+            .expect("fresh table");
+        let mut kernel = crate::kernel::Kernel::boot(config).expect("boot");
+        let action = |then: &str| {
+            format!(
+                r#""dataflow": true,
+                   "steps": [{{"id": "produce", "type": "p.write_then",
+                              "params": {{"then": "{then}"}}, "longRunning": true}}]"#
+            )
+        };
+        kernel
+            .register_plugin_from_json(&format!(
+                r#"{{
+                    "name": "p",
+                    "version": "0.0.0",
+                    "stepTypeDefs": [{{"name": "p.write_then", "freelyUsable": true}}],
+                    "stepTypeImpls": [{{"stepType": "p.write_then", "kind": "native",
+                                       "implRef": "test.p.write_then"}}],
+                    "actions": {{
+                        "ok": {{{}}},
+                        "fail": {{{}}},
+                        "boom": {{{}}}
+                    }}
+                }}"#,
+                action("ok"),
+                action("fail"),
+                action("panic"),
+            ))
+            .expect("registers");
+        kernel.into_arc()
+    }
+
+    /// A guest that streams `p.<action>` through `host_invoke_streaming`
+    /// and reads it to the end. On `STREAM_IO_ERROR` it sizes the
+    /// text with a zero-length `stream_last_error`, fetches it with a
+    /// second call, and raises with it — the binding shape the ABI doc
+    /// describes. On `STREAM_EOF` it reports `"clean"` if the handle
+    /// has no text and `"stale"` if it has; any other code is
+    /// `"other"`. A failed invoke raises with the host's call-error
+    /// text so the test sees why.
+    fn relaying_guest(action: &str) -> Vec<u8> {
+        let m = crate::kernel::abi::ABI_MODULE;
+        let action_len = action.len();
+        let io_error = crate::kernel::streams::STREAM_IO_ERROR;
+        let eof = crate::kernel::streams::STREAM_EOF;
+        let wat = format!(
+            r#"
+            (module
+              (import "{m}" "host_set_result" (func $host_set_result (param i32 i32)))
+              (import "{m}" "host_set_error" (func $host_set_error (param i32 i32)))
+              (import "{m}" "host_call_result_size" (func $call_result_size (result i32)))
+              (import "{m}" "host_call_result_read"
+                (func $call_result_read (param i32 i32) (result i32)))
+              (import "{m}" "host_invoke_streaming"
+                (func $invoke_streaming (param i32 i32 i32 i32 i32 i32) (result i32)))
+              (import "{m}" "stream_read" (func $stream_read (param i32 i32 i32) (result i32)))
+              (import "{m}" "stream_last_error"
+                (func $stream_last_error (param i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 8) "\"clean\"")
+              (data (i32.const 16) "\"stale\"")
+              (data (i32.const 24) "\"other\"")
+              (data (i32.const 32) "{{\"plugin\": \"p\"}}")
+              (data (i32.const 48) "{action}")
+              (data (i32.const 64) "{{}}")
+              (global $next (mut i32) (i32.const 128))
+              (func (export "alloc") (param $len i32) (result i32)
+                (local $ptr i32)
+                global.get $next
+                local.set $ptr
+                global.get $next
+                local.get $len
+                i32.add
+                global.set $next
+                local.get $ptr)
+              (func (export "execute") (param i32 i32 i32 i32) (result i32)
+                (local $h i32)
+                (local $rc i32)
+                (local $len i32)
+                (local.set $h (call $invoke_streaming
+                  (i32.const 32) (i32.const 15)
+                  (i32.const 48) (i32.const {action_len})
+                  (i32.const 64) (i32.const 2)))
+                (if (i32.le_s (local.get $h) (i32.const 0))
+                  (then
+                    (local.set $len (call $call_result_size))
+                    (drop (call $call_result_read (i32.const 8192) (local.get $len)))
+                    (call $host_set_error (i32.const 8192) (local.get $len))
+                    (return (i32.const 0))))
+                (block $done
+                  (loop $again
+                    (local.set $rc
+                      (call $stream_read (local.get $h) (i32.const 4096) (i32.const 64)))
+                    (br_if $done (i32.lt_s (local.get $rc) (i32.const 0)))
+                    (br $again)))
+                (if (i32.eq (local.get $rc) (i32.const {io_error}))
+                  (then
+                    (local.set $len
+                      (call $stream_last_error (local.get $h) (i32.const 0) (i32.const 0)))
+                    (drop (call $stream_last_error
+                      (local.get $h) (i32.const 8192) (local.get $len)))
+                    (call $host_set_error (i32.const 8192) (local.get $len))
+                    (return (i32.const 0))))
+                (if (i32.eq (local.get $rc) (i32.const {eof}))
+                  (then
+                    (if (i32.eqz
+                          (call $stream_last_error (local.get $h) (i32.const 0) (i32.const 0)))
+                      (then (call $host_set_result (i32.const 8) (i32.const 7)))
+                      (else (call $host_set_result (i32.const 16) (i32.const 7))))
+                    (return (i32.const 1))))
+                (call $host_set_result (i32.const 24) (i32.const 7))
+                (i32.const 1))
+            )
+            "#
+        );
+        wat::parse_str(&wat).expect("wat parses")
+    }
+
+    async fn run_relaying(action: &str) -> Result<String, String> {
+        let kernel = kernel_with_p();
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config).expect("engine");
+        let module = Module::new(&engine, relaying_guest(action)).expect("module compiles");
+        let parent = ScriptRuntimeParentContext {
+            kernel: Some(std::sync::Arc::downgrade(&kernel)),
+            plugin: "p".into(),
+            config: Value::Null,
+            secret_resolver: None,
+            exec_ctx: Default::default(),
+            invoke_depth: 0,
+            deadline: None,
+        };
+        run_script_runtime(
+            &engine,
+            &module,
+            "",
+            b"{}",
+            &Default::default(),
+            &crate::kernel::RuntimeLimits::default(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            parent,
+        )
+        .await
+        .result
+    }
+
+    /// A callee that ends cleanly leaves nothing on the handle: the
+    /// guest reads to EOF and the probe answers 0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_finds_no_text_after_a_clean_stream() {
+        assert_eq!(run_relaying("ok").await, Ok("\"clean\"".into()));
+    }
+
+    /// A callee that fails reaches the guest as `STREAM_IO_ERROR`, and
+    /// `stream_last_error` explains it: the guest's own error carries
+    /// the callee's name and what went wrong, sized by the probe and
+    /// fetched whole.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_finds_a_failed_callees_text() {
+        let text = run_relaying("fail")
+            .await
+            .expect_err("the guest raises with the failure text");
+        assert!(
+            text.contains("p.fail failed") && text.contains("upstream fell over"),
+            "the guest's error carries the callee's failure: {text}"
+        );
+    }
+
+    /// A callee whose body panics reaches the guest the same way,
+    /// with the panic in the text rather than a clean EOF.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_finds_a_panicking_callees_text() {
+        let text = run_relaying("boom")
+            .await
+            .expect_err("the guest raises with the panic text");
+        assert!(
+            text.contains("p.boom failed")
+                && text.contains("panicked")
+                && text.contains("relay body fell over"),
+            "the guest's error carries the callee's panic: {text}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod told_of_cancel_tests {
     //! The gate on reading a guest's error as its cancellation is
     //! whether a host import told the guest about the cancel, not
@@ -1016,6 +1259,7 @@ mod abi_alignment_tests {
         "host_set_result",
         "is_cancelled",
         "stream_close",
+        "stream_last_error",
         "stream_output",
         "stream_read",
         "stream_write",
@@ -1104,6 +1348,7 @@ mod abi_alignment_tests {
               (import "{m}" "stream_read"     (func (param i32 i32 i32) (result i32)))
               (import "{m}" "stream_write"    (func (param i32 i32 i32) (result i32)))
               (import "{m}" "stream_close"    (func (param i32) (result i32)))
+              (import "{m}" "stream_last_error" (func (param i32 i32 i32) (result i32)))
               (import "{m}" "stream_output"   (func (result i32)))
               (import "{m}" "is_cancelled"    (func (result i32)))
               (import "{m}" "host_invoke"

@@ -6,7 +6,7 @@
 //! | Module | Imports | Purpose |
 //! |--------|---------|---------|
 //! | [`result`] | `host_set_result`, `host_set_error`, `host_log` | Script-result marshaling + logging |
-//! | [`streams`] | `stream_read`, `stream_write`, `stream_close`, `stream_output`, `is_cancelled` | Stream-handle I/O + cancellation |
+//! | [`streams`] | `stream_read`, `stream_write`, `stream_close`, `stream_last_error`, `stream_output`, `is_cancelled` | Stream-handle I/O, failure text + cancellation |
 //! | [`invoke`] | `host_invoke`, `host_invoke_streaming` | Recurse-into-kernel action invocation |
 //! | [`call_result`] | `host_call_result_size`, `host_call_result_read` | Single-slot result-stash drain (used by `invoke`) |
 
