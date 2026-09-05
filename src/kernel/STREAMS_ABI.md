@@ -244,9 +244,18 @@ io.stream.close(handle)
 ```
 
 A binding like this would raise a language-level error on any
-non-EOF negative code from `read` and any negative code from
-`write`, leaving the guest's usual error-recovery idiom (`pcall` in
-Lua) to plugins that want to treat failures non-fatally.
+non-EOF negative code from `read` and any negative code from `write`
+other than `STREAM_CANCELLED`, leaving the guest's usual
+error-recovery idiom (`pcall` in Lua) to plugins that want to treat
+failures non-fatally. `STREAM_CANCELLED` is not a failure: it is the
+step's own cancel reaching a parked write, the same fact
+`is_cancelled` reports, and a binding should surface it the same way
+— `write` returning `false`, say, so the script stops producing and
+returns normally. A guest has no typed cancellation of its own; a
+script error raised after the step's token has fired is reported by
+the host as the cancellation rather than as a failure, so a binding
+that does raise on it still winds down correctly, but the guest's own
+error text is then only logged.
 
 ## Example: a streaming HTTP step (embedder-provided)
 

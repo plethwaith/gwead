@@ -12,6 +12,7 @@
 use std::future::Future;
 use std::num::NonZeroU32;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
@@ -70,6 +71,9 @@ fn simple_manifest(name: &str, actions: IndexMap<String, Action>) -> PluginManif
 /// EOF. Honours the action's cancellation token: a fire aborts the loop
 /// after the current chunk.
 ///
+/// Reports `stopped_on`: the negative `stream_write` code that ended
+/// the loop early, or `null` when every chunk was written.
+///
 /// Params:
 /// - `chunk_count` (u64, default 10) — how many chunks to write
 /// - `chunk_size` (u64, default 64) — bytes per chunk
@@ -110,6 +114,7 @@ fn dataflow_producer<'a>(
         let cancel = ex.cancel_token();
         let chunk: Vec<u8> = vec![chunk_byte; chunk_size];
         let mut produced: u64 = 0;
+        let mut stopped_on: Option<i32> = None;
         for _ in 0..chunk_count {
             if cancel.is_cancelled() {
                 break;
@@ -125,7 +130,9 @@ fn dataflow_producer<'a>(
                 // The receiver was dropped (consumer side gone), or a
                 // parked write was released by the token — surface as
                 // a graceful exit rather than a hard error so
-                // cancellation tests see a clean shutdown.
+                // cancellation tests see a clean shutdown, and report
+                // the code so a test can tell the two apart.
+                stopped_on = Some(n);
                 break;
             }
             produced += 1;
@@ -137,6 +144,7 @@ fn dataflow_producer<'a>(
             "produced_chunks": produced,
             "chunk_size": chunk_size,
             "cancelled": cancel.is_cancelled(),
+            "stopped_on": stopped_on,
         })))
     })
 }
@@ -172,17 +180,19 @@ fn dataflow_producer_with_progress<'a>(
         let cancel = ex.cancel_token();
         let chunk: Vec<u8> = vec![chunk_byte; chunk_size];
         let mut bytes_written: u64 = 0;
+        let mut produced: u64 = 0;
         for _ in 0..chunk_count {
             let n = streams::write_async_shared(&streams_arc, writable, &chunk, &cancel).await;
             if n < 0 {
                 break;
             }
             bytes_written += n as u64;
+            produced += 1;
             ex.emit_progress(&step_id, json!({ "bytes_written": bytes_written }));
         }
         streams::lock_shared(&streams_arc).close_handle(writable);
         Ok(StepOutput::from(
-            json!({ "produced_chunks": chunk_count, "bytes": bytes_written }),
+            json!({ "produced_chunks": produced, "bytes": bytes_written }),
         ))
     })
 }
@@ -321,31 +331,13 @@ fn boot_kernel() -> Kernel {
     boot_kernel_with_limits(gwead::kernel::RuntimeLimits::default())
 }
 
-/// [`boot_kernel`], but with the write-until-refused guest (see
-/// `script_runtime_mock::build_write_until_refused_wasm_bytes`) as the
-/// `(script, "lua")` runtime, for tests that park a real wasm guest
-/// inside `stream_write`.
-fn boot_kernel_with_write_until_refused_guest() -> Kernel {
-    let mut native_step_impls = gwead::kernel::native_impls::NativeStepImplTable::empty();
-    seed_dataflow_test_impls(&mut native_step_impls);
-    let mut kernel = Kernel::boot(common::script_runtime_mock::trusting(
-        KernelConfig::default().with_native_step_impls(native_step_impls),
-        &["lua"],
-    ))
-    .expect("kernel boot");
-    common::script_runtime_mock::register_module_for_language(
-        &mut kernel,
-        "lua",
-        common::script_runtime_mock::build_write_until_refused_wasm_bytes(),
-    )
-    .expect("write-until-refused guest registers");
-    kernel
-        .register_plugin_from_json(DATAFLOW_TEST_FIXTURE_MANIFEST)
-        .expect("dataflow test fixture registers");
-    kernel
+fn boot_kernel_with_limits(limits: gwead::kernel::RuntimeLimits) -> Kernel {
+    boot_kernel_with(limits, common::script_runtime_mock::build_wasm_bytes())
 }
 
-fn boot_kernel_with_limits(limits: gwead::kernel::RuntimeLimits) -> Kernel {
+/// Boot a kernel with the dataflow fixture, `limits`, and `runtime` as
+/// the `(script, "lua")` runtime module.
+fn boot_kernel_with(limits: gwead::kernel::RuntimeLimits, runtime: Vec<u8>) -> Kernel {
     let mut native_step_impls = gwead::kernel::native_impls::NativeStepImplTable::empty();
     seed_dataflow_test_impls(&mut native_step_impls);
     let mut kernel = Kernel::boot(common::script_runtime_mock::trusting(
@@ -359,7 +351,8 @@ fn boot_kernel_with_limits(limits: gwead::kernel::RuntimeLimits) -> Kernel {
     // script runtime so `(script, "lua")` dispatches in tests that
     // include a `script` step. Lua-semantic tests belong with the
     // runtime plugin, not here.
-    common::script_runtime_mock::register(&mut kernel).expect("mock script runtime registers");
+    common::script_runtime_mock::register_module_for_language(&mut kernel, "lua", runtime)
+        .expect("mock script runtime registers");
     kernel
         .register_plugin_from_json(DATAFLOW_TEST_FIXTURE_MANIFEST)
         .expect("dataflow test fixture registers");
@@ -1387,61 +1380,68 @@ async fn streaming_handle_cancel_propagates_into_producer() {
     );
 }
 
-/// A consumer that holds its readable open but never reads leaves the
-/// producer parked on a full channel, inside `stream_write`, where it
-/// cannot poll its token. Cancelling the handle must still end the
-/// pipeline: the parked write is released with `STREAM_CANCELLED`,
-/// the producer stops, and the result arrives. Before the backstop
-/// this hung forever — the `timeout` is what turns that into a
-/// failure.
-#[tokio::test(flavor = "multi_thread")]
-async fn cancel_releases_a_producer_parked_on_a_stalled_consumer() {
-    let kernel = {
-        let mut k = boot_kernel();
-        let mut actions = IndexMap::new();
-        actions.insert(
-            "relay".to_string(),
-            dataflow_action(vec![long_running_step(
-                "producer",
-                "test_dataflow_fixture.dataflow_producer",
-                json!({ "chunk_count": 100_000, "chunk_size": 16 }),
-            )]),
-        );
-        k.register_plugin(simple_manifest("p", actions)).unwrap();
-        k.into_arc()
-    };
+/// A kernel whose plugin `p` has one dataflow action, `relay`, with a
+/// single long-running step `producer` of `step_type` and `params`.
+fn kernel_with_relay(kernel: Kernel, step_type: &str, params: Value) -> Arc<Kernel> {
+    let mut k = kernel;
+    let mut actions = IndexMap::new();
+    actions.insert(
+        "relay".to_string(),
+        dataflow_action(vec![long_running_step("producer", step_type, params)]),
+    );
+    k.register_plugin(simple_manifest("p", actions)).unwrap();
+    k.into_arc()
+}
 
+/// Run `p.relay` as a dataflow streaming handle whose output is held
+/// open and never read, give the producer time to fill the channel and
+/// park inside its write, cancel, and hand back the pipeline's result.
+/// The result must arrive: before the write backstop this hung
+/// forever, and the timeout is what turns that into a failure.
+async fn cancel_once_parked(
+    kernel: &Arc<Kernel>,
+) -> Result<gwead::kernel::types::ActionResult, KernelError> {
     let handle = kernel
         .execute("p", "relay", json!({}))
         .with_config(&json!({}))
         .with_exec_ctx(gwead::kernel::ExecutionContext::default())
         .into_dataflow_streaming_handle()
         .expect("handle");
-
-    // Long enough for the producer to fill the channel and park. The
-    // output is deliberately held open and never read.
     tokio::time::sleep(Duration::from_millis(100)).await;
     handle.cancel();
-
-    let action_result = tokio::time::timeout(Duration::from_secs(5), handle.result)
+    let result = tokio::time::timeout(Duration::from_secs(5), handle.result)
         .await
         .expect("the cancel reaches the parked writer and the pipeline ends")
-        .expect("delivered")
-        .expect("ok");
-    let produced = action_result.step_results["producer"]["produced_chunks"]
-        .as_u64()
-        .expect("u64");
-    assert!(
-        action_result.step_results["producer"]["cancelled"]
-            .as_bool()
-            .expect("bool"),
-        "the producer stopped because it was cancelled"
+        .expect("delivered");
+    drop(handle.output);
+    result
+}
+
+/// A consumer that holds its readable open but never reads leaves the
+/// producer parked on a full channel, inside `stream_write`, where it
+/// cannot poll its token. Cancelling the handle must still end the
+/// pipeline: the parked write comes back `STREAM_CANCELLED` — not
+/// `STREAM_CLOSED`, the consumer is still there — and the producer
+/// stops at the channel's capacity.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_releases_a_producer_parked_on_a_stalled_consumer() {
+    let kernel = kernel_with_relay(
+        boot_kernel(),
+        "test_dataflow_fixture.dataflow_producer",
+        json!({ "chunk_count": 100_000, "chunk_size": 16 }),
     );
+    let action_result = cancel_once_parked(&kernel).await.expect("ok");
+    let producer = &action_result.step_results["producer"];
+    assert_eq!(
+        producer["stopped_on"],
+        json!(streams::STREAM_CANCELLED),
+        "the parked write was released by the token"
+    );
+    let produced = producer["produced_chunks"].as_u64().expect("u64");
     assert!(
         produced < 100_000,
         "the producer stopped at the channel's capacity, not the end: {produced}"
     );
-    drop(handle.output);
 }
 
 /// The same stall with a real wasm guest: the guest loops on the
@@ -1451,40 +1451,44 @@ async fn cancel_releases_a_producer_parked_on_a_stalled_consumer() {
 /// keys its shutdown on.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_releases_a_wasm_guest_parked_in_stream_write() {
-    let kernel = {
-        let mut k = boot_kernel_with_write_until_refused_guest();
-        let mut actions = IndexMap::new();
-        actions.insert(
-            "relay".to_string(),
-            dataflow_action(vec![long_running_step(
-                "producer",
-                "script",
-                json!({ "language": "lua", "source": "-- writes until refused" }),
-            )]),
-        );
-        k.register_plugin(simple_manifest("p", actions)).unwrap();
-        k.into_arc()
-    };
-
-    let handle = kernel
-        .execute("p", "relay", json!({}))
-        .with_config(&json!({}))
-        .with_exec_ctx(gwead::kernel::ExecutionContext::default())
-        .into_dataflow_streaming_handle()
-        .expect("handle");
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    handle.cancel();
-
-    let action_result = tokio::time::timeout(Duration::from_secs(5), handle.result)
-        .await
-        .expect("the cancel reaches the guest parked in stream_write")
-        .expect("delivered")
-        .expect("ok");
+    let kernel = kernel_with_relay(
+        boot_kernel_with(
+            gwead::kernel::RuntimeLimits::default(),
+            common::script_runtime_mock::build_write_until_refused_wasm_bytes(
+                common::script_runtime_mock::OnCancelled::ReturnResult,
+            ),
+        ),
+        "script",
+        json!({ "language": "lua", "source": "-- writes until refused" }),
+    );
+    let action_result = cancel_once_parked(&kernel).await.expect("ok");
     assert_eq!(
         action_result.step_results["producer"],
         json!("cancelled"),
         "the guest's parked write returned STREAM_CANCELLED"
     );
-    drop(handle.output);
+}
+
+/// A binding that raises on `STREAM_CANCELLED` instead of letting its
+/// script return: the guest has no typed cancellation of its own, so
+/// the host reads a script error under a fired token as the cancel.
+/// The pipeline winds down as it does for a guest that returned —
+/// `Ok`, not a step failure carrying the guest's error text.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guest_that_raises_on_stream_cancelled_is_winding_down_not_failing() {
+    let kernel = kernel_with_relay(
+        boot_kernel_with(
+            gwead::kernel::RuntimeLimits::default(),
+            common::script_runtime_mock::build_write_until_refused_wasm_bytes(
+                common::script_runtime_mock::OnCancelled::RaiseError,
+            ),
+        ),
+        "script",
+        json!({ "language": "lua", "source": "-- raises when refused" }),
+    );
+    let result = cancel_once_parked(&kernel).await;
+    assert!(
+        result.is_ok(),
+        "a guest error after the cancel is the cancel, not a failure: {result:?}"
+    );
 }

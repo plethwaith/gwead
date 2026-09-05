@@ -915,24 +915,19 @@ impl StreamState {
             }
         };
         let bytes = Bytes::copy_from_slice(data);
-        let bytes = match sink.try_send(Ok(bytes)) {
-            Ok(()) => return data.len() as i32,
-            Err(mpsc::error::TrySendError::Closed(_)) => return STREAM_CLOSED,
-            Err(mpsc::error::TrySendError::Full(bytes)) => bytes,
-        };
-        // `biased` so a token that fires while the send is parked wins
-        // the very next poll, and so the outcome under a token that
-        // is already fired does not depend on which arm the select
-        // happens to try first. `Sender::send` reserves a slot and
-        // commits in one poll, so losing the race never leaves a
-        // half-sent chunk behind.
+        // The send is polled first, every poll: a chunk the channel
+        // has room for is committed and a receiver that has gone away
+        // is reported whatever the token says, and only a send that
+        // has to wait falls through to the token. `Sender::send`
+        // reserves a slot and commits in one poll, so losing the race
+        // never leaves a half-sent chunk behind.
         tokio::select! {
             biased;
-            () = cancel.cancelled() => STREAM_CANCELLED,
-            sent = sink.send(bytes) => match sent {
+            sent = sink.send(Ok(bytes)) => match sent {
                 Ok(()) => data.len() as i32,
                 Err(_) => STREAM_CLOSED,
             },
+            () = cancel.cancelled() => STREAM_CANCELLED,
         }
     }
 }

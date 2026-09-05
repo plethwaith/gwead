@@ -62,11 +62,6 @@ pub(super) fn register(
             |mut caller: wasmtime::Caller<'_, ScriptRuntimeStoreData>,
              (handle, buf_ptr, buf_len): (i32, i32, i32)| {
                 let id = std::num::NonZeroU32::new(handle as u32);
-                let streams_arc = caller.data().streams.clone();
-                // The step's token releases a send parked on a full
-                // channel (`STREAM_CANCELLED`); a guest parked inside
-                // this import cannot poll `is_cancelled` itself.
-                let cancel = caller.data().cancel.clone();
                 let mem = caller.get_export("memory").and_then(|e| e.into_memory());
                 Box::new(async move {
                     let Some(id) = id else {
@@ -87,8 +82,21 @@ pub(super) fn register(
                         };
                         mem_data[start..end].to_vec()
                     };
-                    crate::kernel::streams::write_async_shared(&streams_arc, id, &buf, &cancel)
-                        .await
+                    // Registry and token are borrowed from the store
+                    // rather than cloned per chunk: the snapshot above
+                    // released the memory borrow, so nothing else holds
+                    // `caller` across the await. The step's token
+                    // releases a send parked on a full channel
+                    // (`STREAM_CANCELLED`); a guest parked inside this
+                    // import cannot poll `is_cancelled` itself.
+                    let data = caller.data();
+                    crate::kernel::streams::write_async_shared(
+                        &data.streams,
+                        id,
+                        &buf,
+                        &data.cancel,
+                    )
+                    .await
                 })
             },
         )

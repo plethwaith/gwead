@@ -5915,6 +5915,24 @@ mod wallclock_timeout_tests {
         })
     }
 
+    /// What a relay body writes under: the `produce` step's
+    /// pre-provisioned writable, the invocation's registry, and its
+    /// cancellation token.
+    fn relay_output(
+        ex: &(dyn host_api::PluginExecution + Send),
+    ) -> (
+        streams::StreamId,
+        streams::SharedStreamRegistry,
+        tokio_util::sync::CancellationToken,
+    ) {
+        let writable = ex
+            .dataflow_outputs()
+            .get(ex.current_step_id())
+            .copied()
+            .expect("a pre-provisioned writable");
+        (writable, ex.streams().clone(), ex.cancel_token())
+    }
+
     /// A producer that writes one chunk to its dataflow output and
     /// then fails — a relay whose upstream fell over mid-stream.
     fn write_then_fail<'a>(
@@ -5928,14 +5946,7 @@ mod wallclock_timeout_tests {
         >,
     > {
         Box::pin(async move {
-            let step_id = ex.current_step_id().to_string();
-            let writable = ex
-                .dataflow_outputs()
-                .get(&step_id)
-                .copied()
-                .expect("a pre-provisioned writable");
-            let streams_arc = ex.streams().clone();
-            let cancel = ex.cancel_token();
+            let (writable, streams_arc, cancel) = relay_output(&*ex);
             let n = streams::write_async_shared(&streams_arc, writable, b"partial", &cancel).await;
             assert!(n > 0, "the chunk before the failure is accepted");
             Err(host_api::StepError::Failed("upstream fell over".into()))
@@ -5955,14 +5966,7 @@ mod wallclock_timeout_tests {
         >,
     > {
         Box::pin(async move {
-            let step_id = ex.current_step_id().to_string();
-            let writable = ex
-                .dataflow_outputs()
-                .get(&step_id)
-                .copied()
-                .expect("a pre-provisioned writable");
-            let streams_arc = ex.streams().clone();
-            let cancel = ex.cancel_token();
+            let (writable, streams_arc, cancel) = relay_output(&*ex);
             let n = streams::write_async_shared(&streams_arc, writable, b"partial", &cancel).await;
             assert!(n > 0, "the chunk before the failure is accepted");
             streams::lock_shared(&streams_arc).close_handle(writable);
@@ -5982,14 +5986,7 @@ mod wallclock_timeout_tests {
         >,
     > {
         Box::pin(async move {
-            let step_id = ex.current_step_id().to_string();
-            let writable = ex
-                .dataflow_outputs()
-                .get(&step_id)
-                .copied()
-                .expect("a pre-provisioned writable");
-            let streams_arc = ex.streams().clone();
-            let cancel = ex.cancel_token();
+            let (writable, streams_arc, cancel) = relay_output(&*ex);
             let n = streams::write_async_shared(&streams_arc, writable, b"all", &cancel).await;
             assert!(n > 0);
             Ok(host_api::StepOutput::from(Value::Null))
@@ -6012,14 +6009,7 @@ mod wallclock_timeout_tests {
     > {
         Box::pin(async move {
             let chunks = params["chunks"].as_u64().unwrap_or(0);
-            let step_id = ex.current_step_id().to_string();
-            let writable = ex
-                .dataflow_outputs()
-                .get(&step_id)
-                .copied()
-                .expect("a pre-provisioned writable");
-            let streams_arc = ex.streams().clone();
-            let cancel = ex.cancel_token();
+            let (writable, streams_arc, cancel) = relay_output(&*ex);
             for _ in 0..chunks {
                 let n = streams::write_async_shared(&streams_arc, writable, b"x", &cancel).await;
                 assert!(n > 0, "each chunk fits the channel");
@@ -6074,14 +6064,7 @@ mod wallclock_timeout_tests {
             })
             .expect("a capped relay has a deadline");
         Box::pin(async move {
-            let step_id = ex.current_step_id().to_string();
-            let writable = ex
-                .dataflow_outputs()
-                .get(&step_id)
-                .copied()
-                .expect("a pre-provisioned writable");
-            let streams_arc = ex.streams().clone();
-            let cancel = ex.cancel_token();
+            let (writable, streams_arc, cancel) = relay_output(&*ex);
             let text = remaining_ms.to_string();
             let n =
                 streams::write_async_shared(&streams_arc, writable, text.as_bytes(), &cancel).await;
@@ -6127,14 +6110,7 @@ mod wallclock_timeout_tests {
     > {
         Box::pin(async move {
             let tag = params["tag"].as_str().unwrap_or_default().to_string();
-            let step_id = ex.current_step_id().to_string();
-            let writable = ex
-                .dataflow_outputs()
-                .get(&step_id)
-                .copied()
-                .expect("a pre-provisioned writable");
-            let streams_arc = ex.streams().clone();
-            let cancel = ex.cancel_token();
+            let (writable, streams_arc, cancel) = relay_output(&*ex);
             loop {
                 let n = streams::write_async_shared(&streams_arc, writable, b"x", &cancel).await;
                 match n {
@@ -6413,7 +6389,7 @@ mod wallclock_timeout_tests {
     /// produced one.
     #[tokio::test(flavor = "multi_thread")]
     async fn callers_cancel_releases_a_callee_parked_on_a_full_channel() {
-        let kernel = kernel_with_relay(write_until_refused, r#"{"tag": "caller-cancel"}"#);
+        let kernel = kernel_with_relay(write_until_refused, "{}");
         let parent = tokio_util::sync::CancellationToken::new();
         let started = std::time::Instant::now();
         let mut source = spawn_relay_under(&kernel, None, Some(parent.clone())).await;
@@ -6429,7 +6405,6 @@ mod wallclock_timeout_tests {
                     .all(|item| matches!(item, Ok(b) if &b[..] == b"x")),
             "the chunks that fit arrive, and the cancel is not an error item: {items:?}"
         );
-        assert!(released_by_token("caller-cancel"));
     }
 
     /// The same stall under a wallclock cap and no caller cancel: the

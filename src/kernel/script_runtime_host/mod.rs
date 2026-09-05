@@ -242,6 +242,30 @@ pub(crate) fn step_script<'a>(
                         rest.trim()
                     )));
                 }
+                // A guest has no typed cancellation of its own. Its
+                // binding may raise a language-level error when a host
+                // import reports the step's cancel (`STREAM_CANCELLED`
+                // from a parked `stream_write`), or a script may fail
+                // while winding down. Under a fired token that error
+                // is the cancellation surfacing through the guest's
+                // error idiom, and is reported as such, so the
+                // dataflow scheduler sees a step winding down and the
+                // wallclock wrapper sees its deadline rather than a
+                // failure carrying the guest's text. A failure that
+                // merely coincided with the cancel is logged in full
+                // here so it is not lost. Resource-cap violations are
+                // mapped above, before this: a guest that ignores its
+                // cancel until its fuel runs out has still hit the
+                // kernel's limit.
+                if ex.cancel_token().is_cancelled() {
+                    tracing::debug!(
+                        plugin = %owner_plugin,
+                        step_id = %step_id,
+                        error = %e,
+                        "Script step failed under a fired cancellation token; reporting cancellation"
+                    );
+                    return Err(StepError::Cancelled);
+                }
                 tracing::warn!(
                     plugin = %owner_plugin,
                     step_id = %step_id,
