@@ -174,6 +174,17 @@ import is async (`func_wrap_async` → `write_async_shared`): the
 wasmtime fiber suspends until the receiver makes space, without
 tying up a blocking thread.
 
+A write parked on a full channel is raced against the step's
+cancellation token — the one `is_cancelled` reports, which the
+wallclock watchdog also fires. If the token fires before the
+consumer makes room, the write returns `STREAM_CANCELLED` and the
+chunk is not committed; the guest should stop producing and return.
+Only the wait is released: a write the channel has room for is
+committed even after the token has fired, so a producer that has
+already noticed the cancel can still push the chunk it holds. A
+receiver that has gone away is `STREAM_CLOSED` regardless of the
+token.
+
 ### `stream_close`
 
 Marks the handle closed, drops the underlying source/sender, and
@@ -193,6 +204,7 @@ import).
 | `-4` | `STREAM_CLOSED` | Handle closed via `stream_close`, or (on write) the paired consumer has gone away. |
 | `-5` | `STREAM_IO_ERROR` | Readable source returned an I/O error, or the guest exports no `memory`. |
 | `-6` | `STREAM_OOB` | `buf_ptr + buf_len` exceeded linear memory. |
+| `-7` | `STREAM_CANCELLED` | A write parked on a full channel was released by the step's cancellation token (caller cancel or wallclock deadline) before the consumer made room. Nothing was committed. |
 
 Defined in [`streams.rs`](streams.rs). Any guest-side binding, ABI
 doc, or host function impl must reference these constants by name to

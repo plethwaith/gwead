@@ -8,7 +8,8 @@
 //!   output handle if the step is `long_running` in a dataflow action;
 //!   `STREAM_INVALID_HANDLE` otherwise.
 //! - `is_cancelled() -> i32` — 1 if the parent step's cancellation
-//!   token has fired; 0 otherwise.
+//!   token has fired; 0 otherwise. The same token releases a
+//!   `stream_write` parked on a full channel (`STREAM_CANCELLED`).
 //!
 //! Read + write are `func_wrap_async` so `.await` happens directly on
 //! the underlying channel — no `block_in_place`, no `block_on`, no
@@ -62,6 +63,10 @@ pub(super) fn register(
              (handle, buf_ptr, buf_len): (i32, i32, i32)| {
                 let id = std::num::NonZeroU32::new(handle as u32);
                 let streams_arc = caller.data().streams.clone();
+                // The step's token releases a send parked on a full
+                // channel (`STREAM_CANCELLED`); a guest parked inside
+                // this import cannot poll `is_cancelled` itself.
+                let cancel = caller.data().cancel.clone();
                 let mem = caller.get_export("memory").and_then(|e| e.into_memory());
                 Box::new(async move {
                     let Some(id) = id else {
@@ -82,7 +87,8 @@ pub(super) fn register(
                         };
                         mem_data[start..end].to_vec()
                     };
-                    crate::kernel::streams::write_async_shared(&streams_arc, id, &buf).await
+                    crate::kernel::streams::write_async_shared(&streams_arc, id, &buf, &cancel)
+                        .await
                 })
             },
         )

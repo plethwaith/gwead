@@ -92,6 +92,65 @@ pub fn build_wasm_bytes() -> Vec<u8> {
     wat::parse_str(MOCK_WAT).expect("mock script-runtime wat parses")
 }
 
+/// WAT source for a mock whose `execute` writes to its dataflow
+/// output until the host refuses a write, then reports how the loop
+/// ended. Imports `stream_output` and `stream_write` on top of
+/// `host_set_result`, so a test can park a real wasm guest inside the
+/// `stream_write` import — the shape a relay guest has when its
+/// consumer stalls — and observe what releases it.
+///
+/// The result is `"cancelled"` when the loop ended on
+/// `STREAM_CANCELLED`, `"closed"` on `STREAM_CLOSED`, and `"other"`
+/// for any other negative code.
+const WRITE_UNTIL_REFUSED_WAT: &str = r#"
+(module
+  (import "gwead1" "host_set_result" (func $host_set_result (param i32 i32)))
+  (import "gwead1" "stream_output" (func $stream_output (result i32)))
+  (import "gwead1" "stream_write" (func $stream_write (param i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  ;; The chunk, then the three JSON string results, each 11 bytes.
+  (data (i32.const 0) "chunk")
+  (data (i32.const 8) "\"cancelled\"")
+  (data (i32.const 20) "\"closed\"   ")
+  (data (i32.const 32) "\"other\"    ")
+  (global $next (mut i32) (i32.const 64))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    global.get $next
+    local.set $ptr
+    global.get $next
+    local.get $len
+    i32.add
+    global.set $next
+    local.get $ptr)
+  (func (export "execute") (param $src_ptr i32) (param $src_len i32)
+                           (param $args_ptr i32) (param $args_len i32)
+                           (result i32)
+    (local $handle i32)
+    (local $rc i32)
+    (local.set $handle (call $stream_output))
+    (block $refused
+      (loop $again
+        (local.set $rc
+          (call $stream_write (local.get $handle) (i32.const 0) (i32.const 5)))
+        (br_if $refused (i32.lt_s (local.get $rc) (i32.const 0)))
+        (br $again)))
+    (if (i32.eq (local.get $rc) (i32.const -7))
+      (then (call $host_set_result (i32.const 8) (i32.const 11)))
+      (else
+        (if (i32.eq (local.get $rc) (i32.const -4))
+          (then (call $host_set_result (i32.const 20) (i32.const 8)))
+          (else (call $host_set_result (i32.const 32) (i32.const 7))))))
+    i32.const 1)
+)
+"#;
+
+/// Compile the write-until-refused mock — see
+/// [`WRITE_UNTIL_REFUSED_WAT`].
+pub fn build_write_until_refused_wasm_bytes() -> Vec<u8> {
+    wat::parse_str(WRITE_UNTIL_REFUSED_WAT).expect("write-until-refused wat parses")
+}
+
 /// The plugin name the mock registers under for `language`. Tests
 /// need it to put the mock in the kernel's trusted-provider list — see
 /// [`trusting`].
@@ -119,8 +178,19 @@ pub fn register(kernel: &mut Kernel) -> Result<(), KernelError> {
 /// Register the mock as the `(script, language)` impl. Lets tests that
 /// validate selector dispatch route a non-`"lua"` value too.
 pub fn register_for_language(kernel: &mut Kernel, language: &str) -> Result<(), KernelError> {
+    register_module_for_language(kernel, language, build_wasm_bytes())
+}
+
+/// Register `wasm_bytes` as the `(script, language)` impl under the
+/// mock's plugin name. [`register_for_language`] with the standard
+/// mock; tests that need a guest with a specific body (see
+/// [`build_write_until_refused_wasm_bytes`]) pass their own.
+pub fn register_module_for_language(
+    kernel: &mut Kernel,
+    language: &str,
+    wasm_bytes: Vec<u8>,
+) -> Result<(), KernelError> {
     use base64::Engine as _;
-    let wasm_bytes = build_wasm_bytes();
     let base64_bytes = base64::engine::general_purpose::STANDARD.encode(&wasm_bytes);
     let manifest = serde_json::json!({
         "name": plugin_name(language),
