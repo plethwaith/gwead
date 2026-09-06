@@ -200,8 +200,9 @@ import).
 
 The text behind the last `STREAM_IO_ERROR` or `STREAM_CANCELLED` the
 handle returned: for a read, the source's own error (a streaming
-callee's is `"<plugin>.<action> failed: <error>"`, or `"… panicked:
-…"`); for a write, why it was released. Copies up to `buf_len` bytes
+callee's is `"<plugin>.<action> failed: <error>"`, where the error
+part reads `… panicked: …` when the callee panicked); for a write,
+why it was released. Copies up to `buf_len` bytes
 of it into linear memory at `buf_ptr` and returns the text's **full**
 byte length, so a first call with `buf_len` `0` sizes the buffer and
 a second call fills it. Returns `0` when the handle has recorded
@@ -223,14 +224,17 @@ retained, so a probe and a fetch see the same thing.
 
 A recorded text is never empty (a source that fails without a message
 records `source failed without a message`) and never longer than
-4096 bytes (`MAX_LAST_ERROR_BYTES` in [`streams.rs`](streams.rs); a
+4096 bytes (`MAX_LAST_ERROR_BYTES` in [`streams.rs`](streams.rs)): a
 longer one is cut on a char boundary and ends with `… (N bytes
-total)`), since a streaming callee's text is whatever its guest
-raised.
+total)`, that marker counted inside the 4096, since a streaming
+callee's text is whatever its guest raised.
 
-The same failure is logged at `debug` by the read that found it,
-naming the stream id and a preview of the text, so an operator can
-correlate a guest's error with the callee's own `warn`.
+The read that first finds a failure on a handle logs it at `warn`,
+naming the stream id and a preview of the text — for a source an
+embedder registered directly this is the only log line there is,
+and for a streaming callee it is what correlates the callee's own
+`warn` with the read. A later failure on the same handle logs at
+`debug`.
 
 ## Return-code contract
 
@@ -242,7 +246,7 @@ correlate a guest's error with the callee's own `warn`.
 | `-3` | `STREAM_DIRECTION_MISMATCH` | Read on writable, write on readable. |
 | `-4` | `STREAM_CLOSED` | Handle closed via `stream_close`, or (on write) the paired consumer has gone away. |
 | `-5` | `STREAM_IO_ERROR` | Readable source returned an I/O error (its text is kept for `stream_last_error`), or the guest exports no `memory`. |
-| `-6` | `STREAM_OOB` | `buf_ptr + buf_len` exceeded linear memory. |
+| `-6` | `STREAM_OOB` | `buf_ptr + buf_len` exceeded linear memory (or `buf_len` was negative). Checked before anything else the call does — for `stream_last_error`, before the handle is looked up and even on a size probe with nothing recorded. |
 | `-7` | `STREAM_CANCELLED` | A write waiting for room on a full channel was released by the step's cancellation token (caller cancel or wallclock deadline). Nothing was committed. A text saying so is kept for `stream_last_error`. |
 
 Defined in [`streams.rs`](streams.rs). Any guest-side binding, ABI

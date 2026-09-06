@@ -201,9 +201,10 @@ pub struct StreamInner {
     /// one call and fill it with the next, or read the text after it
     /// has closed the handle. Never empty once set (a source that
     /// fails without a message records a placeholder) and never
-    /// longer than [`MAX_LAST_ERROR_BYTES`], since a guest's own
-    /// error text can be as large as its memory. The other codes are
-    /// self-describing and record nothing.
+    /// longer than [`MAX_LAST_ERROR_BYTES`] including the
+    /// `… (N bytes total)` marker a cut text ends with, since a
+    /// guest's own error text can be as large as its memory. The
+    /// other codes are self-describing and record nothing.
     last_error: Option<String>,
 }
 
@@ -892,29 +893,21 @@ impl StreamState {
         // The error's text is kept on the handle: the code the guest
         // gets says only that the source failed; the text says why,
         // and a guest fetches it through `stream_last_error` to put in
-        // its own error. Rendered and logged before the lock is taken.
-        // The log is at debug: the failure itself is already warned
-        // about where it happened (a spawned streaming callee, say),
-        // and a fanned-out source reaches this point once per branch,
-        // so this line is the correlation with the read, not the
-        // report.
+        // its own error. Rendered before the lock, logged after it.
         let recorded = io_error.as_ref().map(|err| {
             let text = err.to_string();
-            tracing::debug!(
-                stream_id = self.id.get(),
-                error = %truncate_text(&text, LOG_PREVIEW_CHARS),
-                "stream_read: the source failed; the reader gets STREAM_IO_ERROR"
-            );
             if text.is_empty() {
                 EMPTY_ERROR_TEXT.to_string()
             } else {
                 truncate_text(&text, MAX_LAST_ERROR_BYTES)
             }
         });
+        let mut first_failure_on_handle = false;
         {
             let mut inner = self.lock_inner();
-            if let Some(text) = recorded {
-                inner.last_error = Some(text);
+            if let Some(text) = recorded.as_ref() {
+                first_failure_on_handle = inner.last_error.is_none();
+                inner.last_error = Some(text.clone());
             }
             if !inner.closed
                 && let StreamDirection::Readable {
@@ -928,6 +921,32 @@ impl StreamState {
                     source
                 };
                 *cur_leftover = new_leftover;
+            }
+        }
+
+        // The first failure a handle sees is warned about: for a
+        // source an embedder registered directly (an HTTP body, say)
+        // this is the only place it is logged at all. A replacement
+        // on the same handle is debug — the handle is already known
+        // to be failing. Each fan-out branch is its own handle, so a
+        // shared source is reported once per consumer and no more,
+        // while a spawned streaming callee's failure is also warned
+        // about where it happened; this line is what correlates it
+        // with the read that found it.
+        if let Some(text) = recorded {
+            let preview = truncate_text(&text, LOG_PREVIEW_BYTES);
+            if first_failure_on_handle {
+                tracing::warn!(
+                    stream_id = self.id.get(),
+                    error = %preview,
+                    "stream_read: the source failed; the reader gets STREAM_IO_ERROR"
+                );
+            } else {
+                tracing::debug!(
+                    stream_id = self.id.get(),
+                    error = %preview,
+                    "stream_read: the source failed again; the reader gets STREAM_IO_ERROR"
+                );
             }
         }
 
@@ -1095,22 +1114,24 @@ pub const EMPTY_ERROR_TEXT: &str = "source failed without a message";
 /// which can be as large as the guest's memory, and it is held per
 /// handle until the parent's registry drains.
 pub const MAX_LAST_ERROR_BYTES: usize = 4096;
-/// How much of a text a `tracing` event shows.
-pub(crate) const LOG_PREVIEW_CHARS: usize = 200;
+/// How many bytes of a text a `tracing` event shows.
+pub(crate) const LOG_PREVIEW_BYTES: usize = 200;
 
-/// `s` if it fits in `max` bytes, else its longest prefix that does
-/// (cut on a char boundary) with `… (N bytes total)` appended.
+/// `s` if it fits in `max` bytes, else a prefix of it with
+/// `… (N bytes total)` appended, the whole result no longer than
+/// `max` — the suffix is budgeted inside the cap, and the prefix is
+/// cut on a char boundary at or below what remains. (A `max` too
+/// small for the suffix alone yields just the suffix.)
 pub(crate) fn truncate_text(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    let cut = s
-        .char_indices()
-        .take_while(|(i, _)| *i < max)
-        .last()
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(0);
-    format!("{}… ({} bytes total)", &s[..cut], s.len())
+    let suffix = format!("… ({} bytes total)", s.len());
+    let mut cut = max.saturating_sub(suffix.len()).min(s.len());
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{suffix}", &s[..cut])
 }
 
 #[cfg(test)]
@@ -1492,6 +1513,13 @@ mod tests {
             rx.try_recv().is_err(),
             "the released chunk was not committed behind the consumer's back"
         );
+
+        // The documented stale case: nothing clears the slot, so a
+        // `STREAM_CLOSED` after the cancel still finds the cancel's
+        // text — a binding keys on the code, not on the text.
+        reg.close(id);
+        assert_eq!(state.write_async(b"late", &cancel).await, STREAM_CLOSED);
+        assert_eq!(state.last_error().as_deref(), Some(STREAM_CANCELLED_TEXT));
     }
 
     /// A parked write learns that the receiver has gone before it
@@ -1544,13 +1572,14 @@ mod tests {
 
     /// A source's error text is a guest's to write and can be as
     /// large as its memory; the handle keeps at most
-    /// `MAX_LAST_ERROR_BYTES` of it, cut on a char boundary and
-    /// saying how much there was.
+    /// `MAX_LAST_ERROR_BYTES` of it, marker included, cut on a char
+    /// boundary and saying how much there was.
     #[tokio::test]
     async fn read_caps_a_long_error_text() {
         let mut reg = StreamRegistry::new();
-        // Two-byte chars, so a byte-count cut would split one.
-        let long: String = "é".repeat(MAX_LAST_ERROR_BYTES);
+        // Three-byte chars, so a cut at the byte budget lands inside
+        // one whatever the budget is.
+        let long: String = "€".repeat(MAX_LAST_ERROR_BYTES);
         let source: ReadableSource = Box::pin(futures::stream::iter(vec![Err(
             std::io::Error::other(long.clone()),
         )]));
@@ -1558,11 +1587,70 @@ mod tests {
         let state = reg.get(id).unwrap();
         assert_eq!(state.read_async(&mut [0u8; 8]).await, STREAM_IO_ERROR);
         let kept = state.last_error().expect("recorded");
+        assert!(
+            kept.len() <= MAX_LAST_ERROR_BYTES,
+            "the whole kept text is within the cap: {}",
+            kept.len()
+        );
         let suffix = format!("… ({} bytes total)", long.len());
         assert!(kept.ends_with(&suffix), "{kept:?}");
         let body = &kept[..kept.len() - suffix.len()];
-        assert!(body.len() <= MAX_LAST_ERROR_BYTES, "{}", body.len());
-        assert!(body.chars().all(|c| c == 'é'), "cut on a char boundary");
+        assert!(
+            !body.is_empty() && body.chars().all(|c| c == '€'),
+            "cut on a char boundary"
+        );
+    }
+
+    /// The cap is exact: a text of `max` bytes is kept whole, one byte
+    /// more is cut, and the cut result never exceeds `max` even when
+    /// the boundary falls inside a multi-byte char.
+    #[test]
+    fn truncate_text_is_exact_at_the_boundary() {
+        let fits = "a".repeat(40);
+        assert_eq!(truncate_text(&fits, 40), fits);
+        let over = "a".repeat(41);
+        let cut = truncate_text(&over, 40);
+        assert!(cut.len() <= 40, "{}", cut.len());
+        assert!(cut.ends_with("… (41 bytes total)"), "{cut:?}");
+        // Three-byte chars: whatever budget the suffix leaves, the
+        // cut steps down to a boundary rather than splitting one.
+        let wide = "€".repeat(30);
+        let cut = truncate_text(&wide, 40);
+        assert!(cut.len() <= 40, "{}", cut.len());
+        assert!(cut.ends_with("… (90 bytes total)"), "{cut:?}");
+        assert!(
+            cut.trim_end_matches("… (90 bytes total)")
+                .chars()
+                .all(|c| c == '€')
+        );
+        // A cap too small for the suffix yields the suffix alone.
+        assert_eq!(truncate_text(&over, 3), "… (41 bytes total)");
+    }
+
+    /// A fanned-out source that fails reaches every branch, and each
+    /// branch — its own handle — records the text for its own reader.
+    #[tokio::test]
+    async fn each_fan_out_branch_records_the_failure_text() {
+        let source: ReadableSource = Box::pin(stream::iter(vec![
+            Ok(Bytes::from_static(b"ab")),
+            Err(std::io::Error::other("upstream fell over")),
+        ]));
+        let reg: SharedStreamRegistry = Default::default();
+        let branches = {
+            let mut reg = lock_shared(&reg);
+            let producer = reg.register_readable("text/plain", source);
+            reg.fan_out_readable_streaming(producer, 2, 4).unwrap()
+        };
+        for branch in branches {
+            let mut buf = [0u8; 8];
+            assert_eq!(read_async_shared(&reg, branch, &mut buf).await, 2);
+            assert_eq!(
+                read_async_shared(&reg, branch, &mut buf).await,
+                STREAM_IO_ERROR
+            );
+            let state = lock_shared(&reg).get(branch).unwrap();
+            assert_eq!(state.last_error().as_deref(), Some("upstream fell over"));
+        }
     }
 
     /// A token that has already fired releases a would-be-parked write

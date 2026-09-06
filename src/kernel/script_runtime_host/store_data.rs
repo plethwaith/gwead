@@ -135,6 +135,6 @@ pub(super) fn bail_host_call(
 pub(super) fn truncate_for_log(value: &Value) -> String {
     crate::kernel::streams::truncate_text(
         &value.to_string(),
-        crate::kernel::streams::LOG_PREVIEW_CHARS,
+        crate::kernel::streams::LOG_PREVIEW_BYTES,
     )
 }

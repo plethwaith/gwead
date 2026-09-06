@@ -738,11 +738,13 @@ mod stream_last_error_tests {
         );
     }
 
-    /// A guest that streams `p.ok` to EOF and then makes `probe` — a
-    /// `stream_last_error` call with `$h` bound to the handle — and
-    /// reports `"as expected"` if it answered `expected`, else raises.
-    fn probing_guest(probe: &str, expected: i32) -> Vec<u8> {
+    /// A guest that streams `p.<action>` until a negative read and
+    /// then evaluates `condition` — a WAT `i32` expression with `$h`
+    /// bound to the handle, typically around a `stream_last_error`
+    /// call — reporting `"as expected"` if it is 1, else raising.
+    fn probing_guest(action: &str, condition: &str) -> Vec<u8> {
         let m = crate::kernel::abi::ABI_MODULE;
+        let action_len = action.len();
         let wat = format!(
             r#"
             (module
@@ -757,7 +759,7 @@ mod stream_last_error_tests {
               (data (i32.const 0) "\"as expected\"")
               (data (i32.const 16) "unexpected code")
               (data (i32.const 32) "{{\"plugin\": \"p\"}}")
-              (data (i32.const 48) "ok")
+              (data (i32.const 48) "{action}")
               (data (i32.const 64) "{{}}")
               (global $next (mut i32) (i32.const 128))
               (func (export "alloc") (param $len i32) (result i32)
@@ -773,7 +775,7 @@ mod stream_last_error_tests {
                 (local $h i32)
                 (local.set $h (call $invoke_streaming
                   (i32.const 32) (i32.const 15)
-                  (i32.const 48) (i32.const 2)
+                  (i32.const 48) (i32.const {action_len})
                   (i32.const 64) (i32.const 2)))
                 (block $done
                   (loop $again
@@ -781,7 +783,7 @@ mod stream_last_error_tests {
                       (call $stream_read (local.get $h) (i32.const 4096) (i32.const 64))
                       (i32.const 0)))
                     (br $again)))
-                (if (result i32) (i32.eq {probe} (i32.const {expected}))
+                (if (result i32) (i32.eq {condition} (i32.const 1))
                   (then (call $host_set_result (i32.const 0) (i32.const 13)) (i32.const 1))
                   (else (call $host_set_error (i32.const 16) (i32.const 15)) (i32.const 0))))
             )
@@ -832,10 +834,11 @@ mod stream_last_error_tests {
         ];
         for (name, args, expected) in cases {
             let kernel = kernel_with_p();
-            let probe = format!("(call $stream_last_error {args})");
+            let condition =
+                format!("(i32.eq (call $stream_last_error {args}) (i32.const {expected}))");
             let outcome = run_guest(
                 Some(&kernel),
-                probing_guest(&probe, expected),
+                probing_guest("ok", &condition),
                 tokio_util::sync::CancellationToken::new(),
             )
             .await;
@@ -845,6 +848,36 @@ mod stream_last_error_tests {
                 "{name}: expected {expected}"
             );
         }
+    }
+
+    /// The convention the ABI doc contrasts with `host_call_result_read`:
+    /// a buffer smaller than the text gets only what fits, and the
+    /// call still answers the text's full length — so the guest can
+    /// come back with a bigger buffer — and writes nothing past the
+    /// buffer it was given.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_copy_into_a_small_buffer_answers_the_full_length_and_stays_inside_it() {
+        let full = run_relaying("fail")
+            .await
+            .expect_err("the failing callee's text, fetched whole");
+        assert!(full.len() > 4, "{full:?}");
+        // Four bytes of the text at 8192; the byte after must stay 0,
+        // and the answer must be the whole length, not 4.
+        let condition = format!(
+            "(i32.and \
+               (i32.eq (call $stream_last_error (local.get $h) (i32.const 8192) (i32.const 4)) \
+                       (i32.const {})) \
+               (i32.eqz (i32.load8_u (i32.const 8196))))",
+            full.len()
+        );
+        let kernel = kernel_with_p();
+        let outcome = run_guest(
+            Some(&kernel),
+            probing_guest("fail", &condition),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(outcome.result, Ok("\"as expected\"".into()));
     }
 
     /// A callee whose body panics reaches the guest the same way,
