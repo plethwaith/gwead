@@ -139,7 +139,8 @@ pub(super) fn register(
     // copy that did not fit is retried at the returned length. A
     // truncated copy may end mid-codepoint; the return value is what
     // a binding sizes by, not the bytes it got. The guest's whole
-    // `buf_ptr .. buf_ptr + buf_len` range is checked first, as the
+    // `buf_ptr .. buf_ptr + buf_len` range is checked before the
+    // handle is looked up and before any byte is copied, as the
     // siblings check theirs, so a wild pointer is `STREAM_OOB` whether
     // or not there is text to copy.
     linker

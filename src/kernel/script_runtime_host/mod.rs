@@ -792,8 +792,9 @@ mod stream_last_error_tests {
         wat::parse_str(&wat).expect("wat parses")
     }
 
-    /// The guest's whole buffer range is checked before anything else,
-    /// as `stream_read` and `stream_write` check theirs: a negative
+    /// The guest's whole buffer range is checked before the handle is
+    /// looked up and before any byte is copied, as `stream_read` and
+    /// `stream_write` check theirs: a negative
     /// length or a pointer past linear memory is `STREAM_OOB` even on
     /// a handle with nothing recorded, and a bad handle is
     /// `STREAM_INVALID_HANDLE` — never a 0 that reads as "no text".
