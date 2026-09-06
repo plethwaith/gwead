@@ -115,7 +115,7 @@ impl ResourceBudget {
             .checked_sub(current)
             .and_then(|rest| rest.checked_add(desired))
         else {
-            // Accounting drift, as for memory: a host bug, said so.
+            // Accounting drift, as for memory: a host bug, say so.
             tracing::error!(
                 current,
                 desired,

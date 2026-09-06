@@ -66,12 +66,12 @@ pub(crate) enum ResourceCap {
 }
 
 impl ResourceCap {
-    /// The failure text a step reports for this cap: the description
-    /// under the name of the `KernelError` it becomes.
-    pub(crate) fn failure_text(&self) -> String {
+    /// The name of the `KernelError` this cap becomes, which a step's
+    /// failure text leads with.
+    pub(crate) fn kind(&self) -> &'static str {
         match self {
-            Self::Fuel { .. } => format!("FuelExhausted: {self}"),
-            Self::Memory { .. } => format!("MemoryLimitExceeded: {self}"),
+            Self::Fuel { .. } => "FuelExhausted",
+            Self::Memory { .. } => "MemoryLimitExceeded",
         }
     }
 }
@@ -107,7 +107,7 @@ pub(crate) enum ScriptRunError {
 impl fmt::Display for ScriptRunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cap { cap, .. } => f.write_str(&cap.failure_text()),
+            Self::Cap { cap, .. } => write!(f, "{}: {cap}", cap.kind()),
             Self::Failed(text) => f.write_str(text),
         }
     }

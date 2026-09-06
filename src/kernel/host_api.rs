@@ -2413,14 +2413,14 @@ fn step_wasm<'a>(
         // runtime's store setup.
         store.set_fuel(limits.fuel_budget).map_err(|e| {
             StepError::Failed(format!(
-                "wasm step: module '{module_name}': failed to set fuel budget: {e}"
+                "wasm step: module '{module_name}' failed to set its fuel budget: {e}"
             ))
         })?;
         store
             .fuel_async_yield_interval(Some(super::script_runtime_host::FUEL_ASYNC_YIELD_INTERVAL))
             .map_err(|e| {
                 StepError::Failed(format!(
-                    "wasm step: module '{module_name}': failed to set fuel yield interval: {e}"
+                    "wasm step: module '{module_name}' failed to set its fuel yield interval: {e}"
                 ))
             })?;
         let linker = wasmtime::Linker::<WasmStoreLimits>::new(&engine);

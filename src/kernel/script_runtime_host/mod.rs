@@ -235,10 +235,11 @@ pub(crate) fn step_script<'a>(
                         detail: format!("step '{step_id}': {cap}"),
                     },
                     // wasmtime's text says how much the module
-                    // declared, which is what its author needs.
+                    // declared, which is what its author needs; the
+                    // cap itself is in the error this becomes.
                     ResourceCap::Memory { bytes } => ResourceViolation::MemoryLimit {
                         bytes: *bytes,
-                        detail: format!("step '{step_id}': {cap}: {error}"),
+                        detail: format!("step '{step_id}': {error}"),
                     },
                 });
                 tracing::warn!(
@@ -248,7 +249,7 @@ pub(crate) fn step_script<'a>(
                     error = %error,
                     "Script step hit a resource cap"
                 );
-                Err(StepError::Failed(cap.failure_text()))
+                Err(StepError::Failed(format!("{}: {cap}", cap.kind())))
             }
             Err(ScriptRunError::Failed(e)) => {
                 // A guest has no typed cancellation of its own. Its
@@ -490,20 +491,23 @@ async fn execute_in_store(
 /// code ran. The fuel meter still reading the whole budget is that
 /// "before", by a wasmtime mechanism worth naming, since a wasmtime
 /// that dropped it would reopen the gate: instantiation runs a
-/// module-startup function wasmtime synthesises, which applies data
-/// and element segments and then calls the module's `start`. Memories
-/// are created, and a declared minimum past the cap refused, before
-/// that function runs, so a refusal there leaves the meter untouched.
-/// Once it runs, its own entry costs a unit, and Cranelift saves the
-/// counter to the store at every call — the call into `start`
-/// included — so the meter reads below the budget for anything
-/// `start` then does, however it fails. That matters because
-/// Cranelift does not save the counter at every instruction: a trap
-/// from division or an out-of-bounds load flushes nothing, and it is
-/// the startup function's saved unit, not `start`'s own spending,
-/// that the gate sees in that case. Verified against wasmtime 47
-/// (`wasmtime-environ`'s `require_startup_func`, and
-/// `fuel_before_op` / `fuel_save_from_var` in its Cranelift backend).
+/// module-startup function wasmtime synthesises (no wasm body of its
+/// own), which applies data and element segments and then calls the
+/// module's `start`. Memories are created, and a declared minimum
+/// past the cap refused, before that function runs, so a refusal
+/// there leaves the meter untouched. The call into `start` is
+/// hand-written in the Cranelift backend as `module_start`, which
+/// charges one unit and saves the counter to the store immediately
+/// before the call, so the meter reads below the budget for anything
+/// `start` then does, however it fails. That save is load-bearing,
+/// because Cranelift does not save the counter at every instruction
+/// — only at calls, returns, `unreachable`, and function exit — so a
+/// trap from division or a dynamically out-of-bounds load in `start`
+/// flushes nothing of `start`'s own spending, and it is
+/// `module_start`'s saved unit that the gate sees in that case.
+/// Verified against wasmtime 47: `require_startup_func` in
+/// `wasmtime-environ`, and `module_start` and `fuel_before_op` in
+/// `wasmtime-internal-cranelift`'s `func_environ.rs`.
 fn classify_from_store(
     store: &wasmtime::Store<ScriptRuntimeStoreData>,
     err: &wasmtime::Error,
@@ -1192,9 +1196,10 @@ mod step_script_tests {
         guest_starting("", body)
     }
 
-    /// [`guest`], with `start` (a function definition and a
-    /// `(start …)` naming it, or nothing) run at instantiation.
-    fn guest_starting(start: &str, body: &str) -> Vec<u8> {
+    /// [`guest`], with `fields` — any module fields, placed after
+    /// `execute`: a function and a `(start …)` naming it, a `data`
+    /// segment, a `table`, or nothing.
+    fn guest_starting(fields: &str, body: &str) -> Vec<u8> {
         let m = crate::kernel::abi::ABI_MODULE;
         let wat = format!(
             r#"
@@ -1217,7 +1222,7 @@ mod step_script_tests {
                 local.get $ptr)
               (func (export "execute") (param i32 i32 i32 i32) (result i32)
                 {body})
-              {start}
+              {fields}
             )
             "#
         );
@@ -1409,6 +1414,39 @@ mod step_script_tests {
         }
     }
 
+    /// A guest declaring more linear memory than the cap allows does
+    /// not instantiate, and that is the typed memory cap: the failure
+    /// text names it, and the recorded violation carries the cap and
+    /// a detail with wasmtime's own text, which says how much the
+    /// module declared.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_declared_minimum_past_the_cap_reports_the_memory_cap() {
+        const CAP: usize = 1024 * 1024;
+        let wat = r#"
+            (module
+              (memory (export "memory") 64)
+              (func (export "alloc") (param i32) (result i32) (i32.const 0))
+              (func (export "execute") (param i32 i32 i32 i32) (result i32) (i32.const 1))
+            )
+        "#;
+        let guest = wat::parse_str(wat).expect("wat parses");
+        let limits = crate::kernel::RuntimeLimits::default().with_max_memory_bytes(CAP);
+        let mut state = state(guest, tokio_util::sync::CancellationToken::new(), limits);
+        let result = run(&mut state).await;
+        assert!(
+            matches!(&result, Err(StepError::Failed(text))
+                if text == "MemoryLimitExceeded: wasm linear memory exceeded 1048576 bytes (at instantiate)"),
+            "{result:?}"
+        );
+        assert!(
+            matches!(&state.resource_violation,
+                Some(ResourceViolation::MemoryLimit { bytes: CAP, detail })
+                    if detail == "step '': memory minimum size of 64 pages exceeds memory limits"),
+            "{:?}",
+            state.resource_violation
+        );
+    }
+
     /// A refused `memory.grow` sets the limiter's flag without a
     /// declared-minimum refusal. A `start` function that has its own
     /// grow refused and then fails — through a host import returning
@@ -1459,6 +1497,26 @@ mod step_script_tests {
                 "execute, host error",
                 guest(&format!("{GROW} {HOST_ERROR} (i32.const 1)")),
                 "script runtime trapped:",
+            ),
+            // The same non-flushing trap in a module with no data
+            // segments, so nothing but `module_start`'s one saved unit
+            // separates the meter from the budget.
+            (
+                "start, non-flushing trap, no data segments",
+                wat::parse_str(format!(
+                    r#"
+                    (module
+                      (memory (export "memory") 1)
+                      (func (export "alloc") (param i32) (result i32) (i32.const 0))
+                      (func (export "execute") (param i32 i32 i32 i32) (result i32)
+                        (i32.const 1))
+                      (func $init {GROW} (drop (i32.div_s (i32.const 1) (i32.const 0))))
+                      (start $init)
+                    )
+                    "#
+                ))
+                .expect("wat parses"),
+                "script runtime instantiation failed:",
             ),
         ];
         for (name, guest, prefix) in cases {
