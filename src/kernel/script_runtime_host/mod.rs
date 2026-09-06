@@ -861,13 +861,16 @@ mod stream_last_error_tests {
             .await
             .expect_err("the failing callee's text, fetched whole");
         assert!(full.len() > 4, "{full:?}");
-        // Four bytes of the text at 8192; the byte after must stay 0,
-        // and the answer must be the whole length, not 4.
+        // Four bytes of the text at 8192; a sentinel planted in the
+        // byte after must survive, and the answer must be the whole
+        // length, not 4.
         let condition = format!(
-            "(i32.and \
-               (i32.eq (call $stream_last_error (local.get $h) (i32.const 8192) (i32.const 4)) \
-                       (i32.const {})) \
-               (i32.eqz (i32.load8_u (i32.const 8196))))",
+            "(block (result i32) \
+               (i32.store8 (i32.const 8196) (i32.const 170)) \
+               (i32.and \
+                 (i32.eq (call $stream_last_error (local.get $h) (i32.const 8192) (i32.const 4)) \
+                         (i32.const {})) \
+                 (i32.eq (i32.load8_u (i32.const 8196)) (i32.const 170))))",
             full.len()
         );
         let kernel = kernel_with_p();

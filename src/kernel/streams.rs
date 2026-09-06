@@ -894,20 +894,28 @@ impl StreamState {
         // gets says only that the source failed; the text says why,
         // and a guest fetches it through `stream_last_error` to put in
         // its own error. Rendered before the lock, logged after it.
+        // Both the kept text and the log preview are cut from the raw
+        // text, so the preview's byte total is the source's, not the
+        // cap's.
         let recorded = io_error.as_ref().map(|err| {
-            let text = err.to_string();
-            if text.is_empty() {
-                EMPTY_ERROR_TEXT.to_string()
+            let raw = err.to_string();
+            if raw.is_empty() {
+                (EMPTY_ERROR_TEXT.to_string(), EMPTY_ERROR_TEXT.to_string())
             } else {
-                truncate_text(&text, MAX_LAST_ERROR_BYTES)
+                (
+                    truncate_text(&raw, MAX_LAST_ERROR_BYTES),
+                    truncate_text(&raw, LOG_PREVIEW_BYTES),
+                )
             }
         });
         let mut first_failure_on_handle = false;
+        let mut log_preview = None;
         {
             let mut inner = self.lock_inner();
-            if let Some(text) = recorded.as_ref() {
+            if let Some((kept, preview)) = recorded {
                 first_failure_on_handle = inner.last_error.is_none();
-                inner.last_error = Some(text.clone());
+                inner.last_error = Some(kept);
+                log_preview = Some(preview);
             }
             if !inner.closed
                 && let StreamDirection::Readable {
@@ -933,8 +941,7 @@ impl StreamState {
         // while a spawned streaming callee's failure is also warned
         // about where it happened; this line is what correlates it
         // with the read that found it.
-        if let Some(text) = recorded {
-            let preview = truncate_text(&text, LOG_PREVIEW_BYTES);
+        if let Some(preview) = log_preview {
             if first_failure_on_handle {
                 tracing::warn!(
                     stream_id = self.id.get(),
@@ -1614,17 +1621,38 @@ mod tests {
         assert!(cut.ends_with("… (41 bytes total)"), "{cut:?}");
         // Three-byte chars: whatever budget the suffix leaves, the
         // cut steps down to a boundary rather than splitting one.
+        // The 20-byte marker leaves 20; the boundary below that is 18,
+        // six chars.
         let wide = "€".repeat(30);
-        let cut = truncate_text(&wide, 40);
-        assert!(cut.len() <= 40, "{}", cut.len());
-        assert!(cut.ends_with("… (90 bytes total)"), "{cut:?}");
-        assert!(
-            cut.trim_end_matches("… (90 bytes total)")
-                .chars()
-                .all(|c| c == '€')
-        );
+        assert_eq!(truncate_text(&wide, 40), "€€€€€€… (90 bytes total)");
         // A cap too small for the suffix yields the suffix alone.
         assert_eq!(truncate_text(&over, 3), "… (41 bytes total)");
+    }
+
+    /// A later failure on the same handle replaces the earlier text:
+    /// the slot is the *last* error, and a guest that asks after the
+    /// second code gets the second reason.
+    #[tokio::test]
+    async fn a_second_failure_on_a_handle_replaces_the_text() {
+        let mut reg = StreamRegistry::new();
+        let source: ReadableSource = Box::pin(stream::iter(vec![
+            Err(std::io::Error::other("first")),
+            Ok(Bytes::from_static(b"ab")),
+            Err(std::io::Error::other("second")),
+        ]));
+        let id = reg.register_readable("application/octet-stream", source);
+        let state = reg.get(id).unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(state.read_async(&mut buf).await, STREAM_IO_ERROR);
+        assert_eq!(state.last_error().as_deref(), Some("first"));
+        assert_eq!(state.read_async(&mut buf).await, 2);
+        assert_eq!(
+            state.last_error().as_deref(),
+            Some("first"),
+            "a clean read keeps it"
+        );
+        assert_eq!(state.read_async(&mut buf).await, STREAM_IO_ERROR);
+        assert_eq!(state.last_error().as_deref(), Some("second"));
     }
 
     /// A fanned-out source that fails reaches every branch, and each

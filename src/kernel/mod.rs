@@ -3551,13 +3551,14 @@ impl Kernel {
     /// like any other readable. EOF on it means the callee has *ended*,
     /// not merely that its producer closed its handle: the kernel holds
     /// a sender of its own until then. A callee-side failure — a failed
-    /// step, its own deadline, or the action vanishing before it ran —
-    /// is recorded beside the channel and the readable yields it as an
-    /// error item once the bytes the producer did write are drained,
-    /// then EOF; the caller's read sees `STREAM_IO_ERROR` rather than
-    /// an EOF it could mistake for the end of the data, and nothing
-    /// queued ahead of the report can crowd it out. The failure is
-    /// logged at `warn` as well. A callee its caller cancels ends the
+    /// step, its own deadline, the action vanishing before it ran, or
+    /// a panic anywhere in the callee — is recorded beside the channel
+    /// and the readable yields it as an error item once the bytes the
+    /// producer did write are drained, then EOF; the caller's read
+    /// sees `STREAM_IO_ERROR` rather than an EOF it could mistake for
+    /// the end of the data, and nothing queued ahead of the report can
+    /// crowd it out. The failure is logged as well
+    /// ([`spawned_callee_failure`]). A callee its caller cancels ends the
     /// stream with a plain EOF — except at the very end of an inherited
     /// budget, where the caller's cancel and the callee's own watchdog
     /// race and the stream may instead end with an error item that

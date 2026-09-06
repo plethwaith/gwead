@@ -130,8 +130,9 @@ pub(super) fn bail_host_call(
 /// Render a JSON value as a short preview for `tracing` events. Used by
 /// the io.* host-call debug logs to keep MB-scale results
 /// out of the log file when an operator enables
-/// `gwead::script_runtime=debug`. Truncates the JSON representation to
-/// ~200 chars with an ellipsis suffix.
+/// `gwead::script_runtime=debug`. Cuts the JSON representation to
+/// [`crate::kernel::streams::LOG_PREVIEW_BYTES`], the
+/// `… (N bytes total)` marker included.
 pub(super) fn truncate_for_log(value: &Value) -> String {
     crate::kernel::streams::truncate_text(
         &value.to_string(),

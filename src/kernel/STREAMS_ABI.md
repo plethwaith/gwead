@@ -246,7 +246,7 @@ and for a streaming callee it is what correlates the callee's own
 | `-3` | `STREAM_DIRECTION_MISMATCH` | Read on writable, write on readable. |
 | `-4` | `STREAM_CLOSED` | Handle closed via `stream_close`, or (on write) the paired consumer has gone away. |
 | `-5` | `STREAM_IO_ERROR` | Readable source returned an I/O error (its text is kept for `stream_last_error`), or the guest exports no `memory`. |
-| `-6` | `STREAM_OOB` | `buf_ptr + buf_len` exceeded linear memory (or `buf_len` was negative). Checked before anything else the call does — for `stream_last_error`, before the handle is looked up and even on a size probe with nothing recorded. |
+| `-6` | `STREAM_OOB` | `buf_ptr + buf_len` exceeded linear memory (or `buf_len` was negative). Checked before the handle is looked up and before any byte is copied — for `stream_last_error`, on a size probe with nothing recorded too. |
 | `-7` | `STREAM_CANCELLED` | A write waiting for room on a full channel was released by the step's cancellation token (caller cancel or wallclock deadline). Nothing was committed. A text saying so is kept for `stream_last_error`. |
 
 Defined in [`streams.rs`](streams.rs). Any guest-side binding, ABI
