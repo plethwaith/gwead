@@ -237,6 +237,31 @@ async fn wasm_infinite_loop_trips_fuel_budget() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn wasm_start_function_tripping_fuel_budget_names_the_cap() {
+    // The same loop in the module's `start` function runs at
+    // instantiation, before the entry is called. The cap is the same
+    // cap and the error names it the same way, saying where.
+    let kernel = boot_with_limits(
+        vec![wasm_manifest(
+            "p",
+            one_module(
+                "spin",
+                r#"(module (func $init (loop $l br $l)) (start $init) (func (export "run")))"#,
+            ),
+            vec![step("exec", "wasm", json!({ "module": "spin" }))],
+        )],
+        RuntimeLimits::default().with_fuel_budget(100_000),
+    );
+
+    let err = run(&kernel, "p").await.expect_err("must trip fuel budget");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exhausted its fuel budget (100000 units) at instantiation"),
+        "error should name the fuel cap and the phase: {msg}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn wasm_memory_grow_past_cap_is_denied() {
     // Grows one 64 KiB page per iteration until the ResourceLimiter
     // says no (memory.grow returns -1), then traps via `unreachable`.

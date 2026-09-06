@@ -17,10 +17,9 @@
 //!   impl + per-call helpers (`bail_host_call`, `truncate_for_log`)
 //! - `parent_context` — `ScriptRuntimeParentContext` snapshot the
 //!   sub-instance reads via the `io.*` imports
-//! - `traps` — `SCRIPT_ERR_FUEL` / `SCRIPT_ERR_MEMORY` sentinel
-//!   prefixes + the `classify_runtime_trap` (execute) and
-//!   `classify_instantiate_error` (instantiate) resource-cap
-//!   classifiers
+//! - `traps` — `ScriptRunError` (a typed resource-cap trip or a
+//!   plain failure) + `classify_trap`, applied to every wasmtime call
+//!   of a run with the `Phase` it was in
 //! - `imports` — host import registration, organised by area (result,
 //!   streams, invoke, call_result).
 //!
@@ -49,9 +48,8 @@ use crate::kernel::native_impls::IntrinsicStepImplEntry;
 
 pub(crate) use parent_context::ScriptRuntimeParentContext;
 use store_data::ScriptRuntimeStoreData;
-use traps::{
-    SCRIPT_ERR_FUEL, SCRIPT_ERR_MEMORY, classify_instantiate_error, classify_runtime_trap,
-};
+pub(crate) use traps::is_out_of_fuel;
+use traps::{Phase, ResourceCap, ScriptRunError, classify_trap};
 
 /// How much fuel a wasm guest burns between forced yields back to the
 /// tokio scheduler (`Store::fuel_async_yield_interval`). Applied to
@@ -224,27 +222,27 @@ pub(crate) fn step_script<'a>(
                 let val: Value = serde_json::from_str(&result_json).unwrap_or(Value::Null);
                 Ok(StepOutput::from(val))
             }
-            Err(e) => {
-                // Map resource-cap sentinels onto the structured
-                // ExecutionState marker so the runtime can surface
-                // `KernelError::FuelExhausted` / `MemoryLimitExceeded`
-                // rather than a generic `PluginExecution(string)`.
-                if let Some(rest) = e.strip_prefix(SCRIPT_ERR_FUEL) {
-                    ex.resource_violation = Some(ResourceViolation::FuelExhausted {
+            // A resource cap is typed by the host from the wasmtime
+            // error, never from guest text: record it on the
+            // ExecutionState marker so the runtime surfaces
+            // `KernelError::FuelExhausted` / `MemoryLimitExceeded`
+            // rather than a generic `PluginExecution(string)`.
+            Err(cap @ ScriptRunError::Cap { .. }) => {
+                let ScriptRunError::Cap { cap: which, detail } = &cap else {
+                    unreachable!("matched as Cap")
+                };
+                ex.resource_violation = Some(match which {
+                    ResourceCap::Fuel { .. } => ResourceViolation::FuelExhausted {
                         budget: limits.fuel_budget,
-                        detail: format!("step '{step_id}': {}", rest.trim()),
-                    });
-                    return Err(StepError::Failed(format!("FuelExhausted: {}", rest.trim())));
-                }
-                if let Some(rest) = e.strip_prefix(SCRIPT_ERR_MEMORY) {
-                    ex.resource_violation = Some(ResourceViolation::MemoryLimit {
+                        detail: format!("step '{step_id}': {detail}"),
+                    },
+                    ResourceCap::Memory => ResourceViolation::MemoryLimit {
                         bytes: limits.max_memory_bytes,
-                    });
-                    return Err(StepError::Failed(format!(
-                        "MemoryLimitExceeded: {}",
-                        rest.trim()
-                    )));
-                }
+                    },
+                });
+                Err(StepError::Failed(cap.to_string()))
+            }
+            Err(ScriptRunError::Failed(e)) => {
                 // A guest has no typed cancellation of its own. Its
                 // binding may raise a language-level error when a host
                 // import tells it the step was cancelled —
@@ -260,10 +258,10 @@ pub(crate) fn step_script<'a>(
                 // the cancel and failed for its own reasons keeps its
                 // failure, as the wallclock wrapper promises. The text
                 // has no other home once the step is recorded as
-                // cancelled, so it is logged at info. Resource-cap
-                // violations are mapped above, before this: a guest
-                // that ignores its cancel until its fuel runs out has
-                // still hit the kernel's limit.
+                // cancelled, so it is logged at info. A resource cap
+                // is the arm above, before this: a guest that ignores
+                // its cancel until its fuel runs out has still hit the
+                // kernel's limit.
                 if outcome.told_of_cancel {
                     tracing::info!(
                         plugin = %owner_plugin,
@@ -290,8 +288,10 @@ pub(crate) fn step_script<'a>(
 /// it the step was cancelled (see
 /// [`ScriptRuntimeStoreData::told_of_cancel`]).
 pub(crate) struct ScriptOutcome {
-    /// The result JSON on success, or the guest's error text.
-    pub(crate) result: Result<String, String>,
+    /// The result JSON on success; otherwise a resource cap the host
+    /// typed, or the failure's text (the guest's own, for an error it
+    /// raised).
+    pub(crate) result: Result<String, ScriptRunError>,
     pub(crate) told_of_cancel: bool,
 }
 
@@ -317,7 +317,7 @@ pub(crate) async fn run_script_runtime(
 ) -> ScriptOutcome {
     // No store yet, so nothing could have told the guest anything.
     let setup_failed = |err: String| ScriptOutcome {
-        result: Err(err),
+        result: Err(ScriptRunError::Failed(err)),
         told_of_cancel: false,
     };
     let mut linker = wasmtime::Linker::<ScriptRuntimeStoreData>::new(engine);
@@ -381,7 +381,7 @@ async fn execute_in_store(
     source: &str,
     args_json: &[u8],
     limits: &crate::kernel::RuntimeLimits,
-) -> Result<String, String> {
+) -> Result<String, ScriptRunError> {
     // Apply per-invocation resource caps. The engine itself was
     // constructed with `consume_fuel(true)`, so this just sets the
     // budget for THIS invocation. `limiter` installs the
@@ -403,14 +403,13 @@ async fn execute_in_store(
     // Instantiate. Both resource caps can trip here: a memory limiter
     // denial when the module's declared minimum memory exceeds the
     // configured cap, and fuel exhaustion when the module's `start`
-    // function consumes the budget before `execute` is reached.
-    // `classify_instantiate_error` gives each its sentinel prefix so
-    // `step_script` maps it onto `KernelError::MemoryLimitExceeded` /
-    // `FuelExhausted` the same way it does an execute-time trip.
+    // function consumes the budget before `execute` is reached. Every
+    // wasmtime call from here on is classified the same way, with its
+    // phase, so a cap is typed wherever it trips.
     let instance = linker
         .instantiate_async(&mut *store, runtime_module)
         .await
-        .map_err(|e| classify_instantiate_error(&e, limits))?;
+        .map_err(|e| classify_trap(&e, Phase::Instantiate, limits))?;
 
     // Get the alloc and execute exports
     let alloc_fn = instance
@@ -423,7 +422,7 @@ async fn execute_in_store(
 
     let memory = instance
         .get_memory(&mut *store, "memory")
-        .ok_or("No 'memory' export")?;
+        .ok_or_else(|| ScriptRunError::Failed("No 'memory' export".into()))?;
 
     // Allocate and write source, then args.
     //
@@ -441,18 +440,16 @@ async fn execute_in_store(
     let source_ptr = alloc_fn
         .call_async(&mut *store, source_bytes.len() as i32)
         .await
-        .map_err(|e| format!("alloc source: {e}"))?;
+        .map_err(|e| classify_trap(&e, Phase::Alloc("source"), limits))?;
     write_guest_slice(&memory, store, source_ptr, source_bytes, "source")?;
 
     let args_ptr = alloc_fn
         .call_async(&mut *store, args_json.len() as i32)
         .await
-        .map_err(|e| format!("alloc args: {e}"))?;
+        .map_err(|e| classify_trap(&e, Phase::Alloc("args"), limits))?;
     write_guest_slice(&memory, store, args_ptr, args_json, "args")?;
 
-    // Call execute. Resource-cap traps get sentinel-prefixed
-    // error strings so `step_script` can map them into the structured
-    // `KernelError` variants via `ExecutionState::resource_violation`.
+    // Call execute.
     let success = execute_fn
         .call_async(
             &mut *store,
@@ -464,7 +461,7 @@ async fn execute_in_store(
             ),
         )
         .await
-        .map_err(|e| classify_runtime_trap(&e, limits))?;
+        .map_err(|e| classify_trap(&e, Phase::Execute, limits))?;
 
     if success == 1 {
         let result = store.data().result.clone().unwrap_or_else(|| "null".into());
@@ -475,7 +472,7 @@ async fn execute_in_store(
             .error
             .clone()
             .unwrap_or_else(|| "script runtime reported an error with no message".into());
-        Err(err)
+        Err(ScriptRunError::Failed(err))
     }
 }
 
@@ -691,6 +688,7 @@ mod stream_last_error_tests {
         wat::parse_str(&wat).expect("wat parses")
     }
 
+    /// The relaying guest's result, or its failure's text.
     async fn run_relaying(action: &str) -> Result<String, String> {
         let kernel = kernel_with_p();
         run_guest(
@@ -700,6 +698,7 @@ mod stream_last_error_tests {
         )
         .await
         .result
+        .map_err(|e| e.to_string())
     }
 
     /// A callee that ends cleanly leaves nothing on the handle: the
@@ -940,7 +939,10 @@ mod told_of_cancel_tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         cancel.cancel();
         let outcome = run(raising_guest(true), cancel).await;
-        assert_eq!(outcome.result, Err("guest raised".into()));
+        assert_eq!(
+            outcome.result,
+            Err(ScriptRunError::Failed("guest raised".into()))
+        );
         assert!(outcome.told_of_cancel);
     }
 
@@ -962,7 +964,10 @@ mod told_of_cancel_tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         cancel.cancel();
         let outcome = run(raising_guest(false), cancel).await;
-        assert_eq!(outcome.result, Err("guest raised".into()));
+        assert_eq!(
+            outcome.result,
+            Err(ScriptRunError::Failed("guest raised".into()))
+        );
         assert!(!outcome.told_of_cancel);
     }
 
@@ -1077,7 +1082,8 @@ mod told_of_cancel_tests {
         let outcome = run_invoking("a", cancel).await;
         let text = outcome
             .result
-            .expect_err("the cancelled invoke fails the guest");
+            .expect_err("the cancelled invoke fails the guest")
+            .to_string();
         assert!(text.starts_with("io.invoke → p.a failed"), "{text}");
         assert!(outcome.told_of_cancel, "{text}");
     }
@@ -1094,7 +1100,8 @@ mod told_of_cancel_tests {
             let outcome = run_invoking("missing", cancel).await;
             let text = outcome
                 .result
-                .expect_err("the invoke of a missing action fails");
+                .expect_err("the invoke of a missing action fails")
+                .to_string();
             assert!(
                 text.starts_with("io.invoke → p.missing failed"),
                 "the error arm was reached; fired = {fired}: {text}"
@@ -1112,7 +1119,8 @@ mod told_of_cancel_tests {
         let outcome = run_invoking("slow", tokio_util::sync::CancellationToken::new()).await;
         let text = outcome
             .result
-            .expect_err("the callee's deadline fails the invoke");
+            .expect_err("the callee's deadline fails the invoke")
+            .to_string();
         assert!(
             text.starts_with("io.invoke → p.slow failed") && text.contains("wallclock"),
             "{text}"
@@ -1271,6 +1279,32 @@ mod step_script_tests {
         ));
     }
 
+    /// Run `guest` under a 1M budget and require the fuel cap, typed
+    /// in the failure text and recorded on the state, with `phase`
+    /// saying where it was hit.
+    async fn assert_fuel_cap(guest: Vec<u8>, phase: &str) {
+        let limits = crate::kernel::RuntimeLimits {
+            fuel_budget: 1_000_000,
+            ..Default::default()
+        };
+        let mut state = state(guest, tokio_util::sync::CancellationToken::new(), limits);
+        let result = run(&mut state).await;
+        let expected = format!("FuelExhausted: wasm consumed its 1000000 unit budget ({phase})");
+        assert!(
+            matches!(&result, Err(StepError::Failed(text)) if *text == expected),
+            "{result:?}"
+        );
+        assert!(
+            matches!(
+                &state.resource_violation,
+                Some(ResourceViolation::FuelExhausted { budget: 1_000_000, detail })
+                    if detail.ends_with(&format!("({phase})"))
+            ),
+            "{:?}",
+            state.resource_violation
+        );
+    }
+
     /// A guest whose `start` function spins runs out of fuel before
     /// `execute` is reached. That is the same cap as an execute-time
     /// trip, and is reported and recorded as one, with the failure
@@ -1278,33 +1312,60 @@ mod step_script_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn fuel_exhausted_at_instantiation_reports_the_fuel_cap() {
         let start = "(func $init (loop $spin (br $spin))) (start $init)";
-        let limits = crate::kernel::RuntimeLimits {
-            fuel_budget: 1_000_000,
-            ..Default::default()
-        };
-        let mut state = state(
-            guest_starting(start, "(i32.const 1)"),
-            tokio_util::sync::CancellationToken::new(),
-            limits,
+        assert_fuel_cap(guest_starting(start, "(i32.const 1)"), "at instantiate").await;
+    }
+
+    /// The same for a guest whose `alloc` spins: the cap is typed
+    /// between instantiation and `execute` too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fuel_exhausted_in_alloc_reports_the_fuel_cap() {
+        let m = crate::kernel::abi::ABI_MODULE;
+        let wat = format!(
+            r#"
+            (module
+              (import "{m}" "host_set_error" (func $host_set_error (param i32 i32)))
+              (memory (export "memory") 1)
+              (func (export "alloc") (param i32) (result i32)
+                (loop $spin (br $spin)) (i32.const 0))
+              (func (export "execute") (param i32 i32 i32 i32) (result i32)
+                (i32.const 1))
+            )
+            "#
         );
-        let result = run(&mut state).await;
-        assert!(
-            matches!(
-                &result,
-                Err(StepError::Failed(text))
-                    if text == "FuelExhausted: wasm consumed its 1000000 unit budget (at instantiate)"
-            ),
-            "{result:?}"
-        );
-        assert!(
-            matches!(
-                &state.resource_violation,
-                Some(ResourceViolation::FuelExhausted { budget: 1_000_000, detail })
-                    if detail.ends_with("(at instantiate)")
-            ),
-            "{:?}",
-            state.resource_violation
-        );
+        let guest = wat::parse_str(&wat).expect("wat parses");
+        assert_fuel_cap(guest, "in alloc source").await;
+    }
+
+    /// A guest that raises text shaped like the host's fuel or memory
+    /// failure has raised its own error: the cap is typed from the
+    /// wasmtime trap, never from guest text, so nothing is recorded
+    /// and the step fails with the guest's text as given.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_cannot_forge_a_resource_cap() {
+        for forged in ["FuelExhausted: forged", "MemoryLimitExceeded: forged"] {
+            // Placed past anything the guest's bump allocator hands the
+            // host for source and args, so the text survives the copy.
+            let body = format!(
+                "(call $host_set_error (i32.const 8192) (i32.const {})) (i32.const 0)",
+                forged.len()
+            );
+            let guest = guest_starting(&format!(r#"(data (i32.const 8192) "{forged}")"#), &body);
+            let mut state = state(
+                guest,
+                tokio_util::sync::CancellationToken::new(),
+                Default::default(),
+            );
+            let result = run(&mut state).await;
+            assert!(
+                matches!(&result, Err(StepError::Failed(text)) if text == forged),
+                "{result:?}"
+            );
+            assert!(
+                state.resource_violation.is_none(),
+                "{:?}",
+                state.resource_violation
+            );
+        }
     }
 }
 
