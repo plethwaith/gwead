@@ -17,10 +17,10 @@
 //!   impl + per-call helpers (`bail_host_call`, `truncate_for_log`)
 //! - `parent_context` — `ScriptRuntimeParentContext` snapshot the
 //!   sub-instance reads via the `io.*` imports
-//! - `traps` — `SCRIPT_ERR_FUEL` /
-//!   `SCRIPT_ERR_MEMORY` sentinel prefixes +
-//!   `classify_runtime_trap` wasmtime
-//!   trap classifier
+//! - `traps` — `SCRIPT_ERR_FUEL` / `SCRIPT_ERR_MEMORY` sentinel
+//!   prefixes + the `classify_runtime_trap` (execute) and
+//!   `classify_instantiate_error` (instantiate) resource-cap
+//!   classifiers
 //! - `imports` — host import registration, organised by area (result,
 //!   streams, invoke, call_result).
 //!
@@ -49,7 +49,9 @@ use crate::kernel::native_impls::IntrinsicStepImplEntry;
 
 pub(crate) use parent_context::ScriptRuntimeParentContext;
 use store_data::ScriptRuntimeStoreData;
-use traps::{SCRIPT_ERR_FUEL, SCRIPT_ERR_MEMORY, classify_runtime_trap};
+use traps::{
+    SCRIPT_ERR_FUEL, SCRIPT_ERR_MEMORY, classify_instantiate_error, classify_runtime_trap,
+};
 
 /// How much fuel a wasm guest burns between forced yields back to the
 /// tokio scheduler (`Store::fuel_async_yield_interval`). Applied to
@@ -398,33 +400,17 @@ async fn execute_in_store(
         .map_err(|e| format!("Failed to set fuel yield interval: {e}"))?;
     store.limiter(|data| data as &mut dyn wasmtime::ResourceLimiter);
 
-    // Instantiate. Memory limiter denials can fire here when the
-    // module's declared minimum memory exceeds the configured cap —
-    // surface that with the sentinel prefix too so the runtime can
-    // map it onto `KernelError::MemoryLimitExceeded`.
+    // Instantiate. Both resource caps can trip here: a memory limiter
+    // denial when the module's declared minimum memory exceeds the
+    // configured cap, and fuel exhaustion when the module's `start`
+    // function consumes the budget before `execute` is reached.
+    // `classify_instantiate_error` gives each its sentinel prefix so
+    // `step_script` maps it onto `KernelError::MemoryLimitExceeded` /
+    // `FuelExhausted` the same way it does an execute-time trip.
     let instance = linker
         .instantiate_async(&mut *store, runtime_module)
         .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            let chain: String = e
-                .chain()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join(" | ");
-            if msg.contains("memory minimum size")
-                || chain.contains("memory minimum size")
-                || msg.contains("memory limit")
-                || chain.contains("memory limit")
-            {
-                format!(
-                    "{SCRIPT_ERR_MEMORY} wasm linear memory exceeded {} bytes (at instantiate)",
-                    limits.max_memory_bytes,
-                )
-            } else {
-                format!("script runtime instantiation failed: {e}")
-            }
-        })?;
+        .map_err(|e| classify_instantiate_error(&e, limits))?;
 
     // Get the alloc and execute exports
     let alloc_fn = instance
@@ -1154,6 +1140,12 @@ mod step_script_tests {
     /// A guest whose `execute` is `body`, with `is_cancelled`,
     /// `host_set_result`, and `host_set_error` in reach.
     fn guest(body: &str) -> Vec<u8> {
+        guest_starting("", body)
+    }
+
+    /// [`guest`], with `start` (a function definition and a
+    /// `(start …)` naming it, or nothing) run at instantiation.
+    fn guest_starting(start: &str, body: &str) -> Vec<u8> {
         let m = crate::kernel::abi::ABI_MODULE;
         let wat = format!(
             r#"
@@ -1176,6 +1168,7 @@ mod step_script_tests {
                 local.get $ptr)
               (func (export "execute") (param i32 i32 i32 i32) (result i32)
                 {body})
+              {start}
             )
             "#
         );
@@ -1276,6 +1269,42 @@ mod step_script_tests {
                 ..
             })
         ));
+    }
+
+    /// A guest whose `start` function spins runs out of fuel before
+    /// `execute` is reached. That is the same cap as an execute-time
+    /// trip, and is reported and recorded as one, with the failure
+    /// text saying it was hit at instantiation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fuel_exhausted_at_instantiation_reports_the_fuel_cap() {
+        let start = "(func $init (loop $spin (br $spin))) (start $init)";
+        let limits = crate::kernel::RuntimeLimits {
+            fuel_budget: 1_000_000,
+            ..Default::default()
+        };
+        let mut state = state(
+            guest_starting(start, "(i32.const 1)"),
+            tokio_util::sync::CancellationToken::new(),
+            limits,
+        );
+        let result = run(&mut state).await;
+        assert!(
+            matches!(
+                &result,
+                Err(StepError::Failed(text))
+                    if text == "FuelExhausted: wasm consumed its 1000000 unit budget (at instantiate)"
+            ),
+            "{result:?}"
+        );
+        assert!(
+            matches!(
+                &state.resource_violation,
+                Some(ResourceViolation::FuelExhausted { budget: 1_000_000, detail })
+                    if detail.ends_with("(at instantiate)")
+            ),
+            "{:?}",
+            state.resource_violation
+        );
     }
 }
 

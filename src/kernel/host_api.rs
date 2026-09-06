@@ -360,7 +360,8 @@ impl StepTypeAccess {
 #[derive(Debug, Clone)]
 pub(crate) enum ResourceViolation {
     /// A `script` interpreter sub-instance consumed its
-    /// [`RuntimeLimits::fuel_budget`](super::RuntimeLimits::fuel_budget).
+    /// [`RuntimeLimits::fuel_budget`](super::RuntimeLimits::fuel_budget),
+    /// in `execute` or in its `start` function at instantiation.
     /// `detail` names the step and what the trap said. (A `wasm` step
     /// runs under the same budget but reports its trap as the step's
     /// own failure, naming the cap in the message.)
