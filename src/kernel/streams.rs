@@ -195,11 +195,15 @@ pub struct StreamInner {
     /// The text behind the last negative code this handle returned
     /// that a code alone cannot carry: the source's error for
     /// `STREAM_IO_ERROR`, and why a write was released for
-    /// `STREAM_CANCELLED`. Kept until a later failure replaces it —
-    /// reading it does not clear it, and a close does not either, so
-    /// a guest can size a buffer with one call and fill it with the
-    /// next, or read the text after it has closed the handle. The
-    /// other codes are self-describing and record nothing.
+    /// `STREAM_CANCELLED`. Only those two codes write it, and only a
+    /// later one of them replaces it — reading it does not clear it,
+    /// and a close does not either, so a guest can size a buffer with
+    /// one call and fill it with the next, or read the text after it
+    /// has closed the handle. Never empty once set (a source that
+    /// fails without a message records a placeholder) and never
+    /// longer than [`MAX_LAST_ERROR_BYTES`], since a guest's own
+    /// error text can be as large as its memory. The other codes are
+    /// self-describing and record nothing.
     last_error: Option<String>,
 }
 
@@ -249,11 +253,19 @@ impl StreamState {
     /// The text behind the last `STREAM_IO_ERROR` or `STREAM_CANCELLED`
     /// this handle returned, if any: the source's error for a read,
     /// [`STREAM_CANCELLED_TEXT`] for a released write. Kept until a
-    /// later failure replaces it — fetching it does not clear it, and
-    /// a close does not either. What the `stream_last_error` host
-    /// import hands a guest. Takes the per-stream lock briefly.
+    /// later one of those two replaces it — fetching it does not clear
+    /// it, and a close does not either. Takes the per-stream lock
+    /// briefly.
     pub fn last_error(&self) -> Option<String> {
-        self.lock_inner().last_error.clone()
+        self.with_last_error(|text| text.map(str::to_owned))
+    }
+
+    /// [`Self::last_error`] without the clone: `f` runs under the
+    /// per-stream lock with a borrow of the text. What the
+    /// `stream_last_error` host import copies from, so a size probe
+    /// costs no allocation.
+    pub fn with_last_error<R>(&self, f: impl FnOnce(Option<&str>) -> R) -> R {
+        f(self.lock_inner().last_error.as_deref())
     }
 }
 
@@ -877,22 +889,32 @@ impl StreamState {
         // the error sticky too would turn one failed read into a
         // stream that can never report its EOF.
         //
-        // The error's text is kept on the handle and logged here. The
-        // code the guest gets says only that the source failed; the
-        // text says why, and a guest fetches it through
-        // `stream_last_error` to put in its own error. The log is the
-        // operator's side of the same correlation: a spawned streaming
-        // callee warns when it fails, and this is the read that found
-        // that failure.
+        // The error's text is kept on the handle: the code the guest
+        // gets says only that the source failed; the text says why,
+        // and a guest fetches it through `stream_last_error` to put in
+        // its own error. Rendered and logged before the lock is taken.
+        // The log is at debug: the failure itself is already warned
+        // about where it happened (a spawned streaming callee, say),
+        // and a fanned-out source reaches this point once per branch,
+        // so this line is the correlation with the read, not the
+        // report.
+        let recorded = io_error.as_ref().map(|err| {
+            let text = err.to_string();
+            tracing::debug!(
+                stream_id = self.id.get(),
+                error = %truncate_text(&text, LOG_PREVIEW_CHARS),
+                "stream_read: the source failed; the reader gets STREAM_IO_ERROR"
+            );
+            if text.is_empty() {
+                EMPTY_ERROR_TEXT.to_string()
+            } else {
+                truncate_text(&text, MAX_LAST_ERROR_BYTES)
+            }
+        });
         {
             let mut inner = self.lock_inner();
-            if let Some(err) = &io_error {
-                tracing::warn!(
-                    stream_id = self.id.get(),
-                    error = %err,
-                    "stream_read: the source failed; the reader gets STREAM_IO_ERROR"
-                );
-                inner.last_error = Some(err.to_string());
+            if let Some(text) = recorded {
+                inner.last_error = Some(text);
             }
             if !inner.closed
                 && let StreamDirection::Readable {
@@ -964,10 +986,13 @@ impl StreamState {
                 Err(_) => STREAM_CLOSED,
             },
             () = cancel.cancelled() => {
-                // Recorded for `stream_last_error` like a read's
-                // failure text, so a guest binding that reports every
-                // negative code through one path finds a reason here
-                // too.
+                // Recorded for `stream_last_error`, as a read's failure
+                // text is: `STREAM_CANCELLED` and `STREAM_IO_ERROR` are
+                // the two codes with a reason behind them, and each
+                // replaces what the other left. Nothing clears the
+                // slot, so a binding keys on the code it just got, not
+                // on whether text is present — a `STREAM_CLOSED` after
+                // this still finds this text.
                 self.lock_inner().last_error =
                     Some(STREAM_CANCELLED_TEXT.to_string());
                 STREAM_CANCELLED
@@ -1061,6 +1086,32 @@ pub const STREAM_CANCELLED: i32 = -7;
 /// returned [`STREAM_CANCELLED`].
 pub const STREAM_CANCELLED_TEXT: &str =
     "write released by the step's cancellation token; nothing was committed";
+/// What [`StreamState::last_error`] records for a source that failed
+/// with an empty message, so a recorded failure never sizes as 0 —
+/// which `stream_last_error` reserves for "nothing recorded".
+pub const EMPTY_ERROR_TEXT: &str = "source failed without a message";
+/// The most of a source's error text [`StreamState::last_error`]
+/// keeps. A streaming callee's text is whatever its guest raised,
+/// which can be as large as the guest's memory, and it is held per
+/// handle until the parent's registry drains.
+pub const MAX_LAST_ERROR_BYTES: usize = 4096;
+/// How much of a text a `tracing` event shows.
+pub(crate) const LOG_PREVIEW_CHARS: usize = 200;
+
+/// `s` if it fits in `max` bytes, else its longest prefix that does
+/// (cut on a char boundary) with `… (N bytes total)` appended.
+pub(crate) fn truncate_text(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let cut = s
+        .char_indices()
+        .take_while(|(i, _)| *i < max)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    format!("{}… ({} bytes total)", &s[..cut], s.len())
+}
 
 #[cfg(test)]
 mod tests {
@@ -1475,6 +1526,43 @@ mod tests {
                 "receiver_first = {receiver_first}"
             );
         }
+    }
+
+    /// A source that fails without a message still records something:
+    /// a guest's size probe answering 0 means "nothing recorded", so
+    /// an empty text would make the failure look clean.
+    #[tokio::test]
+    async fn read_records_a_placeholder_for_an_empty_error_text() {
+        let mut reg = StreamRegistry::new();
+        let source: ReadableSource =
+            Box::pin(futures::stream::iter(vec![Err(std::io::Error::other(""))]));
+        let id = reg.register_readable("application/octet-stream", source);
+        let state = reg.get(id).unwrap();
+        assert_eq!(state.read_async(&mut [0u8; 8]).await, STREAM_IO_ERROR);
+        assert_eq!(state.last_error().as_deref(), Some(EMPTY_ERROR_TEXT));
+    }
+
+    /// A source's error text is a guest's to write and can be as
+    /// large as its memory; the handle keeps at most
+    /// `MAX_LAST_ERROR_BYTES` of it, cut on a char boundary and
+    /// saying how much there was.
+    #[tokio::test]
+    async fn read_caps_a_long_error_text() {
+        let mut reg = StreamRegistry::new();
+        // Two-byte chars, so a byte-count cut would split one.
+        let long: String = "é".repeat(MAX_LAST_ERROR_BYTES);
+        let source: ReadableSource = Box::pin(futures::stream::iter(vec![Err(
+            std::io::Error::other(long.clone()),
+        )]));
+        let id = reg.register_readable("application/octet-stream", source);
+        let state = reg.get(id).unwrap();
+        assert_eq!(state.read_async(&mut [0u8; 8]).await, STREAM_IO_ERROR);
+        let kept = state.last_error().expect("recorded");
+        let suffix = format!("… ({} bytes total)", long.len());
+        assert!(kept.ends_with(&suffix), "{kept:?}");
+        let body = &kept[..kept.len() - suffix.len()];
+        assert!(body.len() <= MAX_LAST_ERROR_BYTES, "{}", body.len());
+        assert!(body.chars().all(|c| c == 'é'), "cut on a char boundary");
     }
 
     /// A token that has already fired releases a would-be-parked write

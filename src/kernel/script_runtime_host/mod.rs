@@ -493,6 +493,43 @@ async fn execute_in_store(
     }
 }
 
+/// Run `guest` as the script runtime for plugin `p` under `cancel`,
+/// with `kernel` (if any) as the parent the invoke imports recurse
+/// into — the caller keeps the `Arc` alive for the run. Shared by the
+/// test modules below that drive `run_script_runtime` from a WAT guest.
+#[cfg(test)]
+async fn run_guest(
+    kernel: Option<&std::sync::Arc<crate::kernel::Kernel>>,
+    guest: Vec<u8>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> ScriptOutcome {
+    let mut config = wasmtime::Config::new();
+    config.consume_fuel(true);
+    let engine = Engine::new(&config).expect("engine");
+    let module = Module::new(&engine, &guest).expect("module compiles");
+    let parent = ScriptRuntimeParentContext {
+        kernel: kernel.map(std::sync::Arc::downgrade),
+        plugin: "p".into(),
+        config: Value::Null,
+        secret_resolver: None,
+        exec_ctx: Default::default(),
+        invoke_depth: 0,
+        deadline: None,
+    };
+    run_script_runtime(
+        &engine,
+        &module,
+        "",
+        b"{}",
+        &Default::default(),
+        &crate::kernel::RuntimeLimits::default(),
+        None,
+        cancel,
+        parent,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod stream_last_error_tests {
     //! What a guest learns of a streaming callee's failure through
@@ -670,29 +707,10 @@ mod stream_last_error_tests {
 
     async fn run_relaying(action: &str) -> Result<String, String> {
         let kernel = kernel_with_p();
-        let mut config = wasmtime::Config::new();
-        config.consume_fuel(true);
-        let engine = Engine::new(&config).expect("engine");
-        let module = Module::new(&engine, relaying_guest(action)).expect("module compiles");
-        let parent = ScriptRuntimeParentContext {
-            kernel: Some(std::sync::Arc::downgrade(&kernel)),
-            plugin: "p".into(),
-            config: Value::Null,
-            secret_resolver: None,
-            exec_ctx: Default::default(),
-            invoke_depth: 0,
-            deadline: None,
-        };
-        run_script_runtime(
-            &engine,
-            &module,
-            "",
-            b"{}",
-            &Default::default(),
-            &crate::kernel::RuntimeLimits::default(),
-            None,
+        run_guest(
+            Some(&kernel),
+            relaying_guest(action),
             tokio_util::sync::CancellationToken::new(),
-            parent,
         )
         .await
         .result
@@ -718,6 +736,115 @@ mod stream_last_error_tests {
             text.contains("p.fail failed") && text.contains("upstream fell over"),
             "the guest's error carries the callee's failure: {text}"
         );
+    }
+
+    /// A guest that streams `p.ok` to EOF and then makes `probe` — a
+    /// `stream_last_error` call with `$h` bound to the handle — and
+    /// reports `"as expected"` if it answered `expected`, else raises.
+    fn probing_guest(probe: &str, expected: i32) -> Vec<u8> {
+        let m = crate::kernel::abi::ABI_MODULE;
+        let wat = format!(
+            r#"
+            (module
+              (import "{m}" "host_set_result" (func $host_set_result (param i32 i32)))
+              (import "{m}" "host_set_error" (func $host_set_error (param i32 i32)))
+              (import "{m}" "host_invoke_streaming"
+                (func $invoke_streaming (param i32 i32 i32 i32 i32 i32) (result i32)))
+              (import "{m}" "stream_read" (func $stream_read (param i32 i32 i32) (result i32)))
+              (import "{m}" "stream_last_error"
+                (func $stream_last_error (param i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 0) "\"as expected\"")
+              (data (i32.const 16) "unexpected code")
+              (data (i32.const 32) "{{\"plugin\": \"p\"}}")
+              (data (i32.const 48) "ok")
+              (data (i32.const 64) "{{}}")
+              (global $next (mut i32) (i32.const 128))
+              (func (export "alloc") (param $len i32) (result i32)
+                (local $ptr i32)
+                global.get $next
+                local.set $ptr
+                global.get $next
+                local.get $len
+                i32.add
+                global.set $next
+                local.get $ptr)
+              (func (export "execute") (param i32 i32 i32 i32) (result i32)
+                (local $h i32)
+                (local.set $h (call $invoke_streaming
+                  (i32.const 32) (i32.const 15)
+                  (i32.const 48) (i32.const 2)
+                  (i32.const 64) (i32.const 2)))
+                (block $done
+                  (loop $again
+                    (br_if $done (i32.lt_s
+                      (call $stream_read (local.get $h) (i32.const 4096) (i32.const 64))
+                      (i32.const 0)))
+                    (br $again)))
+                (if (result i32) (i32.eq {probe} (i32.const {expected}))
+                  (then (call $host_set_result (i32.const 0) (i32.const 13)) (i32.const 1))
+                  (else (call $host_set_error (i32.const 16) (i32.const 15)) (i32.const 0))))
+            )
+            "#
+        );
+        wat::parse_str(&wat).expect("wat parses")
+    }
+
+    /// The guest's whole buffer range is checked before anything else,
+    /// as `stream_read` and `stream_write` check theirs: a negative
+    /// length or a pointer past linear memory is `STREAM_OOB` even on
+    /// a handle with nothing recorded, and a bad handle is
+    /// `STREAM_INVALID_HANDLE` — never a 0 that reads as "no text".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_with_a_bad_buffer_or_handle_is_refused() {
+        use crate::kernel::streams::{STREAM_INVALID_HANDLE, STREAM_OOB};
+        let cases = [
+            (
+                "negative length",
+                "(local.get $h) (i32.const 0) (i32.const -1)",
+                STREAM_OOB,
+            ),
+            (
+                "pointer past memory",
+                "(local.get $h) (i32.const 70000) (i32.const 16)",
+                STREAM_OOB,
+            ),
+            (
+                "length past memory",
+                "(local.get $h) (i32.const 65530) (i32.const 16)",
+                STREAM_OOB,
+            ),
+            (
+                "zero handle",
+                "(i32.const 0) (i32.const 0) (i32.const 0)",
+                STREAM_INVALID_HANDLE,
+            ),
+            (
+                "unknown handle",
+                "(i32.const 99) (i32.const 0) (i32.const 0)",
+                STREAM_INVALID_HANDLE,
+            ),
+            (
+                "in-range probe on a clean handle",
+                "(local.get $h) (i32.const 0) (i32.const 0)",
+                0,
+            ),
+        ];
+        for (name, args, expected) in cases {
+            let kernel = kernel_with_p();
+            let probe = format!("(call $stream_last_error {args})");
+            let outcome = run_guest(
+                Some(&kernel),
+                probing_guest(&probe, expected),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(
+                outcome.result,
+                Ok("\"as expected\"".into()),
+                "{name}: expected {expected}"
+            );
+        }
     }
 
     /// A callee whose body panics reaches the guest the same way,
@@ -782,31 +909,7 @@ mod told_of_cancel_tests {
     }
 
     async fn run(guest: Vec<u8>, cancel: tokio_util::sync::CancellationToken) -> ScriptOutcome {
-        let mut config = wasmtime::Config::new();
-        config.consume_fuel(true);
-        let engine = Engine::new(&config).expect("engine");
-        let module = Module::new(&engine, &guest).expect("module compiles");
-        let parent = ScriptRuntimeParentContext {
-            kernel: None,
-            plugin: "p".into(),
-            config: Value::Null,
-            secret_resolver: None,
-            exec_ctx: Default::default(),
-            invoke_depth: 0,
-            deadline: None,
-        };
-        run_script_runtime(
-            &engine,
-            &module,
-            "",
-            b"{}",
-            &Default::default(),
-            &crate::kernel::RuntimeLimits::default(),
-            None,
-            cancel,
-            parent,
-        )
-        .await
+        run_guest(None, guest, cancel).await
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -938,31 +1041,7 @@ mod told_of_cancel_tests {
         cancel: tokio_util::sync::CancellationToken,
     ) -> ScriptOutcome {
         let kernel = kernel_with_p();
-        let mut config = wasmtime::Config::new();
-        config.consume_fuel(true);
-        let engine = Engine::new(&config).expect("engine");
-        let module = Module::new(&engine, invoking_guest(action)).expect("module compiles");
-        let parent = ScriptRuntimeParentContext {
-            kernel: Some(std::sync::Arc::downgrade(&kernel)),
-            plugin: "p".into(),
-            config: Value::Null,
-            secret_resolver: None,
-            exec_ctx: Default::default(),
-            invoke_depth: 0,
-            deadline: None,
-        };
-        run_script_runtime(
-            &engine,
-            &module,
-            "",
-            b"{}",
-            &Default::default(),
-            &crate::kernel::RuntimeLimits::default(),
-            None,
-            cancel,
-            parent,
-        )
-        .await
+        run_guest(Some(&kernel), invoking_guest(action), cancel).await
     }
 
     /// The callee runs under a child of the step's token, so a fired
@@ -1197,9 +1276,13 @@ fn filter_secrets(ctx: &mut Value, allowed: &[String]) {
 /// `memory.data_mut()` with an unchecked range is a host panic, and
 /// nothing in this crate catches unwinds — so this returns a `String`
 /// error, which surfaces as a failed step, instead.
-fn write_guest_slice(
+///
+/// Also the host→guest copy behind an import that hands the guest
+/// bytes at a pointer the guest passed (`stream_last_error`); `store`
+/// is then the import's `Caller`.
+pub(super) fn write_guest_slice<C: wasmtime::AsContextMut>(
     memory: &wasmtime::Memory,
-    store: &mut wasmtime::Store<ScriptRuntimeStoreData>,
+    store: &mut C,
     ptr: i32,
     payload: &[u8],
     what: &str,

@@ -3695,7 +3695,8 @@ impl Kernel {
             reg.register_readable("application/octet-stream", recv_source)
         };
 
-        // Spawn the callee on a background task. Errors in the spawned
+        // Spawn the callee on a background task of its own, joined by
+        // a supervisor task that records how it ended. Errors in the
         // callee surface as a `warn` and an error item on the stream,
         // and a panic as an `error` and an error item — see
         // `spawned_callee_failure`; no JoinHandle is exposed.
@@ -3730,13 +3731,20 @@ impl Kernel {
         ctx.streams = Some(callee_streams);
         ctx.pre_allocated_outputs = Some(pre_allocated);
 
+        let plugin_reported = plugin_owned.clone();
+        let action_reported = action_owned.clone();
         tokio::spawn(async move {
-            let callee = async {
+            let callee = tokio::spawn(async move {
                 let Some(registration) = kernel.registry.get_action(&plugin_owned, &action_owned)
                 else {
-                    return Err(KernelError::NotFound(format!(
-                        "{plugin_owned}.{action_owned} unregistered between spawn and run"
-                    )));
+                    tracing::warn!(
+                        plugin = %plugin_owned,
+                        action = %action_owned,
+                        "io.invoke_streaming: action unregistered between spawn and run"
+                    );
+                    return Err(KernelError::NotFound(
+                        "unregistered between spawn and run".to_string(),
+                    ));
                 };
                 let fut = kernel.runtime.execute_dag(
                     &plugin_owned,
@@ -3756,12 +3764,14 @@ impl Kernel {
                 // never reaches it, and the caller may return before
                 // the callee ends.
                 with_wallclock_timeout(fut, wallclock.cap(), callee_cancel).await
-            };
+            });
             // The consumer cannot tell a truncated stream from a
             // complete one by EOF alone. Recorded beside the channel,
             // the failure is what the readable yields after the last
             // chunk — see `outcome` above.
-            if let Some(text) = spawned_callee_failure(&plugin_owned, &action_owned, callee).await {
+            if let Some(text) =
+                spawned_callee_failure(&plugin_reported, &action_reported, callee.await)
+            {
                 *outcome
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) =
@@ -4700,27 +4710,39 @@ impl Kernel {
 }
 
 /// What a spawned streaming callee's stream should carry after its
-/// last chunk, from how `callee` ended: nothing for a clean end or a
-/// cancel (the caller's own doing, not a failure worth a warning), the
-/// failure text otherwise.
+/// last chunk, from how its task ended (`joined`): nothing for a clean
+/// end or a cancel (the caller's own doing, not a failure worth a
+/// warning), the failure text otherwise.
 ///
 /// A panic is a failure like any other. The callee's step bodies run
 /// on tasks the dataflow scheduler joins, so a panic in one of them
-/// already comes back as the action's error; this catch is for a panic
-/// in the callee's own orchestration, which nothing joins. Left
-/// uncaught it would unwind past the recording and drop the held
-/// sender, and the consumer would read a clean EOF — tokio logs the
-/// panic, but nothing on the stream would tell it from success.
-async fn spawned_callee_failure(
+/// already comes back as the action's error; running the callee on a
+/// task of its own and joining that covers the rest — its own
+/// orchestration, and the drop of a poisoned future — in the same
+/// words the scheduler uses ([`runtime::join_error`]), with no
+/// `catch_unwind` in the crate. Left unjoined, a panic there would
+/// unwind past the recording and drop the held sender, and the
+/// consumer would read a clean EOF: the panic hook prints it, but
+/// nothing on the stream would tell it from success.
+fn spawned_callee_failure(
     plugin: &str,
     action: &str,
-    callee: impl std::future::Future<Output = Result<ActionResult, KernelError>>,
+    joined: Result<Result<ActionResult, KernelError>, tokio::task::JoinError>,
 ) -> Option<String> {
-    use futures::FutureExt as _;
-    match std::panic::AssertUnwindSafe(callee).catch_unwind().await {
+    let result = joined.unwrap_or_else(|join_err| {
+        tracing::error!(
+            plugin,
+            action,
+            error = %join_err,
+            "io.invoke_streaming: background action panicked outside \
+             its step tasks; its stream ends with the panic"
+        );
+        Err(runtime::join_error("background action", &join_err))
+    });
+    match result {
         // The drop of the held sender ends the stream with a plain EOF.
-        Ok(Ok(_)) => None,
-        Ok(Err(KernelError::Cancelled { .. })) => {
+        Ok(_) => None,
+        Err(KernelError::Cancelled { .. }) => {
             tracing::debug!(
                 plugin,
                 action,
@@ -4729,7 +4751,7 @@ async fn spawned_callee_failure(
             );
             None
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             tracing::warn!(
                 plugin,
                 action,
@@ -4738,21 +4760,6 @@ async fn spawned_callee_failure(
                  its stream ends with the failure"
             );
             Some(format!("{plugin}.{action} failed: {e}"))
-        }
-        Err(payload) => {
-            let what = payload
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "non-string panic payload".to_string());
-            tracing::error!(
-                plugin,
-                action,
-                panic = %what,
-                "io.invoke_streaming: background action panicked outside \
-                 its step tasks; its stream ends with the panic"
-            );
-            Some(format!("{plugin}.{action} panicked: {what}"))
         }
     }
 }
@@ -5992,10 +5999,12 @@ mod wallclock_timeout_tests {
     }
 
     /// A producer that writes one chunk to its dataflow output and
-    /// then fails — a relay whose upstream fell over mid-stream.
+    /// then fails — a relay whose upstream fell over mid-stream — or,
+    /// with `params.panic`, panics instead — a relay whose body hit a
+    /// bug.
     fn write_then_fail<'a>(
         ex: &'a mut (dyn host_api::PluginExecution + Send),
-        _params: &'a Value,
+        params: &'a Value,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<host_api::StepOutput, host_api::StepError>>
@@ -6007,27 +6016,10 @@ mod wallclock_timeout_tests {
             let (writable, streams_arc, cancel) = relay_output(&*ex);
             let n = streams::write_async_shared(&streams_arc, writable, b"partial", &cancel).await;
             assert!(n > 0, "the chunk before the failure is accepted");
+            if params["panic"].as_bool().unwrap_or(false) {
+                panic!("relay body fell over");
+            }
             Err(host_api::StepError::Failed("upstream fell over".into()))
-        })
-    }
-
-    /// A producer that writes one chunk to its dataflow output and
-    /// then panics — a relay whose body hit a bug mid-stream.
-    fn write_then_panic<'a>(
-        ex: &'a mut (dyn host_api::PluginExecution + Send),
-        _params: &'a Value,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<host_api::StepOutput, host_api::StepError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            let (writable, streams_arc, cancel) = relay_output(&*ex);
-            let n = streams::write_async_shared(&streams_arc, writable, b"partial", &cancel).await;
-            assert!(n > 0, "the chunk before the panic is accepted");
-            panic!("relay body fell over");
         })
     }
 
@@ -6399,7 +6391,7 @@ mod wallclock_timeout_tests {
     /// the panic and then a clean EOF.
     #[tokio::test(flavor = "multi_thread")]
     async fn spawned_streaming_callee_step_panic_is_an_error_item_on_the_stream() {
-        let kernel = kernel_with_relay(write_then_panic, "{}");
+        let kernel = kernel_with_relay(write_then_fail, r#"{"panic": true}"#);
         let mut source = spawn_relay(&kernel, None).await;
         let items = drain_relay(&mut source).await;
         match items.as_slice() {
@@ -6417,20 +6409,23 @@ mod wallclock_timeout_tests {
         }
     }
 
-    /// The catch in [`spawned_callee_failure`] is for the panic the
+    /// The join in [`spawned_callee_failure`] is for the panic the
     /// scheduler cannot join: one in the callee's own orchestration,
-    /// before or between its step tasks. Fed a callee that panics
-    /// before any step runs, it still yields a failure text for the
-    /// stream instead of unwinding past the recording.
+    /// before or between its step tasks. Fed the outcome of a callee
+    /// task that panicked before any step ran, it still yields a
+    /// failure text for the stream, in the scheduler's own words.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_spawned_callee_that_panics_outside_its_step_tasks_still_reports_a_failure() {
-        let text = spawned_callee_failure("budget", "relay", async {
+        let joined = tokio::spawn(async {
             panic!("orchestration fell over");
         })
-        .await
-        .expect("a panic is a failure, not a clean end");
+        .await;
+        let text = spawned_callee_failure("budget", "relay", joined)
+            .expect("a panic is a failure, not a clean end");
         assert!(
-            text.contains("budget.relay panicked") && text.contains("orchestration fell over"),
+            text.contains("budget.relay failed")
+                && text.contains("panicked")
+                && text.contains("orchestration fell over"),
             "the text names the callee and the panic: {text}"
         );
     }

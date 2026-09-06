@@ -133,17 +133,8 @@ pub(super) fn bail_host_call(
 /// `gwead::script_runtime=debug`. Truncates the JSON representation to
 /// ~200 chars with an ellipsis suffix.
 pub(super) fn truncate_for_log(value: &Value) -> String {
-    const MAX: usize = 200;
-    let s = value.to_string();
-    if s.len() <= MAX {
-        s
-    } else {
-        let cut = s
-            .char_indices()
-            .take_while(|(i, _)| *i < MAX)
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-        format!("{}… ({} bytes total)", &s[..cut], s.len())
-    }
+    crate::kernel::streams::truncate_text(
+        &value.to_string(),
+        crate::kernel::streams::LOG_PREVIEW_CHARS,
+    )
 }

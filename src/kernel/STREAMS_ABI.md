@@ -209,15 +209,28 @@ nothing, `STREAM_INVALID_HANDLE` for an unknown handle, and
 `STREAM_OOB` when the copy would overrun linear memory. The other
 codes are self-describing and record no text.
 
-The text stays on the handle until a later failure replaces it:
-fetching it does not clear it, and neither does closing the handle,
-so a binding can tidy up first and explain afterwards. A copy that
-did not fit may end mid-codepoint; size by the return value, not by
-what arrived.
+The text stays on the handle until a later `STREAM_IO_ERROR` or
+`STREAM_CANCELLED` replaces it: fetching it does not clear it, and
+neither does closing the handle, so a binding can tidy up first and
+explain afterwards — and so a binding keys on the code it just got,
+not on whether text is present, since a `STREAM_CLOSED` after an
+earlier failure still finds that failure's text. A copy that did not
+fit may end mid-codepoint; size by the return value, not by what
+arrived. This is the opposite convention from `host_call_result_read`,
+which drains a single slot and returns the bytes it copied: that slot
+is one pending call's, consumed once; this text is a handle's,
+retained, so a probe and a fetch see the same thing.
 
-The same failure is logged at `warn` by the read that found it,
-naming the stream id and the text, so an operator can correlate a
-guest's error with the callee's own warning.
+A recorded text is never empty (a source that fails without a message
+records `source failed without a message`) and never longer than
+4096 bytes (`MAX_LAST_ERROR_BYTES` in [`streams.rs`](streams.rs); a
+longer one is cut on a char boundary and ends with `… (N bytes
+total)`), since a streaming callee's text is whatever its guest
+raised.
+
+The same failure is logged at `debug` by the read that found it,
+naming the stream id and a preview of the text, so an operator can
+correlate a guest's error with the callee's own `warn`.
 
 ## Return-code contract
 
