@@ -229,10 +229,60 @@ async fn wasm_infinite_loop_trips_fuel_budget() {
     );
 
     let err = run(&kernel, "p").await.expect_err("must trip fuel budget");
-    let msg = err.to_string().to_lowercase();
+    let msg = err.to_string();
     assert!(
-        msg.contains("fuel"),
-        "error should mention fuel exhaustion: {msg}"
+        msg.contains("exhausted its fuel budget (100000 units) during 'run'"),
+        "error should name the fuel cap and the phase: {msg}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_start_function_tripping_fuel_budget_names_the_cap() {
+    // The same loop in the module's `start` function runs at
+    // instantiation, before the entry is called. The cap is the same
+    // cap and the error names it the same way, saying where.
+    let kernel = boot_with_limits(
+        vec![wasm_manifest(
+            "p",
+            one_module(
+                "spin",
+                r#"(module (func $init (loop $l br $l)) (start $init) (func (export "run")))"#,
+            ),
+            vec![step("exec", "wasm", json!({ "module": "spin" }))],
+        )],
+        RuntimeLimits::default().with_fuel_budget(100_000),
+    );
+
+    let err = run(&kernel, "p").await.expect_err("must trip fuel budget");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exhausted its fuel budget (100000 units) at instantiation"),
+        "error should name the fuel cap and the phase: {msg}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_declared_minimum_past_cap_fails_instantiation_as_the_modules_own_failure() {
+    // 64 pages is 4 MiB, declared up front, under a 1 MiB cap. The
+    // limiter refuses it and the module never instantiates. That is
+    // the `wasm` step's own plain failure naming the module, not the
+    // typed memory cap the `script` step reports for the same shape.
+    let kernel = boot_with_limits(
+        vec![wasm_manifest(
+            "p",
+            one_module("hungry", r#"(module (memory 64) (func (export "run")))"#),
+            vec![step("exec", "wasm", json!({ "module": "hungry" }))],
+        )],
+        RuntimeLimits::default().with_max_memory_bytes(1024 * 1024),
+    );
+
+    let err = run(&kernel, "p")
+        .await
+        .expect_err("must fail to instantiate");
+    assert!(
+        matches!(&err, KernelError::Execution(msg)
+            if msg.starts_with("wasm step: module 'hungry' instantiation failed: ")),
+        "{err:?}"
     );
 }
 

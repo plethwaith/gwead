@@ -47,6 +47,9 @@ pub(crate) struct ResourceBudget {
     committed_memory_bytes: usize,
     /// Sum of every table's current element count in this store.
     committed_table_elements: usize,
+    /// Whether a memory allocation has been refused. See
+    /// [`Self::memory_denied`].
+    memory_denied: bool,
 }
 
 impl ResourceBudget {
@@ -59,7 +62,22 @@ impl ResourceBudget {
             max_memories: limits.max_memories,
             committed_memory_bytes: 0,
             committed_table_elements: 0,
+            memory_denied: false,
         }
+    }
+
+    /// Whether this budget has refused a memory allocation for
+    /// exceeding the cap. The limiter's refusal, together with the
+    /// fuel meter still reading the full budget, is what types a
+    /// failed instantiation as the memory cap (a declared minimum past
+    /// the cap), rather than the text of wasmtime's error, which a
+    /// guest can shape through its name section. A refusal once guest
+    /// code runs answers `-1` to the guest and is not an error, so the
+    /// flag alone types nothing; see `script_runtime_host::traps`. A
+    /// refusal for accounting drift is the host's own fault, not the
+    /// plugin's cap, and is not recorded here.
+    pub(crate) fn memory_denied(&self) -> bool {
+        self.memory_denied
     }
 
     /// `ResourceLimiter::memory_growing`, as a store-wide check.
@@ -72,9 +90,18 @@ impl ResourceBudget {
             // `current` exceeding what we have committed means our
             // accounting drifted from wasmtime's. Deny rather than
             // guess: a wrong allow here is unbounded host allocation.
+            // A host bug, not the plugin's cap: say so, and leave
+            // `memory_denied` alone so it is not reported as one.
+            tracing::error!(
+                current,
+                desired,
+                committed = self.committed_memory_bytes,
+                "wasm memory accounting drifted from wasmtime's; refusing the grow"
+            );
             return false;
         };
         if new_total > self.max_memory_bytes {
+            self.memory_denied = true;
             return false;
         }
         self.committed_memory_bytes = new_total;
@@ -88,6 +115,13 @@ impl ResourceBudget {
             .checked_sub(current)
             .and_then(|rest| rest.checked_add(desired))
         else {
+            // Accounting drift, as for memory: a host bug, say so.
+            tracing::error!(
+                current,
+                desired,
+                committed = self.committed_table_elements,
+                "wasm table accounting drifted from wasmtime's; refusing the grow"
+            );
             return false;
         };
         if new_total > self.max_table_elements {
@@ -178,6 +212,28 @@ mod tests {
             !b.memory_growing(0, 1),
             "a second memory has no budget left, even for one byte"
         );
+    }
+
+    /// A refusal is remembered, and nothing before it counts as one.
+    #[test]
+    fn a_refused_memory_allocation_is_recorded() {
+        let mut b = budget(4096, 64);
+        assert!(b.memory_growing(0, 4096));
+        assert!(!b.memory_denied(), "an allowed allocation is not a refusal");
+        assert!(!b.memory_growing(4096, 4097));
+        assert!(b.memory_denied());
+    }
+
+    /// A refusal for accounting drift is refused, but is the host's
+    /// fault and not recorded as the cap.
+    #[test]
+    fn a_refusal_for_accounting_drift_is_not_recorded_as_the_cap() {
+        let mut b = budget(4096, 64);
+        assert!(
+            !b.memory_growing(1, 2),
+            "nothing committed, so `current` of 1 is drift"
+        );
+        assert!(!b.memory_denied());
     }
 
     #[test]

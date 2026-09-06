@@ -360,8 +360,10 @@ impl StepTypeAccess {
 #[derive(Debug, Clone)]
 pub(crate) enum ResourceViolation {
     /// A `script` interpreter sub-instance consumed its
-    /// [`RuntimeLimits::fuel_budget`](super::RuntimeLimits::fuel_budget).
-    /// `detail` names the step and what the trap said. (A `wasm` step
+    /// [`RuntimeLimits::fuel_budget`](super::RuntimeLimits::fuel_budget):
+    /// in `execute`, in `alloc`, or in its `start` function at
+    /// instantiation. `detail` names the step, the budget, and the
+    /// phase. (A `wasm` step
     /// runs under the same budget but reports its trap as the step's
     /// own failure, naming the cap in the message.)
     FuelExhausted { budget: u64, detail: String },
@@ -372,8 +374,9 @@ pub(crate) enum ResourceViolation {
     /// the limiter answers a `memory.grow` past the cap with `-1` and
     /// no trap, for a `script` step and a `wasm` step alike, so the
     /// step may still succeed. (A `wasm` step's instantiation failure
-    /// is its own plain failure naming the module.)
-    MemoryLimit { bytes: usize },
+    /// is its own plain failure naming the module.) `detail` names the
+    /// step and the cap.
+    MemoryLimit { bytes: usize, detail: String },
     /// Cumulative step-result bytes exceeded
     /// [`RuntimeLimits::max_step_results_bytes`](super::RuntimeLimits::max_step_results_bytes),
     /// recorded when a step's result is refused rather than stored.
@@ -412,9 +415,10 @@ impl From<ResourceViolation> for super::KernelError {
             ResourceViolation::FuelExhausted { budget, detail } => {
                 Self::FuelExhausted { budget, detail }
             }
-            ResourceViolation::MemoryLimit { bytes } => {
-                Self::MemoryLimitExceeded { limit_bytes: bytes }
-            }
+            ResourceViolation::MemoryLimit { bytes, detail } => Self::MemoryLimitExceeded {
+                limit_bytes: bytes,
+                detail,
+            },
             ResourceViolation::StepResultsLimit {
                 limit_bytes,
                 attempted_bytes,
@@ -2407,19 +2411,50 @@ fn step_wasm<'a>(
         // interval keeps a CPU-bound module from pinning its tokio
         // worker for the whole budget — same rationale as the script
         // runtime's store setup.
-        let _ = store.set_fuel(limits.fuel_budget);
-        let _ = store
-            .fuel_async_yield_interval(Some(super::script_runtime_host::FUEL_ASYNC_YIELD_INTERVAL));
+        store.set_fuel(limits.fuel_budget).map_err(|e| {
+            StepError::Failed(format!(
+                "wasm step: module '{module_name}' failed to set its fuel budget: {e}"
+            ))
+        })?;
+        store
+            .fuel_async_yield_interval(Some(super::script_runtime_host::FUEL_ASYNC_YIELD_INTERVAL))
+            .map_err(|e| {
+                StepError::Failed(format!(
+                    "wasm step: module '{module_name}' failed to set its fuel yield interval: {e}"
+                ))
+            })?;
         let linker = wasmtime::Linker::<WasmStoreLimits>::new(&engine);
+
+        // Name the fuel cap when it tripped — the bare trap display
+        // is just a wasm backtrace with no indication that the
+        // failure was the fuel meter rather than module logic. Keep
+        // `{e}` — the trap display carries the wasm backtrace, i.e.
+        // WHERE execution was when the meter ran dry, which a module
+        // author debugging a near-miss budget wants. Fuel can run out
+        // at instantiation too, in the module's `start` function, so
+        // both calls are classified. The memory cap is not named:
+        // during the entry a `memory.grow` past the cap answers -1 to
+        // the module rather than trapping, so whatever trap follows
+        // is the module's own; at instantiation a declared minimum
+        // past the cap fails instantiation, and that is the `wasm`
+        // step's own plain failure naming the module (see
+        // `ResourceViolation::MemoryLimit`).
+        let failed = |e: wasmtime::Error, when: &str, plain: &str| {
+            if super::script_runtime_host::is_out_of_fuel(&e) {
+                StepError::Failed(format!(
+                    "wasm step: module '{module_name}' exhausted its fuel budget \
+                     ({} units) {when}: {e}",
+                    limits.fuel_budget
+                ))
+            } else {
+                StepError::Failed(format!("wasm step: module '{module_name}' {plain}: {e}"))
+            }
+        };
 
         let instance = linker
             .instantiate_async(&mut store, &module)
             .await
-            .map_err(|e| {
-                StepError::Failed(format!(
-                    "wasm step: module '{module_name}' instantiation failed: {e}"
-                ))
-            })?;
+            .map_err(|e| failed(e, "at instantiation", "instantiation failed"))?;
 
         let entry_fn = instance
             .get_typed_func::<(), ()>(&mut store, &entry)
@@ -2431,30 +2466,11 @@ fn step_wasm<'a>(
             })?;
 
         entry_fn.call_async(&mut store, ()).await.map_err(|e| {
-            // Name the resource cap when one tripped — the bare trap
-            // display is just a wasm backtrace with no indication that
-            // the failure was the fuel meter rather than module logic.
-            // Memory-cap denials don't need the same treatment:
-            // `memory.grow` returns -1 to the module rather than
-            // trapping, so whatever trap follows is the module's own.
-            if matches!(
-                e.downcast_ref::<wasmtime::Trap>(),
-                Some(wasmtime::Trap::OutOfFuel)
-            ) {
-                // Keep `{e}` — the trap display carries the wasm
-                // backtrace, i.e. WHERE execution was when the meter
-                // ran dry, which a module author debugging a near-miss
-                // budget wants.
-                StepError::Failed(format!(
-                    "wasm step: module '{module_name}' exhausted its fuel budget \
-                     ({} units) during '{entry}': {e}",
-                    limits.fuel_budget
-                ))
-            } else {
-                StepError::Failed(format!(
-                    "wasm step: module '{module_name}' trapped during '{entry}': {e}"
-                ))
-            }
+            failed(
+                e,
+                &format!("during '{entry}'"),
+                &format!("trapped during '{entry}'"),
+            )
         })?;
 
         Ok(StepOutput::from(Value::Null))

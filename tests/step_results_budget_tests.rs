@@ -506,7 +506,12 @@ fn hungry_script() -> Value {
 const SMALL_MEMORY: usize = 1024 * 1024;
 
 fn small_memory() -> RuntimeLimits {
-    RuntimeLimits::default().with_max_memory_bytes(SMALL_MEMORY)
+    RuntimeLimits::default()
+        .with_max_memory_bytes(SMALL_MEMORY)
+        // Not the default: the memory-cap gate compares the fuel
+        // meter against the configured budget, and a comparison
+        // against a hard-coded default would pass by accident.
+        .with_fuel_budget(5_000_000)
 }
 
 /// Uncaught, a memory trip is typed. Pins the recorded marker and its
@@ -522,7 +527,16 @@ async fn a_memory_trip_is_typed() {
         .await
         .expect_err("4 MiB declared does not instantiate under 1 MiB");
     match err {
-        KernelError::MemoryLimitExceeded { limit_bytes } => assert_eq!(limit_bytes, SMALL_MEMORY),
+        KernelError::MemoryLimitExceeded {
+            limit_bytes,
+            detail,
+        } => {
+            assert_eq!(limit_bytes, SMALL_MEMORY);
+            assert!(
+                detail.starts_with("step 'hungry': "),
+                "the detail names the step: {detail}"
+            );
+        }
         other => panic!("expected MemoryLimitExceeded, got: {other:?}"),
     }
 }
