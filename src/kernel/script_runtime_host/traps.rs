@@ -18,16 +18,17 @@
 //! `execute`, in `alloc`, or in the module's `start` function at
 //! instantiation. The memory limit is recognised at instantiation
 //! only, from the limiter having refused an allocation before any
-//! guest instruction ran: a declared minimum past the cap is refused
-//! by the limiter while the memory is being created, before the
-//! `start` function, and fails instantiation with a plain error. The
-//! caller establishes "before any guest instruction ran" from the
-//! fuel meter, which still reads the full budget then (see
-//! `classify_from_store` in the parent module). A `start` function
-//! can have its own `memory.grow` refused too — answered `-1`, no
-//! trap — and then fail in any way it likes, a trap or an error from
-//! a host import; it has run instructions to do so, and the fuel
-//! meter says so, so that is its own failure and not the cap.
+//! guest code ran: a declared minimum past the cap is refused by the
+//! limiter while the memory is being created, before the `start`
+//! function, and fails instantiation with a plain error. The caller
+//! establishes "before any guest code ran" from the fuel meter, which
+//! still reads the full budget then and never does once `start` has
+//! been entered (see `classify_from_store` in the parent module for
+//! the wasmtime mechanism that guarantees it). A `start` function can
+//! have its own `memory.grow` refused too — answered `-1`, no trap —
+//! and then fail in any way it likes, a trap or an error from a host
+//! import; the fuel meter says it ran, so that is its own failure and
+//! not the cap.
 
 use std::fmt;
 
@@ -64,6 +65,17 @@ pub(crate) enum ResourceCap {
     Memory { bytes: usize },
 }
 
+impl ResourceCap {
+    /// The failure text a step reports for this cap: the description
+    /// under the name of the `KernelError` it becomes.
+    pub(crate) fn failure_text(&self) -> String {
+        match self {
+            Self::Fuel { .. } => format!("FuelExhausted: {self}"),
+            Self::Memory { .. } => format!("MemoryLimitExceeded: {self}"),
+        }
+    }
+}
+
 impl fmt::Display for ResourceCap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -95,14 +107,7 @@ pub(crate) enum ScriptRunError {
 impl fmt::Display for ScriptRunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cap {
-                cap: cap @ ResourceCap::Fuel { .. },
-                ..
-            } => write!(f, "FuelExhausted: {cap}"),
-            Self::Cap {
-                cap: cap @ ResourceCap::Memory { .. },
-                ..
-            } => write!(f, "MemoryLimitExceeded: {cap}"),
+            Self::Cap { cap, .. } => f.write_str(&cap.failure_text()),
             Self::Failed(text) => f.write_str(text),
         }
     }

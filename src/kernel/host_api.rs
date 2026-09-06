@@ -2411,9 +2411,18 @@ fn step_wasm<'a>(
         // interval keeps a CPU-bound module from pinning its tokio
         // worker for the whole budget — same rationale as the script
         // runtime's store setup.
-        let _ = store.set_fuel(limits.fuel_budget);
-        let _ = store
-            .fuel_async_yield_interval(Some(super::script_runtime_host::FUEL_ASYNC_YIELD_INTERVAL));
+        store.set_fuel(limits.fuel_budget).map_err(|e| {
+            StepError::Failed(format!(
+                "wasm step: module '{module_name}': failed to set fuel budget: {e}"
+            ))
+        })?;
+        store
+            .fuel_async_yield_interval(Some(super::script_runtime_host::FUEL_ASYNC_YIELD_INTERVAL))
+            .map_err(|e| {
+                StepError::Failed(format!(
+                    "wasm step: module '{module_name}': failed to set fuel yield interval: {e}"
+                ))
+            })?;
         let linker = wasmtime::Linker::<WasmStoreLimits>::new(&engine);
 
         // Name the fuel cap when it tripped — the bare trap display

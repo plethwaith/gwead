@@ -506,7 +506,12 @@ fn hungry_script() -> Value {
 const SMALL_MEMORY: usize = 1024 * 1024;
 
 fn small_memory() -> RuntimeLimits {
-    RuntimeLimits::default().with_max_memory_bytes(SMALL_MEMORY)
+    RuntimeLimits::default()
+        .with_max_memory_bytes(SMALL_MEMORY)
+        // Not the default: the memory-cap gate compares the fuel
+        // meter against the configured budget, and a comparison
+        // against a hard-coded default would pass by accident.
+        .with_fuel_budget(5_000_000)
 }
 
 /// Uncaught, a memory trip is typed. Pins the recorded marker and its

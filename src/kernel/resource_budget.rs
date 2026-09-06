@@ -67,12 +67,13 @@ impl ResourceBudget {
     }
 
     /// Whether this budget has refused a memory allocation for
-    /// exceeding the cap. The limiter's refusal is what types a failed
-    /// instantiation as the memory cap (a declared minimum past the
-    /// cap), rather than the text of wasmtime's error, which a guest
-    /// can shape through its name section. A refusal during execution
-    /// answers `-1` to the guest and is not an error, so the flag
-    /// alone types nothing; see `script_runtime_host::traps`. A
+    /// exceeding the cap. The limiter's refusal, together with the
+    /// fuel meter still reading the full budget, is what types a
+    /// failed instantiation as the memory cap (a declared minimum past
+    /// the cap), rather than the text of wasmtime's error, which a
+    /// guest can shape through its name section. A refusal once guest
+    /// code runs answers `-1` to the guest and is not an error, so the
+    /// flag alone types nothing; see `script_runtime_host::traps`. A
     /// refusal for accounting drift is the host's own fault, not the
     /// plugin's cap, and is not recorded here.
     pub(crate) fn memory_denied(&self) -> bool {
@@ -114,6 +115,13 @@ impl ResourceBudget {
             .checked_sub(current)
             .and_then(|rest| rest.checked_add(desired))
         else {
+            // Accounting drift, as for memory: a host bug, said so.
+            tracing::error!(
+                current,
+                desired,
+                committed = self.committed_table_elements,
+                "wasm table accounting drifted from wasmtime's; refusing the grow"
+            );
             return false;
         };
         if new_total > self.max_table_elements {

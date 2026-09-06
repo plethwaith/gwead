@@ -229,15 +229,16 @@ pub(crate) fn step_script<'a>(
             // `KernelError::FuelExhausted` / `MemoryLimitExceeded`
             // rather than a generic `PluginExecution(string)`.
             Err(ScriptRunError::Cap { cap, error }) => {
-                let detail = format!("step '{step_id}': {cap}");
                 ex.resource_violation = Some(match &cap {
                     ResourceCap::Fuel { budget, .. } => ResourceViolation::FuelExhausted {
                         budget: *budget,
-                        detail,
+                        detail: format!("step '{step_id}': {cap}"),
                     },
+                    // wasmtime's text says how much the module
+                    // declared, which is what its author needs.
                     ResourceCap::Memory { bytes } => ResourceViolation::MemoryLimit {
                         bytes: *bytes,
-                        detail,
+                        detail: format!("step '{step_id}': {cap}: {error}"),
                     },
                 });
                 tracing::warn!(
@@ -247,9 +248,7 @@ pub(crate) fn step_script<'a>(
                     error = %error,
                     "Script step hit a resource cap"
                 );
-                Err(StepError::Failed(
-                    ScriptRunError::Cap { cap, error }.to_string(),
-                ))
+                Err(StepError::Failed(cap.failure_text()))
             }
             Err(ScriptRunError::Failed(e)) => {
                 // A guest has no typed cancellation of its own. Its
@@ -414,8 +413,8 @@ async fn execute_in_store(
     // configured cap, and fuel exhaustion when the module's `start`
     // function consumes the budget before `execute` is reached. Every
     // wasmtime call from here on is classified the same way, with its
-    // phase and what the limiter has refused, so a cap is typed
-    // wherever it trips.
+    // phase and what the limiter and the fuel meter say, so a cap is
+    // typed wherever it trips.
     let instance = match linker.instantiate_async(&mut *store, runtime_module).await {
         Ok(instance) => instance,
         Err(e) => return Err(classify_from_store(&*store, &e, Phase::Instantiate, limits)),
@@ -488,12 +487,23 @@ async fn execute_in_store(
 
 /// [`classify_error`] for a wasmtime error from `store`'s run, with
 /// whether its limiter refused a memory allocation before any guest
-/// instruction ran. Every guest instruction costs fuel, so the fuel
-/// meter still reading the whole budget is that "before": a declared
-/// minimum past the cap is refused while the memory is created,
-/// ahead of the `start` function, and consumes nothing. A `start`
-/// function that had its own grow refused and then failed has spent
-/// fuel getting there, whatever it made the failure look like.
+/// code ran. The fuel meter still reading the whole budget is that
+/// "before", by a wasmtime mechanism worth naming, since a wasmtime
+/// that dropped it would reopen the gate: instantiation runs a
+/// module-startup function wasmtime synthesises, which applies data
+/// and element segments and then calls the module's `start`. Memories
+/// are created, and a declared minimum past the cap refused, before
+/// that function runs, so a refusal there leaves the meter untouched.
+/// Once it runs, its own entry costs a unit, and Cranelift saves the
+/// counter to the store at every call — the call into `start`
+/// included — so the meter reads below the budget for anything
+/// `start` then does, however it fails. That matters because
+/// Cranelift does not save the counter at every instruction: a trap
+/// from division or an out-of-bounds load flushes nothing, and it is
+/// the startup function's saved unit, not `start`'s own spending,
+/// that the gate sees in that case. Verified against wasmtime 47
+/// (`wasmtime-environ`'s `require_startup_func`, and
+/// `fuel_before_op` / `fuel_save_from_var` in its Cranelift backend).
 fn classify_from_store(
     store: &wasmtime::Store<ScriptRuntimeStoreData>,
     err: &wasmtime::Error,
@@ -1431,6 +1441,20 @@ mod step_script_tests {
                 ),
                 "script runtime instantiation failed:",
             ),
+            // Division by zero traps without Cranelift saving the fuel
+            // counter first, unlike `unreachable` and a call. The gate
+            // still sees the startup function's own spending.
+            (
+                "start, non-flushing trap",
+                guest_starting(
+                    &format!(
+                        "(func $init {GROW} (drop (i32.div_s (i32.const 1) (i32.const 0)))) \
+                         (start $init)"
+                    ),
+                    "(i32.const 1)",
+                ),
+                "script runtime instantiation failed:",
+            ),
             (
                 "execute, host error",
                 guest(&format!("{GROW} {HOST_ERROR} (i32.const 1)")),
@@ -1446,6 +1470,55 @@ mod step_script_tests {
             let result = run(&mut state).await;
             assert!(
                 matches!(&result, Err(StepError::Failed(text)) if text.starts_with(prefix)),
+                "{name}: {result:?}"
+            );
+            assert!(
+                state.resource_violation.is_none(),
+                "{name}: {:?}",
+                state.resource_violation
+            );
+        }
+    }
+
+    /// An instantiation that fails before any guest code runs, but
+    /// with no memory refused — an import the host does not provide,
+    /// or a table declared past the table cap — leaves the fuel meter
+    /// full and is a plain failure: both halves of the memory-cap
+    /// gate are needed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_instantiation_failure_without_a_refusal_is_a_plain_failure() {
+        let m = crate::kernel::abi::ABI_MODULE;
+        let missing_import = format!(
+            r#"
+            (module
+              (import "{m}" "no_such_import" (func $missing))
+              (memory (export "memory") 1)
+              (func (export "alloc") (param i32) (result i32) (i32.const 0))
+              (func (export "execute") (param i32 i32 i32 i32) (result i32)
+                (call $missing) (i32.const 1))
+            )
+            "#
+        );
+        let cases = [
+            (
+                "missing import",
+                wat::parse_str(&missing_import).expect("wat parses"),
+                "unknown import",
+            ),
+            (
+                "table past the cap",
+                guest_starting("(table 64 funcref)", "(i32.const 1)"),
+                "table",
+            ),
+        ];
+        for (name, guest, mentions) in cases {
+            let limits = crate::kernel::RuntimeLimits::default().with_max_table_elements(16);
+            let mut state = state(guest, tokio_util::sync::CancellationToken::new(), limits);
+            let result = run(&mut state).await;
+            assert!(
+                matches!(&result, Err(StepError::Failed(text))
+                    if text.starts_with("script runtime instantiation failed:")
+                        && text.contains(mentions)),
                 "{name}: {result:?}"
             );
             assert!(
