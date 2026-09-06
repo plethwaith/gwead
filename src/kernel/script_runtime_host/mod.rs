@@ -18,8 +18,9 @@
 //! - `parent_context` — `ScriptRuntimeParentContext` snapshot the
 //!   sub-instance reads via the `io.*` imports
 //! - `traps` — `ScriptRunError` (a typed resource-cap trip or a
-//!   plain failure) + `classify_trap`, applied to every wasmtime call
-//!   of a run with the `Phase` it was in
+//!   plain failure) + `classify_error`, applied to every wasmtime
+//!   call of a run with the `Phase` it was in and what the store's
+//!   limiter and fuel meter say
 //! - `imports` — host import registration, organised by area (result,
 //!   streams, invoke, call_result).
 //!
@@ -49,7 +50,7 @@ use crate::kernel::native_impls::IntrinsicStepImplEntry;
 pub(crate) use parent_context::ScriptRuntimeParentContext;
 use store_data::ScriptRuntimeStoreData;
 pub(crate) use traps::is_out_of_fuel;
-use traps::{Phase, ResourceCap, ScriptRunError, classify_trap};
+use traps::{Phase, ResourceCap, ScriptRunError, classify_error};
 
 /// How much fuel a wasm guest burns between forced yields back to the
 /// tokio scheduler (`Store::fuel_async_yield_interval`). Applied to
@@ -227,23 +228,28 @@ pub(crate) fn step_script<'a>(
             // ExecutionState marker so the runtime surfaces
             // `KernelError::FuelExhausted` / `MemoryLimitExceeded`
             // rather than a generic `PluginExecution(string)`.
-            Err(ScriptRunError::Cap(cap)) => {
+            Err(ScriptRunError::Cap { cap, error }) => {
+                let detail = format!("step '{step_id}': {cap}");
                 ex.resource_violation = Some(match &cap {
                     ResourceCap::Fuel { budget, .. } => ResourceViolation::FuelExhausted {
                         budget: *budget,
-                        detail: format!("step '{step_id}': {cap}"),
+                        detail,
                     },
-                    ResourceCap::Memory { bytes } => {
-                        ResourceViolation::MemoryLimit { bytes: *bytes }
-                    }
+                    ResourceCap::Memory { bytes } => ResourceViolation::MemoryLimit {
+                        bytes: *bytes,
+                        detail,
+                    },
                 });
                 tracing::warn!(
                     plugin = %owner_plugin,
                     step_id = %step_id,
                     cap = %cap,
+                    error = %error,
                     "Script step hit a resource cap"
                 );
-                Err(StepError::Failed(ScriptRunError::Cap(cap).to_string()))
+                Err(StepError::Failed(
+                    ScriptRunError::Cap { cap, error }.to_string(),
+                ))
             }
             Err(ScriptRunError::Failed(e)) => {
                 // A guest has no typed cancellation of its own. Its
@@ -412,7 +418,7 @@ async fn execute_in_store(
     // wherever it trips.
     let instance = match linker.instantiate_async(&mut *store, runtime_module).await {
         Ok(instance) => instance,
-        Err(e) => return Err(classify(&*store, &e, Phase::Instantiate, limits)),
+        Err(e) => return Err(classify_from_store(&*store, &e, Phase::Instantiate, limits)),
     };
 
     // Get the alloc and execute exports
@@ -444,13 +450,13 @@ async fn execute_in_store(
     let source_ptr = alloc_fn
         .call_async(&mut *store, source_bytes.len() as i32)
         .await
-        .map_err(|e| classify(&*store, &e, Phase::Alloc("source"), limits))?;
+        .map_err(|e| classify_from_store(&*store, &e, Phase::Alloc("source"), limits))?;
     write_guest_slice(&memory, store, source_ptr, source_bytes, "source")?;
 
     let args_ptr = alloc_fn
         .call_async(&mut *store, args_json.len() as i32)
         .await
-        .map_err(|e| classify(&*store, &e, Phase::Alloc("args"), limits))?;
+        .map_err(|e| classify_from_store(&*store, &e, Phase::Alloc("args"), limits))?;
     write_guest_slice(&memory, store, args_ptr, args_json, "args")?;
 
     // Call execute.
@@ -465,7 +471,7 @@ async fn execute_in_store(
             ),
         )
         .await
-        .map_err(|e| classify(&*store, &e, Phase::Execute, limits))?;
+        .map_err(|e| classify_from_store(&*store, &e, Phase::Execute, limits))?;
 
     if success == 1 {
         let result = store.data().result.clone().unwrap_or_else(|| "null".into());
@@ -480,15 +486,25 @@ async fn execute_in_store(
     }
 }
 
-/// [`classify_trap`] for a wasmtime error from `store`'s run, with
-/// what its limiter has refused.
-fn classify(
+/// [`classify_error`] for a wasmtime error from `store`'s run, with
+/// whether its limiter refused a memory allocation before any guest
+/// instruction ran. Every guest instruction costs fuel, so the fuel
+/// meter still reading the whole budget is that "before": a declared
+/// minimum past the cap is refused while the memory is created,
+/// ahead of the `start` function, and consumes nothing. A `start`
+/// function that had its own grow refused and then failed has spent
+/// fuel getting there, whatever it made the failure look like.
+fn classify_from_store(
     store: &wasmtime::Store<ScriptRuntimeStoreData>,
     err: &wasmtime::Error,
     phase: Phase,
     limits: &crate::kernel::RuntimeLimits,
 ) -> ScriptRunError {
-    classify_trap(err, phase, limits, store.data().budget.memory_denied())
+    let refused_before_the_guest_ran = store.data().budget.memory_denied()
+        && store
+            .get_fuel()
+            .is_ok_and(|left| left == limits.fuel_budget);
+    classify_error(err, phase, limits, refused_before_the_guest_ran)
 }
 
 /// Run `guest` as the script runtime for plugin `p` under `cancel`,
@@ -1378,6 +1394,63 @@ mod step_script_tests {
             assert!(
                 state.resource_violation.is_none(),
                 "{:?}",
+                state.resource_violation
+            );
+        }
+    }
+
+    /// A refused `memory.grow` sets the limiter's flag without a
+    /// declared-minimum refusal. A `start` function that has its own
+    /// grow refused and then fails — through a host import returning
+    /// an error, or a trap — has run instructions to do so, and is
+    /// reported as its own failure; so is `execute` doing the same.
+    /// The memory cap needs the refusal to come before any guest
+    /// instruction ran, which only a declared minimum does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_cannot_forge_the_memory_cap_with_a_refused_grow() {
+        // 2048 pages past a one-page memory is 128 MiB, over the
+        // default 64 MiB cap but under wasm32's own ceiling, so the
+        // limiter is asked and refuses.
+        const GROW: &str = "(drop (memory.grow (i32.const 2048)))";
+        // A negative pointer, which the host import rejects.
+        const HOST_ERROR: &str = "(call $host_set_error (i32.const -1) (i32.const 1))";
+        let cases = [
+            (
+                "start, host error",
+                guest_starting(
+                    &format!("(func $init {GROW} {HOST_ERROR}) (start $init)"),
+                    "(i32.const 1)",
+                ),
+                "script runtime instantiation failed:",
+            ),
+            (
+                "start, trap",
+                guest_starting(
+                    &format!("(func $init {GROW} unreachable) (start $init)"),
+                    "(i32.const 1)",
+                ),
+                "script runtime instantiation failed:",
+            ),
+            (
+                "execute, host error",
+                guest(&format!("{GROW} {HOST_ERROR} (i32.const 1)")),
+                "script runtime trapped:",
+            ),
+        ];
+        for (name, guest, prefix) in cases {
+            let mut state = state(
+                guest,
+                tokio_util::sync::CancellationToken::new(),
+                Default::default(),
+            );
+            let result = run(&mut state).await;
+            assert!(
+                matches!(&result, Err(StepError::Failed(text)) if text.starts_with(prefix)),
+                "{name}: {result:?}"
+            );
+            assert!(
+                state.resource_violation.is_none(),
+                "{name}: {:?}",
                 state.resource_violation
             );
         }

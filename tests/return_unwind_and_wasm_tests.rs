@@ -262,6 +262,31 @@ async fn wasm_start_function_tripping_fuel_budget_names_the_cap() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn wasm_declared_minimum_past_cap_fails_instantiation_as_the_modules_own_failure() {
+    // 64 pages is 4 MiB, declared up front, under a 1 MiB cap. The
+    // limiter refuses it and the module never instantiates. That is
+    // the `wasm` step's own plain failure naming the module, not the
+    // typed memory cap the `script` step reports for the same shape.
+    let kernel = boot_with_limits(
+        vec![wasm_manifest(
+            "p",
+            one_module("hungry", r#"(module (memory 64) (func (export "run")))"#),
+            vec![step("exec", "wasm", json!({ "module": "hungry" }))],
+        )],
+        RuntimeLimits::default().with_max_memory_bytes(1024 * 1024),
+    );
+
+    let err = run(&kernel, "p")
+        .await
+        .expect_err("must fail to instantiate");
+    assert!(
+        matches!(&err, KernelError::Execution(msg)
+            if msg.starts_with("wasm step: module 'hungry' instantiation failed: ")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn wasm_memory_grow_past_cap_is_denied() {
     // Grows one 64 KiB page per iteration until the ResourceLimiter
     // says no (memory.grow returns -1), then traps via `unreachable`.

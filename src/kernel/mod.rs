@@ -5685,8 +5685,8 @@ pub enum KernelError {
     /// step alike, so the step may still succeed. (A `wasm` step whose
     /// declared minimum exceeds the cap fails to instantiate as
     /// [`Self::Execution`] naming the module.)
-    #[error("Wasm memory limit exceeded ({limit_bytes} bytes)")]
-    MemoryLimitExceeded { limit_bytes: usize },
+    #[error("Wasm memory limit exceeded ({limit_bytes} bytes): {detail}")]
+    MemoryLimitExceeded { limit_bytes: usize, detail: String },
 
     /// One invocation's step results outgrew
     /// `RuntimeLimits::max_step_results_bytes`. Host-side memory, not

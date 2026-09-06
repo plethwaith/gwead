@@ -522,7 +522,16 @@ async fn a_memory_trip_is_typed() {
         .await
         .expect_err("4 MiB declared does not instantiate under 1 MiB");
     match err {
-        KernelError::MemoryLimitExceeded { limit_bytes } => assert_eq!(limit_bytes, SMALL_MEMORY),
+        KernelError::MemoryLimitExceeded {
+            limit_bytes,
+            detail,
+        } => {
+            assert_eq!(limit_bytes, SMALL_MEMORY);
+            assert!(
+                detail.starts_with("step 'hungry': "),
+                "the detail names the step: {detail}"
+            );
+        }
         other => panic!("expected MemoryLimitExceeded, got: {other:?}"),
     }
 }

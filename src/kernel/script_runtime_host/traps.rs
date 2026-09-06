@@ -2,30 +2,32 @@
 //!
 //! Every wasmtime call a script-runtime run makes — instantiation,
 //! the two `alloc` calls, and `execute` — can fail on a resource cap,
-//! and each one goes through [`classify_trap`] with the [`Phase`] it
+//! and each one goes through [`classify_error`] with the [`Phase`] it
 //! was in. A cap trip comes back as [`ScriptRunError::Cap`], a typed
 //! value only the host constructs from what wasmtime and the store's
-//! own limiter report, so the dispatch entry (`step_script`) records
-//! a `ResourceViolation` from it without reading text, and nothing a
-//! guest controls — the text it hands `host_set_error`, or the
-//! function and module names its name section puts in a trap's
-//! backtrace — can pass for the cap. Anything else — a generic trap,
-//! a setup failure, or the guest's own error text — is
+//! own limiter and fuel meter report, so the dispatch entry
+//! (`step_script`) records a `ResourceViolation` from it without
+//! reading text, and nothing a guest controls — the text it hands
+//! `host_set_error`, the function and module names its name section
+//! puts in a trap's backtrace, or the errors it can make host imports
+//! return — can pass for the cap. Anything else — a generic trap, a
+//! setup failure, or the guest's own error text — is
 //! [`ScriptRunError::Failed`] carrying its text.
 //!
 //! Fuel is recognised by the typed `OutOfFuel` trap at any phase: in
 //! `execute`, in `alloc`, or in the module's `start` function at
 //! instantiation. The memory limit is recognised at instantiation
-//! only, from the limiter having refused an allocation
-//! ([`ResourceBudget::memory_denied`]) together with the error not
-//! being a trap: a declared minimum past the cap is refused by the
-//! limiter and fails instantiation with a plain error, the one place
-//! a memory denial is an error at all. A `memory.grow` past the cap
-//! answers `-1` to the guest and never traps, so a denial the
-//! limiter recorded during a `start` function that then trapped for
-//! its own reasons is a trap, not the cap.
-//!
-//! [`ResourceBudget::memory_denied`]: crate::kernel::resource_budget::ResourceBudget::memory_denied
+//! only, from the limiter having refused an allocation before any
+//! guest instruction ran: a declared minimum past the cap is refused
+//! by the limiter while the memory is being created, before the
+//! `start` function, and fails instantiation with a plain error. The
+//! caller establishes "before any guest instruction ran" from the
+//! fuel meter, which still reads the full budget then (see
+//! `classify_from_store` in the parent module). A `start` function
+//! can have its own `memory.grow` refused too — answered `-1`, no
+//! trap — and then fail in any way it likes, a trap or an error from
+//! a host import; it has run instructions to do so, and the fuel
+//! meter says so, so that is its own failure and not the cap.
 
 use std::fmt;
 
@@ -68,12 +70,11 @@ impl fmt::Display for ResourceCap {
             Self::Fuel { budget, phase } => {
                 write!(f, "wasm consumed its {budget} unit budget ({phase})")
             }
-            Self::Memory { bytes } => {
-                write!(
-                    f,
-                    "wasm linear memory exceeded {bytes} bytes (at instantiate)"
-                )
-            }
+            Self::Memory { bytes } => write!(
+                f,
+                "wasm linear memory exceeded {bytes} bytes ({})",
+                Phase::Instantiate
+            ),
         }
     }
 }
@@ -81,10 +82,11 @@ impl fmt::Display for ResourceCap {
 /// Why a script-runtime run produced no result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ScriptRunError {
-    /// A resource cap tripped. Constructed only by [`classify_trap`],
+    /// A resource cap tripped. Constructed only by [`classify_error`],
     /// never from guest text, so a step that sees it has hit the
-    /// kernel's limit.
-    Cap(ResourceCap),
+    /// kernel's limit. `error` is the wasmtime error's chain, kept for
+    /// the log: the cap is what the step reports.
+    Cap { cap: ResourceCap, error: String },
     /// Anything else: a setup failure, a generic trap, or the guest's
     /// own error text, verbatim.
     Failed(String),
@@ -93,10 +95,14 @@ pub(crate) enum ScriptRunError {
 impl fmt::Display for ScriptRunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cap(cap @ ResourceCap::Fuel { .. }) => write!(f, "FuelExhausted: {cap}"),
-            Self::Cap(cap @ ResourceCap::Memory { .. }) => {
-                write!(f, "MemoryLimitExceeded: {cap}")
-            }
+            Self::Cap {
+                cap: cap @ ResourceCap::Fuel { .. },
+                ..
+            } => write!(f, "FuelExhausted: {cap}"),
+            Self::Cap {
+                cap: cap @ ResourceCap::Memory { .. },
+                ..
+            } => write!(f, "MemoryLimitExceeded: {cap}"),
             Self::Failed(text) => f.write_str(text),
         }
     }
@@ -120,27 +126,16 @@ pub(crate) fn is_out_of_fuel(err: &wasmtime::Error) -> bool {
 
 /// Classify the error a wasmtime call returned in `phase`: the fuel
 /// cap, the memory cap, or a generic failure named for the phase.
-/// `memory_denied` is whether the store's limiter has refused an
-/// allocation (see the module docs for why that, and not the error's
-/// text, is what types the memory cap).
-pub(crate) fn classify_trap(
+/// `refused_before_the_guest_ran` is whether the store's limiter
+/// refused a memory allocation while no guest instruction had yet
+/// run, which is the shape of a declared minimum past the cap and of
+/// nothing a guest can do (see the module docs).
+pub(crate) fn classify_error(
     err: &wasmtime::Error,
     phase: Phase,
     limits: &crate::kernel::RuntimeLimits,
-    memory_denied: bool,
+    refused_before_the_guest_ran: bool,
 ) -> ScriptRunError {
-    if is_out_of_fuel(err) {
-        return ScriptRunError::Cap(ResourceCap::Fuel {
-            budget: limits.fuel_budget,
-            phase,
-        });
-    }
-    let is_trap = err.downcast_ref::<wasmtime::Trap>().is_some();
-    if phase == Phase::Instantiate && memory_denied && !is_trap {
-        return ScriptRunError::Cap(ResourceCap::Memory {
-            bytes: limits.max_memory_bytes,
-        });
-    }
     // Report the whole chain, not just the top-level Display — for a
     // host-import trap the root cause (e.g. a bounds-check rejection)
     // lives at the bottom of the chain, and "error while executing at
@@ -150,6 +145,23 @@ pub(crate) fn classify_trap(
         .map(|c| c.to_string())
         .collect::<Vec<_>>()
         .join(" | ");
+    if is_out_of_fuel(err) {
+        return ScriptRunError::Cap {
+            cap: ResourceCap::Fuel {
+                budget: limits.fuel_budget,
+                phase,
+            },
+            error: chain,
+        };
+    }
+    if phase == Phase::Instantiate && refused_before_the_guest_ran {
+        return ScriptRunError::Cap {
+            cap: ResourceCap::Memory {
+                bytes: limits.max_memory_bytes,
+            },
+            error: chain,
+        };
+    }
     ScriptRunError::Failed(match phase {
         Phase::Instantiate => format!("script runtime instantiation failed: {chain}"),
         Phase::Alloc(what) => format!("alloc {what}: {chain}"),
@@ -159,7 +171,7 @@ pub(crate) fn classify_trap(
 
 #[cfg(test)]
 mod tests {
-    //! What `classify_trap` makes of each kind of error at each
+    //! What `classify_error` makes of each kind of error at each
     //! phase, on hand-built errors rather than a running guest.
     use super::*;
     use crate::kernel::RuntimeLimits;
@@ -181,24 +193,22 @@ mod tests {
         wasmtime::Error::from(wasmtime::Trap::OutOfFuel)
     }
 
-    fn unreachable_trap() -> wasmtime::Error {
-        wasmtime::Error::from(wasmtime::Trap::UnreachableCodeReached)
-    }
-
     /// The fuel trap is the fuel cap at every phase, naming the phase
     /// and the budget, whatever the limiter has recorded.
     #[test]
     fn out_of_fuel_is_the_fuel_cap_at_every_phase() {
         for phase in PHASES {
-            for denied in [false, true] {
-                let got = classify_trap(&out_of_fuel(), phase, &limits(), denied);
-                assert_eq!(
-                    got,
-                    ScriptRunError::Cap(ResourceCap::Fuel {
-                        budget: 1_000,
-                        phase
-                    }),
-                    "{phase}, denied = {denied}"
+            for refused in [false, true] {
+                let got = classify_error(&out_of_fuel(), phase, &limits(), refused);
+                assert!(
+                    matches!(
+                        &got,
+                        ScriptRunError::Cap {
+                            cap: ResourceCap::Fuel { budget: 1_000, phase: p },
+                            error,
+                        } if *p == phase && error.contains("fuel")
+                    ),
+                    "{phase}, refused = {refused}: {got:?}"
                 );
                 assert_eq!(
                     got.to_string(),
@@ -209,15 +219,19 @@ mod tests {
     }
 
     /// A plain error at instantiation after the limiter refused an
-    /// allocation is the memory cap: that is the shape of a declared
-    /// minimum past the cap.
+    /// allocation before the guest ran is the memory cap: that is the
+    /// shape of a declared minimum past the cap. The wasmtime error
+    /// rides along for the log.
     #[test]
-    fn a_refused_allocation_that_failed_instantiation_is_the_memory_cap() {
+    fn a_refusal_before_the_guest_ran_that_failed_instantiation_is_the_memory_cap() {
         let err = wasmtime::Error::msg("memory minimum size of 64 pages exceeds memory limits");
-        let got = classify_trap(&err, Phase::Instantiate, &limits(), true);
+        let got = classify_error(&err, Phase::Instantiate, &limits(), true);
         assert_eq!(
             got,
-            ScriptRunError::Cap(ResourceCap::Memory { bytes: 4_096 })
+            ScriptRunError::Cap {
+                cap: ResourceCap::Memory { bytes: 4_096 },
+                error: "memory minimum size of 64 pages exceeds memory limits".into(),
+            }
         );
         assert_eq!(
             got.to_string(),
@@ -225,41 +239,35 @@ mod tests {
         );
     }
 
-    /// The memory cap is typed from the limiter, not from text: an
-    /// error whose text says "memory limit" — a trap backtrace prints
-    /// whatever names the guest's name section gives its functions —
-    /// is a plain failure when the limiter refused nothing, and a
-    /// trap is a plain failure even when it did (a `start` function
-    /// whose `memory.grow` was answered `-1` and then trapped for its
-    /// own reasons).
+    /// The memory cap is typed from the limiter and the fuel meter,
+    /// not from text: an error whose text says "memory limit" — a
+    /// trap backtrace prints whatever names the guest's name section
+    /// gives its functions — is a plain failure when nothing was
+    /// refused before the guest ran, whatever kind of error it is.
     #[test]
-    fn memory_text_and_traps_are_not_the_memory_cap() {
-        let named = wasmtime::Error::msg("wasm trap: unreachable\n  0: memory limit exceeded");
-        let got = classify_trap(&named, Phase::Instantiate, &limits(), false);
-        assert_eq!(
-            got,
-            ScriptRunError::Failed(
-                "script runtime instantiation failed: wasm trap: unreachable\n  0: memory limit exceeded"
-                    .into()
-            )
-        );
-
-        let got = classify_trap(&unreachable_trap(), Phase::Instantiate, &limits(), true);
-        assert!(
-            matches!(&got, ScriptRunError::Failed(text)
-                if text.starts_with("script runtime instantiation failed: wasm trap: wasm `unreachable`")),
-            "{got:?}"
-        );
+    fn memory_text_without_a_refusal_before_the_guest_ran_is_not_the_memory_cap() {
+        for err in [
+            wasmtime::Error::msg("wasm trap: unreachable\n  0: memory limit exceeded"),
+            wasmtime::Error::from(wasmtime::Trap::UnreachableCodeReached),
+            wasmtime::Error::msg("memory minimum size of 64 pages exceeds memory limits"),
+        ] {
+            let got = classify_error(&err, Phase::Instantiate, &limits(), false);
+            assert!(
+                matches!(&got, ScriptRunError::Failed(text)
+                    if text.starts_with("script runtime instantiation failed: ")),
+                "{got:?}"
+            );
+        }
     }
 
-    /// A refused allocation outside instantiation answers `-1` to the
-    /// guest and is not an error; a later failure in that run is its
-    /// own, whatever the limiter recorded.
+    /// A refusal outside instantiation answers `-1` to the guest and
+    /// is not an error; a later failure in that run is its own,
+    /// whatever the caller reports about the limiter.
     #[test]
-    fn a_refused_allocation_types_nothing_after_instantiation() {
+    fn a_refusal_types_nothing_after_instantiation() {
         for phase in [Phase::Alloc("source"), Phase::Alloc("args"), Phase::Execute] {
             let err = wasmtime::Error::msg("memory limit");
-            let got = classify_trap(&err, phase, &limits(), true);
+            let got = classify_error(&err, phase, &limits(), true);
             assert!(matches!(got, ScriptRunError::Failed(_)), "{phase}: {got:?}");
         }
     }
@@ -277,7 +285,7 @@ mod tests {
         };
         for phase in PHASES {
             assert_eq!(
-                classify_trap(&err, phase, &limits(), false),
+                classify_error(&err, phase, &limits(), false),
                 ScriptRunError::Failed(expect(phase).into()),
                 "{phase}"
             );

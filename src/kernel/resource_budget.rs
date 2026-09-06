@@ -66,13 +66,15 @@ impl ResourceBudget {
         }
     }
 
-    /// Whether this budget has refused a memory allocation. The
-    /// limiter's refusal is what types a failed instantiation as the
-    /// memory cap (a declared minimum past the cap), rather than the
-    /// text of wasmtime's error, which a guest can shape through its
-    /// name section. A refusal during execution answers `-1` to the
-    /// guest and is not an error, so the flag alone types nothing;
-    /// see `script_runtime_host::traps`.
+    /// Whether this budget has refused a memory allocation for
+    /// exceeding the cap. The limiter's refusal is what types a failed
+    /// instantiation as the memory cap (a declared minimum past the
+    /// cap), rather than the text of wasmtime's error, which a guest
+    /// can shape through its name section. A refusal during execution
+    /// answers `-1` to the guest and is not an error, so the flag
+    /// alone types nothing; see `script_runtime_host::traps`. A
+    /// refusal for accounting drift is the host's own fault, not the
+    /// plugin's cap, and is not recorded here.
     pub(crate) fn memory_denied(&self) -> bool {
         self.memory_denied
     }
@@ -87,7 +89,14 @@ impl ResourceBudget {
             // `current` exceeding what we have committed means our
             // accounting drifted from wasmtime's. Deny rather than
             // guess: a wrong allow here is unbounded host allocation.
-            self.memory_denied = true;
+            // A host bug, not the plugin's cap: say so, and leave
+            // `memory_denied` alone so it is not reported as one.
+            tracing::error!(
+                current,
+                desired,
+                committed = self.committed_memory_bytes,
+                "wasm memory accounting drifted from wasmtime's; refusing the grow"
+            );
             return false;
         };
         if new_total > self.max_memory_bytes {
@@ -205,6 +214,18 @@ mod tests {
         assert!(!b.memory_denied(), "an allowed allocation is not a refusal");
         assert!(!b.memory_growing(4096, 4097));
         assert!(b.memory_denied());
+    }
+
+    /// A refusal for accounting drift is refused, but is the host's
+    /// fault and not recorded as the cap.
+    #[test]
+    fn a_refusal_for_accounting_drift_is_not_recorded_as_the_cap() {
+        let mut b = budget(4096, 64);
+        assert!(
+            !b.memory_growing(1, 2),
+            "nothing committed, so `current` of 1 is drift"
+        );
+        assert!(!b.memory_denied());
     }
 
     #[test]

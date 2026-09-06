@@ -362,8 +362,8 @@ pub(crate) enum ResourceViolation {
     /// A `script` interpreter sub-instance consumed its
     /// [`RuntimeLimits::fuel_budget`](super::RuntimeLimits::fuel_budget):
     /// in `execute`, in `alloc`, or in its `start` function at
-    /// instantiation.
-    /// `detail` names the step and what the trap said. (A `wasm` step
+    /// instantiation. `detail` names the step, the budget, and the
+    /// phase. (A `wasm` step
     /// runs under the same budget but reports its trap as the step's
     /// own failure, naming the cap in the message.)
     FuelExhausted { budget: u64, detail: String },
@@ -374,8 +374,9 @@ pub(crate) enum ResourceViolation {
     /// the limiter answers a `memory.grow` past the cap with `-1` and
     /// no trap, for a `script` step and a `wasm` step alike, so the
     /// step may still succeed. (A `wasm` step's instantiation failure
-    /// is its own plain failure naming the module.)
-    MemoryLimit { bytes: usize },
+    /// is its own plain failure naming the module.) `detail` names the
+    /// step and the cap.
+    MemoryLimit { bytes: usize, detail: String },
     /// Cumulative step-result bytes exceeded
     /// [`RuntimeLimits::max_step_results_bytes`](super::RuntimeLimits::max_step_results_bytes),
     /// recorded when a step's result is refused rather than stored.
@@ -414,9 +415,10 @@ impl From<ResourceViolation> for super::KernelError {
             ResourceViolation::FuelExhausted { budget, detail } => {
                 Self::FuelExhausted { budget, detail }
             }
-            ResourceViolation::MemoryLimit { bytes } => {
-                Self::MemoryLimitExceeded { limit_bytes: bytes }
-            }
+            ResourceViolation::MemoryLimit { bytes, detail } => Self::MemoryLimitExceeded {
+                limit_bytes: bytes,
+                detail,
+            },
             ResourceViolation::StepResultsLimit {
                 limit_bytes,
                 attempted_bytes,
