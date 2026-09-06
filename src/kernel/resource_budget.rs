@@ -47,6 +47,9 @@ pub(crate) struct ResourceBudget {
     committed_memory_bytes: usize,
     /// Sum of every table's current element count in this store.
     committed_table_elements: usize,
+    /// Whether a memory allocation has been refused. See
+    /// [`Self::memory_denied`].
+    memory_denied: bool,
 }
 
 impl ResourceBudget {
@@ -59,7 +62,19 @@ impl ResourceBudget {
             max_memories: limits.max_memories,
             committed_memory_bytes: 0,
             committed_table_elements: 0,
+            memory_denied: false,
         }
+    }
+
+    /// Whether this budget has refused a memory allocation. The
+    /// limiter's refusal is what types a failed instantiation as the
+    /// memory cap (a declared minimum past the cap), rather than the
+    /// text of wasmtime's error, which a guest can shape through its
+    /// name section. A refusal during execution answers `-1` to the
+    /// guest and is not an error, so the flag alone types nothing;
+    /// see `script_runtime_host::traps`.
+    pub(crate) fn memory_denied(&self) -> bool {
+        self.memory_denied
     }
 
     /// `ResourceLimiter::memory_growing`, as a store-wide check.
@@ -72,9 +87,11 @@ impl ResourceBudget {
             // `current` exceeding what we have committed means our
             // accounting drifted from wasmtime's. Deny rather than
             // guess: a wrong allow here is unbounded host allocation.
+            self.memory_denied = true;
             return false;
         };
         if new_total > self.max_memory_bytes {
+            self.memory_denied = true;
             return false;
         }
         self.committed_memory_bytes = new_total;
@@ -178,6 +195,16 @@ mod tests {
             !b.memory_growing(0, 1),
             "a second memory has no budget left, even for one byte"
         );
+    }
+
+    /// A refusal is remembered, and nothing before it counts as one.
+    #[test]
+    fn a_refused_memory_allocation_is_recorded() {
+        let mut b = budget(4096, 64);
+        assert!(b.memory_growing(0, 4096));
+        assert!(!b.memory_denied(), "an allowed allocation is not a refusal");
+        assert!(!b.memory_growing(4096, 4097));
+        assert!(b.memory_denied());
     }
 
     #[test]

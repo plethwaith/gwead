@@ -360,8 +360,9 @@ impl StepTypeAccess {
 #[derive(Debug, Clone)]
 pub(crate) enum ResourceViolation {
     /// A `script` interpreter sub-instance consumed its
-    /// [`RuntimeLimits::fuel_budget`](super::RuntimeLimits::fuel_budget),
-    /// in `execute` or in its `start` function at instantiation.
+    /// [`RuntimeLimits::fuel_budget`](super::RuntimeLimits::fuel_budget):
+    /// in `execute`, in `alloc`, or in its `start` function at
+    /// instantiation.
     /// `detail` names the step and what the trap said. (A `wasm` step
     /// runs under the same budget but reports its trap as the step's
     /// own failure, naming the cap in the message.)
@@ -2413,17 +2414,20 @@ fn step_wasm<'a>(
             .fuel_async_yield_interval(Some(super::script_runtime_host::FUEL_ASYNC_YIELD_INTERVAL));
         let linker = wasmtime::Linker::<WasmStoreLimits>::new(&engine);
 
-        // Name the resource cap when one tripped — the bare trap
-        // display is just a wasm backtrace with no indication that
-        // the failure was the fuel meter rather than module logic.
-        // Keep `{e}` — the trap display carries the wasm backtrace,
-        // i.e. WHERE execution was when the meter ran dry, which a
-        // module author debugging a near-miss budget wants. Memory-cap
-        // denials don't need the same treatment: `memory.grow`
-        // returns -1 to the module rather than trapping, so whatever
-        // trap follows is the module's own. Fuel can run out at
-        // instantiation too, in the module's `start` function, so
-        // both calls are classified.
+        // Name the fuel cap when it tripped — the bare trap display
+        // is just a wasm backtrace with no indication that the
+        // failure was the fuel meter rather than module logic. Keep
+        // `{e}` — the trap display carries the wasm backtrace, i.e.
+        // WHERE execution was when the meter ran dry, which a module
+        // author debugging a near-miss budget wants. Fuel can run out
+        // at instantiation too, in the module's `start` function, so
+        // both calls are classified. The memory cap is not named:
+        // during the entry a `memory.grow` past the cap answers -1 to
+        // the module rather than trapping, so whatever trap follows
+        // is the module's own; at instantiation a declared minimum
+        // past the cap fails instantiation, and that is the `wasm`
+        // step's own plain failure naming the module (see
+        // `ResourceViolation::MemoryLimit`).
         let failed = |e: wasmtime::Error, when: &str, plain: &str| {
             if super::script_runtime_host::is_out_of_fuel(&e) {
                 StepError::Failed(format!(

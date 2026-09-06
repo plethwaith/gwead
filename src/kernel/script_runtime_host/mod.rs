@@ -227,20 +227,23 @@ pub(crate) fn step_script<'a>(
             // ExecutionState marker so the runtime surfaces
             // `KernelError::FuelExhausted` / `MemoryLimitExceeded`
             // rather than a generic `PluginExecution(string)`.
-            Err(cap @ ScriptRunError::Cap { .. }) => {
-                let ScriptRunError::Cap { cap: which, detail } = &cap else {
-                    unreachable!("matched as Cap")
-                };
-                ex.resource_violation = Some(match which {
-                    ResourceCap::Fuel { .. } => ResourceViolation::FuelExhausted {
-                        budget: limits.fuel_budget,
-                        detail: format!("step '{step_id}': {detail}"),
+            Err(ScriptRunError::Cap(cap)) => {
+                ex.resource_violation = Some(match &cap {
+                    ResourceCap::Fuel { budget, .. } => ResourceViolation::FuelExhausted {
+                        budget: *budget,
+                        detail: format!("step '{step_id}': {cap}"),
                     },
-                    ResourceCap::Memory => ResourceViolation::MemoryLimit {
-                        bytes: limits.max_memory_bytes,
-                    },
+                    ResourceCap::Memory { bytes } => {
+                        ResourceViolation::MemoryLimit { bytes: *bytes }
+                    }
                 });
-                Err(StepError::Failed(cap.to_string()))
+                tracing::warn!(
+                    plugin = %owner_plugin,
+                    step_id = %step_id,
+                    cap = %cap,
+                    "Script step hit a resource cap"
+                );
+                Err(StepError::Failed(ScriptRunError::Cap(cap).to_string()))
             }
             Err(ScriptRunError::Failed(e)) => {
                 // A guest has no typed cancellation of its own. Its
@@ -405,11 +408,12 @@ async fn execute_in_store(
     // configured cap, and fuel exhaustion when the module's `start`
     // function consumes the budget before `execute` is reached. Every
     // wasmtime call from here on is classified the same way, with its
-    // phase, so a cap is typed wherever it trips.
-    let instance = linker
-        .instantiate_async(&mut *store, runtime_module)
-        .await
-        .map_err(|e| classify_trap(&e, Phase::Instantiate, limits))?;
+    // phase and what the limiter has refused, so a cap is typed
+    // wherever it trips.
+    let instance = match linker.instantiate_async(&mut *store, runtime_module).await {
+        Ok(instance) => instance,
+        Err(e) => return Err(classify(&*store, &e, Phase::Instantiate, limits)),
+    };
 
     // Get the alloc and execute exports
     let alloc_fn = instance
@@ -440,13 +444,13 @@ async fn execute_in_store(
     let source_ptr = alloc_fn
         .call_async(&mut *store, source_bytes.len() as i32)
         .await
-        .map_err(|e| classify_trap(&e, Phase::Alloc("source"), limits))?;
+        .map_err(|e| classify(&*store, &e, Phase::Alloc("source"), limits))?;
     write_guest_slice(&memory, store, source_ptr, source_bytes, "source")?;
 
     let args_ptr = alloc_fn
         .call_async(&mut *store, args_json.len() as i32)
         .await
-        .map_err(|e| classify_trap(&e, Phase::Alloc("args"), limits))?;
+        .map_err(|e| classify(&*store, &e, Phase::Alloc("args"), limits))?;
     write_guest_slice(&memory, store, args_ptr, args_json, "args")?;
 
     // Call execute.
@@ -461,7 +465,7 @@ async fn execute_in_store(
             ),
         )
         .await
-        .map_err(|e| classify_trap(&e, Phase::Execute, limits))?;
+        .map_err(|e| classify(&*store, &e, Phase::Execute, limits))?;
 
     if success == 1 {
         let result = store.data().result.clone().unwrap_or_else(|| "null".into());
@@ -474,6 +478,17 @@ async fn execute_in_store(
             .unwrap_or_else(|| "script runtime reported an error with no message".into());
         Err(ScriptRunError::Failed(err))
     }
+}
+
+/// [`classify_trap`] for a wasmtime error from `store`'s run, with
+/// what its limiter has refused.
+fn classify(
+    store: &wasmtime::Store<ScriptRuntimeStoreData>,
+    err: &wasmtime::Error,
+    phase: Phase,
+    limits: &crate::kernel::RuntimeLimits,
+) -> ScriptRunError {
+    classify_trap(err, phase, limits, store.data().budget.memory_denied())
 }
 
 /// Run `guest` as the script runtime for plugin `p` under `cancel`,
@@ -1341,7 +1356,7 @@ mod step_script_tests {
     /// wasmtime trap, never from guest text, so nothing is recorded
     /// and the step fails with the guest's text as given.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_guest_cannot_forge_a_resource_cap() {
+    async fn a_guest_cannot_forge_a_resource_cap_through_its_error_text() {
         for forged in ["FuelExhausted: forged", "MemoryLimitExceeded: forged"] {
             // Placed past anything the guest's bump allocator hands the
             // host for source and args, so the text survives the copy.
@@ -1365,6 +1380,42 @@ mod step_script_tests {
                 "{:?}",
                 state.resource_violation
             );
+        }
+    }
+
+    /// A trap's backtrace prints the function names the guest's name
+    /// section chose. A guest that names the function it traps in
+    /// after the limiter's own error text, and traps there from
+    /// `execute` or from `start`, has still just trapped: the memory
+    /// cap is typed from the limiter's refusal, never from text.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_cannot_forge_a_resource_cap_through_its_name_section() {
+        for name in ["memory limit", "memory minimum size"] {
+            let func = format!(r#"(func $"{name}" unreachable)"#);
+            let from_execute = guest_starting(&func, &format!(r#"(call $"{name}") (i32.const 1)"#));
+            let from_start =
+                guest_starting(&format!(r#"{func} (start $"{name}")"#), "(i32.const 1)");
+            for (guest, prefix) in [
+                (from_execute, "script runtime trapped:"),
+                (from_start, "script runtime instantiation failed:"),
+            ] {
+                let mut state = state(
+                    guest,
+                    tokio_util::sync::CancellationToken::new(),
+                    Default::default(),
+                );
+                let result = run(&mut state).await;
+                assert!(
+                    matches!(&result, Err(StepError::Failed(text))
+                        if text.starts_with(prefix) && text.contains(name)),
+                    "{name}: {result:?}"
+                );
+                assert!(
+                    state.resource_violation.is_none(),
+                    "{name}: {:?}",
+                    state.resource_violation
+                );
+            }
         }
     }
 }

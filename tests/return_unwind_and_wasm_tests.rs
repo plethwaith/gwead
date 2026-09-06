@@ -229,10 +229,10 @@ async fn wasm_infinite_loop_trips_fuel_budget() {
     );
 
     let err = run(&kernel, "p").await.expect_err("must trip fuel budget");
-    let msg = err.to_string().to_lowercase();
+    let msg = err.to_string();
     assert!(
-        msg.contains("fuel"),
-        "error should mention fuel exhaustion: {msg}"
+        msg.contains("exhausted its fuel budget (100000 units) during 'run'"),
+        "error should name the fuel cap and the phase: {msg}"
     );
 }
 
