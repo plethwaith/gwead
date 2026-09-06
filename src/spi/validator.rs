@@ -1,6 +1,6 @@
 //! SPI validator — validates plugin manifests against SPI definitions.
 //!
-//! What's strict and what's soft, precisely:
+//! What's strict, what's soft, and what's merely reported, precisely:
 //!
 //! - **Strict (rejects the plugin at load):** a claimed role whose SPI
 //!   definition IS registered but whose required actions the plugin
@@ -11,19 +11,21 @@
 //!   intentional — but it also means load order decides whether a
 //!   contract is ever checked. Embedders that want contracts enforced
 //!   must register SPI defs before dependent plugins.
-//! - **Informational (reported, not a finding):** actions the plugin
-//!   provides that no resolved role names
-//!   ([`ValidationResult::extra_actions`]). A role contract is a floor,
-//!   not a ceiling, so these are neither errors nor warnings; they are
-//!   returned for tooling that wants them and the kernel notes them at
-//!   DEBUG.
+//! - **Reported (neither error nor warning):** actions the plugin
+//!   provides beyond its resolved roles. See
+//!   [`ValidationResult::extra_actions`] for what counts and why it is
+//!   not a finding.
 
 use super::definition::SpiDefinition;
 use super::loader::SpiRegistry;
 use crate::kernel::types::PluginManifest;
 
 /// Validation result for a single plugin.
+///
+/// `#[non_exhaustive]`: only [`validate_manifest`] constructs one, so
+/// a field can be added without a semver-major bump.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ValidationResult {
     pub plugin_name: String,
     pub errors: Vec<ValidationError>,
@@ -32,17 +34,20 @@ pub struct ValidationResult {
     /// names, required or optional, in manifest order.
     ///
     /// Not a finding: a role contract says what a plugin must provide,
-    /// and a provider whose role action dispatches to private helper
-    /// actions is the normal shape, not a mistake. Nothing here needs
+    /// and a provider whose role action dispatches to helper actions of
+    /// its own is the normal shape, not a mistake. Nothing here needs
     /// changing, so the kernel logs the list at DEBUG rather than WARN.
     ///
-    /// Computed against the union of every role that resolved, so a
+    /// Computed against the union of every role that resolved — the
+    /// plugin's own roles, not every SPI the registry knows — so a
     /// plugin claiming two roles and providing exactly their actions
-    /// has nothing here. A role with no SPI definition contributes no
-    /// contract: its actions land here alongside the
-    /// [`UnknownRole`](ValidationWarning::UnknownRole) warning. Empty
-    /// when no role resolved, since there is then nothing to compare
-    /// against.
+    /// has nothing here, while a plugin providing another role's action
+    /// without claiming that role does. A role with no SPI definition
+    /// contributes no contract: when some other role resolved, its
+    /// actions land here alongside the
+    /// [`UnknownRole`](ValidationWarning::UnknownRole) warning. When no
+    /// role resolved at all there is nothing to compare against, and
+    /// the list is empty.
     ///
     /// One case this cannot tell apart: a misspelled *optional* action.
     /// An optional action may be omitted, so a typo is not a
@@ -215,7 +220,7 @@ mod tests {
         }
     }
 
-    /// Build an SpiRegistry with the three SPI defs these tests exercise.
+    /// Build an SpiRegistry with the SPI defs most of these tests share.
     /// Inline JSONs because the gwead crate ships no SPI def
     /// resources; the validator's job is to apply the action
     /// contracts a registry hands it, not to know where they came from.
@@ -312,6 +317,24 @@ mod tests {
         assert!(
             matches!(&result.warnings[0], ValidationWarning::UnknownRole { role } if role == "CUSTOM_THING")
         );
+        assert!(
+            result.extra_actions.is_empty(),
+            "no role resolved, so there is no contract to be beyond: {:?}",
+            result.extra_actions
+        );
+    }
+
+    /// The contract is the plugin's *resolved roles*, not every SPI in
+    /// the registry: providing another role's action without claiming
+    /// that role is an extra like any other.
+    #[test]
+    fn an_unclaimed_roles_action_is_an_extra() {
+        let registry = test_registry();
+        let m = manifest("chat_that_embeds", &["LLM_CHAT"], &["chat", "embed"]);
+        let result = validate_manifest(&m, "", &registry);
+        assert!(result.is_valid(), "Errors: {:?}", result.errors);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.extra_actions, ["embed"]);
     }
 
     /// An action beyond the role contract is reported, in manifest

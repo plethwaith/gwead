@@ -2242,9 +2242,18 @@ impl Kernel {
 
         // Validate against SPI definitions: a registered contract is
         // enforced, an unknown role only warns, and actions beyond the
-        // contract are not a finding at all (see
-        // `ValidationResult::extra_actions`), so they are noted at DEBUG.
+        // contract are noted at DEBUG (`ValidationResult::extra_actions`
+        // says why). A rejected plugin gets only its error: the warnings
+        // and extras describe a plugin that never loads.
         let validation = validator::validate_manifest(&manifest, namespace, &self.spi_registry);
+        if !validation.is_valid() {
+            let errors: Vec<String> = validation.errors.iter().map(|e| e.to_string()).collect();
+            return Err(KernelError::Validation(format!(
+                "Plugin '{}' failed SPI validation: {}",
+                plugin_name,
+                errors.join("; ")
+            )));
+        }
         for warning in &validation.warnings {
             tracing::warn!(plugin = %plugin_name, "{warning}");
         }
@@ -2254,14 +2263,6 @@ impl Kernel {
                 extra_actions = ?validation.extra_actions,
                 "Plugin provides actions beyond its SPI roles"
             );
-        }
-        if !validation.is_valid() {
-            let errors: Vec<String> = validation.errors.iter().map(|e| e.to_string()).collect();
-            return Err(KernelError::Validation(format!(
-                "Plugin '{}' failed SPI validation: {}",
-                plugin_name,
-                errors.join("; ")
-            )));
         }
 
         // Validate the manifest's permission set. Default-deny

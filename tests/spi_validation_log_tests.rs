@@ -2,12 +2,17 @@
 //! to say at plugin registration.
 //!
 //! The validator's return value is covered by its own unit tests; these
-//! pin the *level* each finding reaches the log at, because that is
+//! pin the *level* each part of it reaches the log at, because that is
 //! what an operator sees. A plugin that provides actions beyond what
 //! its roles name is doing exactly what the SPI intends, so it is noted
 //! at DEBUG. A plugin claiming a role no SPI has been registered for
 //! may be a misconfiguration, so it stays at WARN — and it doubles as
 //! the positive control proving the recorder below sees WARN events.
+//! A plugin the validator rejects gets its error and nothing else.
+//!
+//! The SPI fixture is inlined, as `kernel_tests.rs` and
+//! `intrinsics_tests.rs` inline theirs: gwead ships no SPI definitions,
+//! and each test crate states the contract it validates against.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -19,8 +24,6 @@ use serde_json::json;
 use tracing::Level;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
-
-mod common;
 
 // ---------------------------------------------------------------------------
 // Event recording
@@ -118,6 +121,13 @@ fn manifest(name: &str, roles: &[&str], action_names: &[&str]) -> PluginManifest
     m
 }
 
+fn extras_events(events: &[Recorded]) -> Vec<&Recorded> {
+    events
+        .iter()
+        .filter(|e| e.field("extra_actions").is_some())
+        .collect()
+}
+
 /// Events that mention `needle` anywhere: in the message or a field.
 /// Deliberately broad — the kernel's own "Plugin registered" event lists
 /// the plugin's actions too, and a level check has to cover it.
@@ -150,10 +160,7 @@ fn extra_actions_are_logged_once_at_debug_and_never_warned_about() {
             .expect("extra actions do not fail registration");
     });
 
-    let noted: Vec<&Recorded> = events
-        .iter()
-        .filter(|e| e.field("extra_actions").is_some())
-        .collect();
+    let noted = extras_events(&events);
     assert_eq!(
         noted.len(),
         1,
@@ -207,4 +214,38 @@ fn unknown_role_is_still_logged_at_warn() {
         warned[0]
     );
     assert_eq!(warned[0].field("plugin"), Some("custom_plugin"));
+    assert!(
+        extras_events(&events).is_empty(),
+        "no role resolved, so nothing is beyond a contract; got {events:#?}"
+    );
+}
+
+/// A plugin the validator rejects never loads, so its warnings and
+/// extras describe nothing: the caller gets the error, the log gets no
+/// WARN for the unknown role and no DEBUG for the extra.
+#[test]
+fn a_rejected_plugin_logs_neither_warnings_nor_extras() {
+    let mut kernel = boot();
+    let events = record_events(|| {
+        let err = kernel
+            .register_plugin(manifest(
+                "incomplete",
+                &[ROLE, "CUSTOM_THING"],
+                &["search", "helper"],
+            ))
+            .expect_err("a missing required action rejects the plugin");
+        assert!(
+            err.to_string().contains("requires action 'fetch'"),
+            "the caller is told what was missing: {err}"
+        );
+    });
+
+    assert!(
+        mentioning(&events, "Unknown SPI role").is_empty(),
+        "no warning for a plugin that never loaded; got {events:#?}"
+    );
+    assert!(
+        extras_events(&events).is_empty(),
+        "no extras for a plugin that never loaded; got {events:#?}"
+    );
 }

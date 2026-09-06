@@ -25,9 +25,8 @@
 //! contract violation downgrades from a rejection to a log line. See
 //! [`validator`] for the implementation.
 //!
-//! A plugin that provides *more* actions than its roles name is not a
-//! case at all: a contract is a floor, not a ceiling. The extras are
-//! reported on the validation result and logged at DEBUG.
+//! Actions beyond a plugin's roles are neither case; see
+//! [`validator::ValidationResult::extra_actions`].
 //!
 //! ## No wire types here
 //!
