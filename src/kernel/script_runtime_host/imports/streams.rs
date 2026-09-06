@@ -8,7 +8,11 @@
 //!   output handle if the step is `long_running` in a dataflow action;
 //!   `STREAM_INVALID_HANDLE` otherwise.
 //! - `is_cancelled() -> i32` — 1 if the parent step's cancellation
-//!   token has fired; 0 otherwise.
+//!   token has fired; 0 otherwise. The same token releases a
+//!   `stream_write` parked on a full channel (`STREAM_CANCELLED`).
+//!   An answer of 1 records on the store that the guest was told
+//!   (`told_of_cancel`), which is what lets `step_script` read a
+//!   later guest error as the cancellation.
 //!
 //! Read + write are `func_wrap_async` so `.await` happens directly on
 //! the underlying channel — no `block_in_place`, no `block_on`, no
@@ -61,7 +65,6 @@ pub(super) fn register(
             |mut caller: wasmtime::Caller<'_, ScriptRuntimeStoreData>,
              (handle, buf_ptr, buf_len): (i32, i32, i32)| {
                 let id = std::num::NonZeroU32::new(handle as u32);
-                let streams_arc = caller.data().streams.clone();
                 let mem = caller.get_export("memory").and_then(|e| e.into_memory());
                 Box::new(async move {
                     let Some(id) = id else {
@@ -82,7 +85,25 @@ pub(super) fn register(
                         };
                         mem_data[start..end].to_vec()
                     };
-                    crate::kernel::streams::write_async_shared(&streams_arc, id, &buf).await
+                    // Registry and token are borrowed from the store
+                    // rather than cloned per chunk: the snapshot above
+                    // released the memory borrow, so nothing else holds
+                    // `caller` across the await. The step's token
+                    // releases a send parked on a full channel
+                    // (`STREAM_CANCELLED`); a guest parked inside this
+                    // import cannot poll `is_cancelled` itself.
+                    let data = caller.data();
+                    let n = crate::kernel::streams::write_async_shared(
+                        &data.streams,
+                        id,
+                        &buf,
+                        &data.cancel,
+                    )
+                    .await;
+                    if n == crate::kernel::streams::STREAM_CANCELLED {
+                        caller.data_mut().told_of_cancel = true;
+                    }
+                    n
                 })
             },
         )
@@ -137,8 +158,9 @@ pub(super) fn register(
         .func_wrap(
             crate::kernel::abi::ABI_MODULE,
             "is_cancelled",
-            |caller: wasmtime::Caller<'_, ScriptRuntimeStoreData>| -> i32 {
+            |mut caller: wasmtime::Caller<'_, ScriptRuntimeStoreData>| -> i32 {
                 if caller.data().cancel.is_cancelled() {
+                    caller.data_mut().told_of_cancel = true;
                     1
                 } else {
                     0
