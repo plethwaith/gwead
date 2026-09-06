@@ -10,9 +10,10 @@
 //! the positive control proving the recorder below sees WARN events.
 //! A plugin the validator rejects gets its error and nothing else.
 //!
-//! The SPI fixture is inlined, as `kernel_tests.rs` and
-//! `intrinsics_tests.rs` inline theirs: gwead ships no SPI definitions,
-//! and each test crate states the contract it validates against.
+//! The SPI fixture is inlined, as `kernel_tests.rs` (this same role)
+//! and `intrinsics_tests.rs` (a role of its own) inline theirs: gwead
+//! ships no SPI definitions, and each test crate states the contract it
+//! validates against.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};

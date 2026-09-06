@@ -2242,9 +2242,9 @@ impl Kernel {
 
         // Validate against SPI definitions: a registered contract is
         // enforced, an unknown role only warns, and actions beyond the
-        // contract are noted at DEBUG (`ValidationResult::extra_actions`
-        // says why). A rejected plugin gets only its error: the warnings
-        // and extras describe a plugin that never loads.
+        // contract are not a finding (`ValidationResult::extra_actions`).
+        // A rejected plugin gets only its error: the warnings and extras
+        // describe a plugin that never loads.
         let validation = validator::validate_manifest(&manifest, namespace, &self.spi_registry);
         if !validation.is_valid() {
             let errors: Vec<String> = validation.errors.iter().map(|e| e.to_string()).collect();

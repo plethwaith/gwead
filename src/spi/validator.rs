@@ -73,9 +73,10 @@ pub enum ValidationError {
 }
 
 /// A validation warning — the plugin can be loaded but something may
-/// need the author's attention. Every variant is logged at WARN;
-/// anything that is merely descriptive belongs on [`ValidationResult`]
-/// as its own field (see [`ValidationResult::extra_actions`]), not here.
+/// need the author's attention. Every variant is logged at WARN for a
+/// plugin that loads; a rejected plugin gets only its error. Anything
+/// that is merely descriptive belongs on [`ValidationResult`] as its
+/// own field (see [`ValidationResult::extra_actions`]), not here.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ValidationWarning {
