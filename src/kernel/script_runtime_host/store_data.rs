@@ -6,7 +6,7 @@
 //! - Result / error slots the wasm side writes via `host_set_result` /
 //!   `host_set_error`
 //! - A shared stream registry handle (for `stream_read` / `stream_write` /
-//!   `stream_close`)
+//!   `stream_close` / `stream_last_error`)
 //! - The dataflow output id (for `io.stream.output` if the step is
 //!   `long_running` in a dataflow action — `None` otherwise)
 //! - A cancellation token (for `is_cancelled`)
@@ -130,20 +130,12 @@ pub(super) fn bail_host_call(
 /// Render a JSON value as a short preview for `tracing` events. Used by
 /// the io.* host-call debug logs to keep MB-scale results
 /// out of the log file when an operator enables
-/// `gwead::script_runtime=debug`. Truncates the JSON representation to
-/// ~200 chars with an ellipsis suffix.
+/// `gwead::script_runtime=debug`. Cuts the JSON representation to
+/// [`crate::kernel::streams::LOG_PREVIEW_BYTES`], the
+/// `… (N bytes total)` marker included.
 pub(super) fn truncate_for_log(value: &Value) -> String {
-    const MAX: usize = 200;
-    let s = value.to_string();
-    if s.len() <= MAX {
-        s
-    } else {
-        let cut = s
-            .char_indices()
-            .take_while(|(i, _)| *i < MAX)
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-        format!("{}… ({} bytes total)", &s[..cut], s.len())
-    }
+    crate::kernel::streams::truncate_text(
+        &value.to_string(),
+        crate::kernel::streams::LOG_PREVIEW_BYTES,
+    )
 }

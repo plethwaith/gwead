@@ -2198,9 +2198,10 @@ mod vars_sequential_guard_tests {
 /// Map a `JoinError` from a parallel branch/wave task into a
 /// `KernelError`, distinguishing a task panic from cancellation —
 /// `JoinError::Cancelled` isn't a panic and saying "panicked" for it
-/// would point debugging at the wrong place. Used by both
-/// `run_parallel` and `execute_dag`'s parallel-wave loop.
-fn join_error(what: &str, join_err: &tokio::task::JoinError) -> KernelError {
+/// would point debugging at the wrong place. Used by
+/// `run_parallel`, `execute_dag`'s parallel-wave loop, and the
+/// supervisor of a spawned `io.invoke_streaming` callee.
+pub(super) fn join_error(what: &str, join_err: &tokio::task::JoinError) -> KernelError {
     if join_err.is_panic() {
         KernelError::Execution(format!("{what} panicked: {join_err}"))
     } else {
