@@ -50,8 +50,8 @@ fn boot_kernel() -> Kernel {
     // METADATA_PROVIDER need the role registered so registration
     // validates. Defined inline — gwead's tests must not reach into an
     // embedder's manifest files; the engine
-    // depends on nothing outside itself. Same minimal shape as
-    // intrinsics_tests.rs.
+    // depends on nothing outside itself. intrinsics_tests.rs and
+    // spi_validation_log_tests.rs inline their roles the same way.
     kernel
         .register_spi_from_json(
             "METADATA_PROVIDER",

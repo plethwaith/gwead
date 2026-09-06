@@ -25,6 +25,9 @@
 //! contract violation downgrades from a rejection to a log line. See
 //! [`validator`] for the implementation.
 //!
+//! Actions beyond a plugin's roles are neither case; see
+//! [`validator::ValidationResult::extra_actions`].
+//!
 //! ## No wire types here
 //!
 //! This module deliberately ships no request/response structs for any
