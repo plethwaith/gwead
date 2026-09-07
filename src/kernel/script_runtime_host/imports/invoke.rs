@@ -26,7 +26,7 @@ use crate::kernel::host_api::INVOKE_MAX_DEPTH;
 /// Whether a failed `host_invoke` told the guest of its own cancel:
 /// the step's token has fired, and the callee — which runs under a
 /// child of it — stopped in the shape a cancellation takes, the way a
-/// `STREAM_CANCELLED` write tells it (see `told_of_cancel`). Both
+/// `STREAM_CANCELLED` read or write tells it (see `told_of_cancel`). Both
 /// halves matter. A callee's own deadline under a quiet token is the
 /// callee's failure, however cancellation-shaped; under a fired token
 /// it is counted, the deadline being the same event seen one level
@@ -640,10 +640,13 @@ pub(super) fn register(
                             // validation, or a secret pull, none of them
                             // cancellation-shaped. A spawned callee that
                             // is later stopped by this step's token
-                            // reaches the guest through `stream_read`,
-                            // as EOF or as the error item a callee's own
-                            // watchdog records at the end of an
-                            // inherited budget; neither is a telling.
+                            // reaches the guest through `stream_read`: a
+                            // read parked when the token fires is
+                            // released as `STREAM_CANCELLED` and is a
+                            // telling there; a stream that had already
+                            // ended — a plain EOF, or the error item a
+                            // callee's own watchdog records at the end
+                            // of an inherited budget — is not.
                             bail_host_call(
                                 &mut caller,
                                 format!(

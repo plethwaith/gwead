@@ -14,7 +14,9 @@
 //!   `STREAM_INVALID_HANDLE` otherwise.
 //! - `is_cancelled() -> i32` — 1 if the parent step's cancellation
 //!   token has fired; 0 otherwise. The same token releases a
-//!   `stream_write` parked on a full channel (`STREAM_CANCELLED`).
+//!   `stream_write` parked on a full channel or a `stream_read`
+//!   parked on a source that has not yielded (both
+//!   `STREAM_CANCELLED`), and both releases record the telling.
 //!   An answer of 1 records on the store that the guest was told
 //!   (`told_of_cancel`), which is what lets `step_script` read a
 //!   later guest error as the cancellation.
@@ -38,6 +40,13 @@ pub(super) fn register(
              (handle, buf_ptr, buf_len): (i32, i32, i32)| {
                 let id = std::num::NonZeroU32::new(handle as u32);
                 let streams_arc = caller.data().streams.clone();
+                // Cloned, not borrowed like `stream_write`'s: the
+                // memory borrow below spans the await, so nothing can
+                // hold `caller.data()` at the same time. `stream_write`
+                // snapshots its bytes before the await instead, so
+                // nothing else holds `caller` across it; the read
+                // cannot do that, its buffer *is* guest memory.
+                let cancel = caller.data().cancel.clone();
                 // Snapshot the memory slice's offset + length, then
                 // resolve it inside the future just before the put-back
                 // — wasm linear memory can be re-borrowed across the
@@ -50,14 +59,24 @@ pub(super) fn register(
                     let Some(mem) = mem else {
                         return crate::kernel::streams::STREAM_IO_ERROR;
                     };
-                    let mem_data = mem.data_mut(&mut caller);
-                    let start = buf_ptr as usize;
-                    let end = match start.checked_add(buf_len as usize) {
-                        Some(e) if e <= mem_data.len() => e,
-                        _ => return crate::kernel::streams::STREAM_OOB,
+                    let n = {
+                        let mem_data = mem.data_mut(&mut caller);
+                        let start = buf_ptr as usize;
+                        let end = match start.checked_add(buf_len as usize) {
+                            Some(e) if e <= mem_data.len() => e,
+                            _ => return crate::kernel::streams::STREAM_OOB,
+                        };
+                        let buf = &mut mem_data[start..end];
+                        crate::kernel::streams::read_async_shared(&streams_arc, id, buf, &cancel)
+                            .await
                     };
-                    let buf = &mut mem_data[start..end];
-                    crate::kernel::streams::read_async_shared(&streams_arc, id, buf).await
+                    // The step's token released a read parked on a
+                    // quiet source: the guest is told of its cancel,
+                    // as a released write tells it.
+                    if n == crate::kernel::streams::STREAM_CANCELLED {
+                        caller.data_mut().told_of_cancel = true;
+                    }
+                    n
                 })
             },
         )
