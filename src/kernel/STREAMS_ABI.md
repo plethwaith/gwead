@@ -314,12 +314,12 @@ its `nil`: `nil` is `STREAM_EOF` (the source is exhausted), `false` is
 `STREAM_CANCELLED` (the wait was released, the source is untouched) —
 a script that treats them alike would stop identically either way, but
 a relay forwarding the distinction upstream needs to tell them apart.
-A guest has no typed cancellation
-of its own; a script error raised after the step's token has fired is
-reported by the host as the cancellation rather than as a failure —
-provided a host import told the guest about the cancel first (a read
-or write returning `STREAM_CANCELLED`, `is_cancelled` answering 1, or
-a plain invoke whose callee was stopped by the step's token). A
+A guest has no typed cancellation of its own; a script error raised
+after the step's token has fired is reported by the host as the
+cancellation rather than as a failure — provided a host import told
+the guest about the cancel first (a read or write returning
+`STREAM_CANCELLED`, `is_cancelled` answering 1, or a plain invoke
+whose callee was stopped by the step's token). A
 streaming callee's own stop arrives through `stream_read`: a read
 parked when the token fires is released as `STREAM_CANCELLED` and is
 a telling; a stream that had already ended by the time the guest read

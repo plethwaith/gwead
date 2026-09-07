@@ -853,9 +853,24 @@ impl StreamState {
             // guest treating the first `-1` as terminal (the correct
             // reading) would silently truncate. Sources that emit empty
             // chunks are legal — a chunked HTTP body can produce one —
-            // so they are consumed and ignored here. Each
-            // iteration awaits, so a source that only ever yields empty
-            // chunks parks this task rather than spinning a core.
+            // so they are consumed and ignored here.
+            //
+            // A realistic source eventually goes `Pending` between
+            // items — that's a genuine suspension point, so the task
+            // is off the executor while it waits — but nothing here
+            // guarantees that: a source that always has another empty
+            // chunk ready would let `select!`'s `biased` ordering keep
+            // picking it forever, same as an always-ready source of
+            // *real* chunks would (the design this loop shares with
+            // `write_async`: a source that never has to wait never
+            // falls through to the token). The difference is that a
+            // real chunk ends the call in one step; an all-empty
+            // source loops here indefinitely with nothing to show the
+            // caller. `yield_now` after each empty chunk keeps that
+            // loop cooperative — it hands the executor back so other
+            // tasks (including whatever would eventually stop feeding
+            // this one) keep running — without changing which side of
+            // the race wins.
             loop {
                 // The source is polled first, every poll: a chunk, an
                 // error item, or an end that is already there is
@@ -873,18 +888,7 @@ impl StreamState {
                 };
                 match item {
                     Some(Ok(chunk)) if chunk.is_empty() => {
-                        // An empty chunk carries nothing a caller could
-                        // ever see — it is discarded either way — so
-                        // re-checking here does not touch the "a chunk
-                        // already there wins" precedence above; it only
-                        // closes the gap a source that never yields
-                        // `Pending` would otherwise leave: without this,
-                        // `biased` always finds `source.next()` ready
-                        // and the token is never even polled.
-                        if cancel.is_cancelled() {
-                            released = true;
-                            break;
-                        }
+                        tokio::task::yield_now().await;
                         continue;
                     }
                     Some(Ok(chunk)) => {
@@ -1758,30 +1762,105 @@ mod tests {
         assert_eq!(state.read_async(&mut buf, &cancel).await, STREAM_CANCELLED);
     }
 
-    /// A source that never goes `Pending` — always immediately ready
-    /// with another empty chunk — would let the `biased` select
-    /// always pick `source.next()` and never even poll the token, if
-    /// the loop didn't also check `is_cancelled()` after discarding an
-    /// empty chunk. Wrapped in a timeout: without that check this
-    /// spins forever inside a single poll rather than merely being
-    /// slow to notice the cancel.
+    /// An empty chunk ahead of real content does not change who wins:
+    /// the token was already fired before the read even started, and
+    /// the real chunk right behind the empty one still wins the race,
+    /// exactly as it would with no empty chunk in front of it.
     #[tokio::test]
-    async fn a_source_that_never_goes_pending_still_releases_on_a_fired_token() {
+    async fn a_chunk_behind_a_leading_empty_chunk_still_wins_under_a_fired_token() {
+        let mut reg = StreamRegistry::new();
+        let (state, mut tx) = channel_readable(&mut reg);
+        tx.try_send(Ok(Bytes::new())).unwrap();
+        tx.try_send(Ok(Bytes::from_static(b"abc"))).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let mut buf = [0u8; 8];
+        assert_eq!(state.read_async(&mut buf, &cancel).await, 3);
+        assert_eq!(&buf[..3], b"abc");
+    }
+
+    /// Same, with the source ending right behind the empty chunk
+    /// instead of yielding real content: `STREAM_EOF` still wins over
+    /// the fired token, and it's sticky.
+    #[tokio::test]
+    async fn an_end_behind_a_leading_empty_chunk_still_wins_under_a_fired_token() {
+        let mut reg = StreamRegistry::new();
+        let (state, mut tx) = channel_readable(&mut reg);
+        tx.try_send(Ok(Bytes::new())).unwrap();
+        drop(tx);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let mut buf = [0u8; 8];
+        assert_eq!(state.read_async(&mut buf, &cancel).await, STREAM_EOF);
+        assert_eq!(state.read_async(&mut buf, &cancel).await, STREAM_EOF);
+    }
+
+    /// Same, with the source failing right behind the empty chunk:
+    /// `STREAM_IO_ERROR` still wins, and `last_error` is the source's
+    /// text, not the cancel text — a relay forwarding the upstream's
+    /// error still gets it even though the step was already
+    /// cancelling.
+    #[tokio::test]
+    async fn an_error_behind_a_leading_empty_chunk_still_wins_under_a_fired_token() {
+        let mut reg = StreamRegistry::new();
+        let (state, mut tx) = channel_readable(&mut reg);
+        tx.try_send(Ok(Bytes::new())).unwrap();
+        tx.try_send(Err(std::io::Error::other("boom"))).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let mut buf = [0u8; 8];
+        assert_eq!(state.read_async(&mut buf, &cancel).await, STREAM_IO_ERROR);
+        assert_eq!(state.last_error().as_deref(), Some("boom"));
+    }
+
+    /// A source that never goes `Pending` — always immediately ready
+    /// with another empty chunk — never releases under a fired token:
+    /// by the same "ready wins" rule a source of real chunks already
+    /// has, a source that never has to wait never falls through to
+    /// the token, empty or not. That is out of scope for this
+    /// backstop to bound; what it must not do is monopolize the
+    /// executor while it spins. `yield_now` after each empty chunk
+    /// keeps the loop cooperative: a concurrent task still makes
+    /// progress while this read never returns.
+    #[tokio::test]
+    async fn a_source_that_never_goes_pending_does_not_starve_the_executor() {
         let mut reg = StreamRegistry::new();
         let source: ReadableSource = Box::pin(futures::stream::repeat_with(|| Ok(Bytes::new())));
         let id = reg.register_readable("application/octet-stream", source);
         let state = reg.get(id).unwrap();
         let cancel = CancellationToken::new();
         cancel.cancel();
-
         let mut buf = [0u8; 8];
+
+        let ticks = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                for _ in 0..5 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+        };
+
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(50),
             state.read_async(&mut buf, &cancel),
         )
-        .await
-        .expect("the read returns instead of spinning forever");
-        assert_eq!(result, STREAM_CANCELLED);
+        .await;
+        assert!(
+            result.is_err(),
+            "an always-ready source never releases, by design"
+        );
+        ticker.await.unwrap();
+        assert_eq!(
+            ticks.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "the ticker ran concurrently — the empty-chunk loop did not block the executor"
+        );
     }
 
     /// The shared registry entry point passes the token through, so
