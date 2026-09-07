@@ -308,8 +308,13 @@ error-recovery idiom (`pcall` in Lua) to plugins that want to treat
 failures non-fatally. `STREAM_CANCELLED` is not a failure: it is the
 step's own cancel reaching a parked read or write, the same fact
 `is_cancelled` reports, and a binding should surface it the same way
-— `read` returning `nil` or `write` returning `false`, say, so the
-script stops and returns normally. A guest has no typed cancellation
+— `read` and `write` both returning `false`, say, so the script stops
+and returns normally. `read`'s `false` is deliberately distinct from
+its `nil`: `nil` is `STREAM_EOF` (the source is exhausted), `false` is
+`STREAM_CANCELLED` (the wait was released, the source is untouched) —
+a script that treats them alike would stop identically either way, but
+a relay forwarding the distinction upstream needs to tell them apart.
+A guest has no typed cancellation
 of its own; a script error raised after the step's token has fired is
 reported by the host as the cancellation rather than as a failure —
 provided a host import told the guest about the cancel first (a read

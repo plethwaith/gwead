@@ -872,7 +872,21 @@ impl StreamState {
                     }
                 };
                 match item {
-                    Some(Ok(chunk)) if chunk.is_empty() => continue,
+                    Some(Ok(chunk)) if chunk.is_empty() => {
+                        // An empty chunk carries nothing a caller could
+                        // ever see — it is discarded either way — so
+                        // re-checking here does not touch the "a chunk
+                        // already there wins" precedence above; it only
+                        // closes the gap a source that never yields
+                        // `Pending` would otherwise leave: without this,
+                        // `biased` always finds `source.next()` ready
+                        // and the token is never even polled.
+                        if cancel.is_cancelled() {
+                            released = true;
+                            break;
+                        }
+                        continue;
+                    }
                     Some(Ok(chunk)) => {
                         leftover = Some(chunk);
                         break;
@@ -1742,6 +1756,32 @@ mod tests {
 
         let mut buf = [0u8; 8];
         assert_eq!(state.read_async(&mut buf, &cancel).await, STREAM_CANCELLED);
+    }
+
+    /// A source that never goes `Pending` — always immediately ready
+    /// with another empty chunk — would let the `biased` select
+    /// always pick `source.next()` and never even poll the token, if
+    /// the loop didn't also check `is_cancelled()` after discarding an
+    /// empty chunk. Wrapped in a timeout: without that check this
+    /// spins forever inside a single poll rather than merely being
+    /// slow to notice the cancel.
+    #[tokio::test]
+    async fn a_source_that_never_goes_pending_still_releases_on_a_fired_token() {
+        let mut reg = StreamRegistry::new();
+        let source: ReadableSource = Box::pin(futures::stream::repeat_with(|| Ok(Bytes::new())));
+        let id = reg.register_readable("application/octet-stream", source);
+        let state = reg.get(id).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let mut buf = [0u8; 8];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.read_async(&mut buf, &cancel),
+        )
+        .await
+        .expect("the read returns instead of spinning forever");
+        assert_eq!(result, STREAM_CANCELLED);
     }
 
     /// The shared registry entry point passes the token through, so
