@@ -15,7 +15,10 @@ embedders depend on Gwead, never the reverse.
 
 ## Status
 
-**0.1.0 — first release.** The manifest format is Gwead's public API; its
+**0.2.0 — typed cancellation and stream failure reporting.** Breaking for
+embedders (typed errors gained fields, stream reads and writes take the
+step's cancellation token, one validation warning became data); manifests
+written for 0.1.0 load unchanged. The manifest format is Gwead's public API; its
 contract is the pair of meta-schemas in [`schemas/`](schemas/) (JSON Schema
 Draft 2020-12), and every manifest loaded from JSON (`Kernel::load_manifest`,
 `register_plugin_from_json`, `register_spi_from_json`) is validated against

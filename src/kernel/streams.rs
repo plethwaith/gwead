@@ -254,7 +254,7 @@ impl StreamState {
     /// The text behind the last `STREAM_IO_ERROR` or `STREAM_CANCELLED`
     /// this handle returned, if any: the source's error for a failed
     /// read, [`STREAM_READ_CANCELLED_TEXT`] for a released read, or
-    /// [`STREAM_CANCELLED_TEXT`] for a released write. Kept until a
+    /// [`STREAM_WRITE_CANCELLED_TEXT`] for a released write. Kept until a
     /// later one of those replaces it — fetching it does not clear
     /// it, and a close does not either. Takes the per-stream lock
     /// briefly.
@@ -1096,7 +1096,7 @@ impl StreamState {
                 // on whether text is present — a `STREAM_CLOSED` after
                 // this still finds this text.
                 self.lock_inner().last_error =
-                    Some(STREAM_CANCELLED_TEXT.to_string());
+                    Some(STREAM_WRITE_CANCELLED_TEXT.to_string());
                 STREAM_CANCELLED
             }
         }
@@ -1197,7 +1197,7 @@ pub const STREAM_CANCELLED: i32 = -7;
 /// The text [`StreamState::last_error`] carries for a write that
 /// returned [`STREAM_CANCELLED`]. See [`STREAM_READ_CANCELLED_TEXT`]
 /// for the read side's text.
-pub const STREAM_CANCELLED_TEXT: &str =
+pub const STREAM_WRITE_CANCELLED_TEXT: &str =
     "write released by the step's cancellation token; nothing was committed";
 /// The text [`StreamState::last_error`] carries for a read that
 /// returned [`STREAM_CANCELLED`].
@@ -1994,7 +1994,7 @@ mod tests {
         firing.await.unwrap();
         assert_eq!(
             state.last_error().as_deref(),
-            Some(STREAM_CANCELLED_TEXT),
+            Some(STREAM_WRITE_CANCELLED_TEXT),
             "the released write records why, for stream_last_error"
         );
 
@@ -2010,7 +2010,10 @@ mod tests {
         // text — a binding keys on the code, not on the text.
         reg.close(id);
         assert_eq!(state.write_async(b"late", &cancel).await, STREAM_CLOSED);
-        assert_eq!(state.last_error().as_deref(), Some(STREAM_CANCELLED_TEXT));
+        assert_eq!(
+            state.last_error().as_deref(),
+            Some(STREAM_WRITE_CANCELLED_TEXT)
+        );
     }
 
     /// A parked write learns that the receiver has gone before it
