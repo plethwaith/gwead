@@ -861,28 +861,33 @@ impl StreamState {
             // empty chunks queued back to back resolves `Ready` on
             // every one of them, and `select!`'s `biased` ordering
             // picks a ready `source.next()` over the token every
-            // time (the design this loop shares with `write_async`:
-            // a source that never has to wait never falls through to
-            // the token). For a *real* chunk that costs nothing — one
-            // ends the call right there — but an all-empty run costs
-            // one more loop iteration per chunk, and a source that
-            // never stops offering one would loop here forever with
-            // nothing to show the caller. `yield_now` after each empty
-            // chunk keeps that loop cooperative: it hands control back
-            // to the executor once per chunk without changing which
-            // side of the race wins, so other tasks keep running, and
-            // — because dropping this future at all requires the
-            // executor to get control back first — a caller racing
-            // this call against a hard deadline (`run_with_wallclock_
-            // timeout`'s drop-after-grace, or a `JoinSet` abort, both
-            // of which land only at a suspension point) can still cut
-            // it off. Nothing here promises that on its own: an
-            // uncapped action, or an embedder calling
-            // `read_async_shared` outside the kernel entirely, has no
-            // such deadline to land on, and a purely synchronous
-            // source that never has to wait is defined to keep
-            // winning the race against `cancel`, same as a real
-            // chunk would.
+            // time: the same ready-wins rule `write_async`'s single
+            // race already has (it has no loop of its own to spin —
+            // one send either commits or doesn't). For a *real* chunk
+            // that costs nothing — one ends the call right there —
+            // but an all-empty run costs one more loop iteration per
+            // chunk, and a source that never stops offering one would
+            // loop here forever with nothing to show the caller.
+            // `yield_now` after each empty chunk keeps that loop
+            // cooperative: it hands control back to the executor once
+            // per chunk without changing which side of the race wins,
+            // so other tasks keep running.
+            //
+            // That suspension point is also what lets an *external*
+            // deadline still cut this call off, even though `select!`
+            // itself never resolves in the token's favour here:
+            // dropping this future at all requires the executor to
+            // get control back first, so a caller racing it against a
+            // hard deadline — `run_with_wallclock_timeout`'s
+            // drop-after-grace, or a `JoinSet` abort, both of which
+            // land only at a suspension point — can still end it from
+            // outside, discarding the call rather than waiting for it
+            // to return a code. Nothing here promises even that on
+            // its own, though: an uncapped action, or an embedder
+            // calling `read_async_shared` outside the kernel
+            // entirely, has no such deadline to land on, and this
+            // function's own race keeps favouring the source for as
+            // long as it keeps answering.
             loop {
                 // The source is polled first, every poll: a chunk, an
                 // error item, or an end that is already there is
@@ -1797,11 +1802,13 @@ mod tests {
     /// the fired token. (Stickiness itself — a source put back as the
     /// sentinel `empty()` stream rather than its own exhausted self —
     /// is pinned separately by
-    /// `parked_read_reports_the_end_of_its_source_over_a_fired_token`,
-    /// whose unfused source would panic if read a second time without
-    /// that swap; this channel-backed source would report `STREAM_EOF`
-    /// again on its own regardless, so a second read here would not
-    /// distinguish the two.)
+    /// `read_past_eof_returns_eof_again_without_polling_the_source`,
+    /// whose unfused `Unfold` would panic if polled again without that
+    /// swap; this channel-backed source is fused on its own and would
+    /// report `STREAM_EOF` again regardless, so a second read here
+    /// wouldn't distinguish the two. It would, however, show the
+    /// sentinel `empty()` source itself still beating a fired token —
+    /// the second assertion below.)
     #[tokio::test]
     async fn an_end_behind_a_leading_empty_chunk_still_wins_under_a_fired_token() {
         let mut reg = StreamRegistry::new();
@@ -1813,6 +1820,11 @@ mod tests {
 
         let mut buf = [0u8; 8];
         assert_eq!(state.read_async(&mut buf, &cancel).await, STREAM_EOF);
+        assert_eq!(
+            state.read_async(&mut buf, &cancel).await,
+            STREAM_EOF,
+            "the sentinel source still beats the fired token"
+        );
     }
 
     /// Same, with the source failing right behind the empty chunk:
@@ -1834,15 +1846,33 @@ mod tests {
         assert_eq!(state.last_error().as_deref(), Some("boom"));
     }
 
+    /// Bound on the hand-poll loop below, in case the empty-chunk arm
+    /// ever stops resolving `Ready` on its very next poll — see that
+    /// test's doc comment for why this is needed at all.
+    const MAX_SUSPENSIONS: u32 = 64;
+
     /// Each empty chunk costs one suspension: hand-polled over three
     /// empty chunks then a real one, under a token that never fires,
     /// counting how many times the outer `read_async` future itself
     /// returns `Poll::Pending`. `bytes_source`'s `stream::iter` never
     /// goes `Pending` on its own — every item is `Ready` the instant
     /// it's polled — so any suspension seen here can only be
-    /// `yield_now`'s. Without it the whole call would resolve to
-    /// `"abc"` in a single poll, zero suspensions; the assertion below
-    /// is what a reverted `yield_now` fails in 0.00s.
+    /// `yield_now`'s. Without it the whole call resolves to `"abc"` in
+    /// a single poll, zero suspensions, and the `suspensions >= 3`
+    /// assertion below fails instantly.
+    ///
+    /// The hand-poll loop drives this future itself, so nothing here
+    /// ever hands control back to the *test's own* task the way an
+    /// `.await` on the whole call would — a `Poll::Pending` from
+    /// `read_async` just sends this loop straight around to poll it
+    /// again. That is only safe because `yield_now` is known to
+    /// resolve `Ready` on its very next poll. A production change that
+    /// swapped it for something needing a real external wakeup to
+    /// advance — a timer, another task, the token itself — would make
+    /// every poll here return the same `Pending` forever, and this
+    /// loop would spin hot rather than fail. `MAX_SUSPENSIONS` turns
+    /// that into a fast, clean failure instead of a CI hang: this test
+    /// has no per-test timeout of its own to fall back on.
     #[tokio::test]
     async fn each_empty_chunk_yields_once_before_the_next_real_item() {
         let mut reg = StreamRegistry::new();
@@ -1862,7 +1892,14 @@ mod tests {
             let mut fut = std::pin::pin!(state.read_async(&mut buf, &cancel));
             loop {
                 match futures::poll!(fut.as_mut()) {
-                    std::task::Poll::Pending => suspensions += 1,
+                    std::task::Poll::Pending => {
+                        suspensions += 1;
+                        assert!(
+                            suspensions < MAX_SUSPENSIONS,
+                            "gave up after {MAX_SUSPENSIONS} suspensions with no result — \
+                             the empty-chunk arm no longer resolves on its own next poll"
+                        );
+                    }
                     std::task::Poll::Ready(n) => break n,
                 }
             }
