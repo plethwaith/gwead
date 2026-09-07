@@ -255,9 +255,10 @@ pub(crate) fn step_script<'a>(
                 // A guest has no typed cancellation of its own. Its
                 // binding may raise a language-level error when a host
                 // import tells it the step was cancelled —
-                // `STREAM_CANCELLED` from a parked `stream_write`,
-                // `is_cancelled` answering 1, or a plain `io.invoke`
-                // whose callee stopped on this step's token. An error from a guest
+                // `STREAM_CANCELLED` from a parked `stream_write` or
+                // `stream_read`, `is_cancelled` answering 1, or a plain
+                // `io.invoke` whose callee stopped on this step's
+                // token. An error from a guest
                 // that was told is the cancellation surfacing through
                 // the guest's error idiom, and is reported as such, so
                 // the dataflow scheduler sees a step winding down and
@@ -1067,20 +1068,26 @@ mod told_of_cancel_tests {
         wat::parse_str(&wat).expect("wat parses")
     }
 
-    /// A step body that sleeps two seconds without racing the token.
+    /// A step body that sleeps `params.ms` (default two seconds)
+    /// without racing the token.
     fn sleep_ignoring_token<'a>(
         _ex: &'a mut (dyn crate::kernel::host_api::PluginExecution + Send),
-        _params: &'a Value,
+        params: &'a Value,
     ) -> Pin<Box<dyn Future<Output = Result<StepOutput, StepError>> + Send + 'a>> {
+        let ms = params["ms"].as_u64().unwrap_or(2000);
         Box::pin(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
             Ok(StepOutput::from(Value::Null))
         })
     }
 
     /// A kernel with plugin `p` as the invoking guest's parent: its
-    /// one-step action `a`, and `slow`, whose own 50 ms wallclock cap
-    /// ends a two-second sleep.
+    /// one-step action `a`; `slow`, whose own 50 ms wallclock cap ends
+    /// a two-second sleep; and `stall`, a dataflow action whose one
+    /// long-running step holds its writable open, writes nothing,
+    /// ignores the token, and ends after 300 ms — the scheduler does
+    /// not abort step tasks on cancel, so the stream stays open and
+    /// quiet for the whole 300 ms whatever the token does.
     fn kernel_with_p() -> std::sync::Arc<crate::kernel::Kernel> {
         let mut config = crate::kernel::KernelConfig::default();
         config
@@ -1101,6 +1108,11 @@ mod told_of_cancel_tests {
                         "slow": {
                             "wallclockTimeoutMs": 50,
                             "steps": [{"id": "s", "type": "p.sleep", "params": {}}]
+                        },
+                        "stall": {
+                            "dataflow": true,
+                            "steps": [{"id": "hold", "type": "p.sleep",
+                                       "params": {"ms": 300}, "longRunning": true}]
                         }
                     }
                 }"#,
@@ -1177,6 +1189,140 @@ mod told_of_cancel_tests {
     async fn a_guest_whose_invoke_succeeded_was_not_told() {
         let outcome = run_invoking("a", tokio_util::sync::CancellationToken::new()).await;
         assert_eq!(outcome.result, Ok("null".into()));
+        assert!(!outcome.told_of_cancel);
+    }
+
+    /// A guest that streams `p.<action>` through `host_invoke_streaming`
+    /// and reads it to a negative code: `STREAM_EOF` reports the
+    /// result `"eof"`; any other negative code — the binding shape
+    /// #17 describes — raises with `"stream read failed"`. A failed
+    /// invoke raises with the host's call-error text, as
+    /// `relaying_guest` in `stream_last_error_tests` does.
+    fn streaming_guest(action: &str) -> Vec<u8> {
+        let m = crate::kernel::abi::ABI_MODULE;
+        let action_len = action.len();
+        let eof = crate::kernel::streams::STREAM_EOF;
+        let wat = format!(
+            r#"
+            (module
+              (import "{m}" "host_set_result" (func $host_set_result (param i32 i32)))
+              (import "{m}" "host_set_error" (func $host_set_error (param i32 i32)))
+              (import "{m}" "host_call_result_size" (func $call_result_size (result i32)))
+              (import "{m}" "host_call_result_read"
+                (func $call_result_read (param i32 i32) (result i32)))
+              (import "{m}" "host_invoke_streaming"
+                (func $invoke_streaming (param i32 i32 i32 i32 i32 i32) (result i32)))
+              (import "{m}" "stream_read" (func $stream_read (param i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 8) "\"eof\"")
+              (data (i32.const 32) "stream read failed")
+              (data (i32.const 64) "{{\"plugin\": \"p\"}}")
+              (data (i32.const 96) "{action}")
+              (data (i32.const 112) "{{}}")
+              (global $next (mut i32) (i32.const 128))
+              (func (export "alloc") (param $len i32) (result i32)
+                (local $ptr i32)
+                global.get $next
+                local.set $ptr
+                global.get $next
+                local.get $len
+                i32.add
+                global.set $next
+                local.get $ptr)
+              (func (export "execute") (param i32 i32 i32 i32) (result i32)
+                (local $h i32)
+                (local $rc i32)
+                (local $len i32)
+                (local.set $h (call $invoke_streaming
+                  (i32.const 64) (i32.const 15)
+                  (i32.const 96) (i32.const {action_len})
+                  (i32.const 112) (i32.const 2)))
+                (if (i32.le_s (local.get $h) (i32.const 0))
+                  (then
+                    (local.set $len (call $call_result_size))
+                    (drop (call $call_result_read (i32.const 8192) (local.get $len)))
+                    (call $host_set_error (i32.const 8192) (local.get $len))
+                    (return (i32.const 0))))
+                (block $done
+                  (loop $again
+                    (local.set $rc
+                      (call $stream_read (local.get $h) (i32.const 4096) (i32.const 64)))
+                    (br_if $done (i32.lt_s (local.get $rc) (i32.const 0)))
+                    (br $again)))
+                (if (i32.eq (local.get $rc) (i32.const {eof}))
+                  (then
+                    (call $host_set_result (i32.const 8) (i32.const 5))
+                    (return (i32.const 1))))
+                (call $host_set_error (i32.const 32) (i32.const 18))
+                (i32.const 0))
+            )
+            "#
+        );
+        wat::parse_str(&wat).expect("wat parses")
+    }
+
+    async fn run_streaming(
+        action: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> ScriptOutcome {
+        let kernel = kernel_with_p();
+        run_guest(Some(&kernel), streaming_guest(action), cancel).await
+    }
+
+    /// A streaming callee stopped by the step's own token, parked
+    /// mid-read: the token fires while the guest is inside
+    /// `stream_read`, the read is released as `STREAM_CANCELLED`, and
+    /// that release is a telling. The guest raises, and the host
+    /// reports the cancellation rather than the guest's text — well
+    /// under the callee's 300 ms hold, since it is the token that
+    /// released the read, not the callee's own end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_whose_streaming_callees_read_was_released_mid_read_was_told() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let firing = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                cancel.cancel();
+            })
+        };
+        let started = std::time::Instant::now();
+        let outcome = run_streaming("stall", cancel).await;
+        firing.await.unwrap();
+        assert_eq!(
+            outcome.result,
+            Err(ScriptRunError::Failed("stream read failed".into()))
+        );
+        assert!(outcome.told_of_cancel);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(300),
+            "the token released the read; the callee's own end did not: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Same as above, but the token has already fired before the
+    /// guest's first read: deterministic because `stall` ignores the
+    /// token, so the source is open and quiet when the guest's first
+    /// read parks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_whose_streaming_callees_read_was_released_before_its_first_read_was_told() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let outcome = run_streaming("stall", cancel).await;
+        assert_eq!(
+            outcome.result,
+            Err(ScriptRunError::Failed("stream read failed".into()))
+        );
+        assert!(outcome.told_of_cancel);
+    }
+
+    /// A streaming callee that ends under a token that never fires
+    /// reaches the guest as a plain `STREAM_EOF`: nothing told it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_whose_streaming_callee_ended_under_a_quiet_token_was_not_told() {
+        let outcome = run_streaming("stall", tokio_util::sync::CancellationToken::new()).await;
+        assert_eq!(outcome.result, Ok("\"eof\"".into()));
         assert!(!outcome.told_of_cancel);
     }
 }

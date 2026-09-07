@@ -242,6 +242,98 @@ pub fn build_write_until_refused_wasm_bytes(on_cancelled: OnCancelled) -> Vec<u8
     wat::parse_str(&wat).expect("write-until-refused wat parses")
 }
 
+/// WAT source for a mock whose `execute` invokes `p.stall` through
+/// `host_invoke_streaming` and loops on `stream_read` until the host
+/// refuses, then reports how. Imports `host_invoke_streaming` and
+/// `stream_read` on top of `host_set_result` / `host_set_error` /
+/// the call-result pair, so a test can park a real wasm guest inside
+/// the `stream_read` import — the shape a relay guest has when its
+/// streamed callee stalls — and observe what releases it. A failed
+/// invoke raises with the host's call-error text, the same way
+/// `relaying_guest` in `script_runtime_host::mod` tests does.
+///
+/// `{cancelled}` and `{eof}` are the `STREAM_CANCELLED` / `STREAM_EOF`
+/// codes, spliced in by name from the kernel's constants;
+/// `{on_cancelled}` is the body for the cancelled branch (see
+/// [`OnCancelled`]). The result is `"eof"` on a plain end of stream
+/// and `"other"` for any other negative code.
+const READ_UNTIL_REFUSED_WAT: &str = r#"
+(module
+  (import "gwead1" "host_set_result" (func $host_set_result (param i32 i32)))
+  (import "gwead1" "host_set_error" (func $host_set_error (param i32 i32)))
+  (import "gwead1" "host_call_result_size" (func $call_result_size (result i32)))
+  (import "gwead1" "host_call_result_read" (func $call_result_read (param i32 i32) (result i32)))
+  (import "gwead1" "host_invoke_streaming"
+    (func $invoke_streaming (param i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "gwead1" "stream_read" (func $stream_read (param i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{\"plugin\": \"p\"}")
+  (data (i32.const 16) "stall")
+  (data (i32.const 32) "{}")
+  (data (i32.const 48) "\"cancelled\"")
+  (data (i32.const 64) "\"eof\"")
+  (data (i32.const 80) "\"other\"")
+  (data (i32.const 96) "stream read cancelled")
+  (global $next (mut i32) (i32.const 128))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    global.get $next
+    local.set $ptr
+    global.get $next
+    local.get $len
+    i32.add
+    global.set $next
+    local.get $ptr)
+  (func (export "execute") (param $src_ptr i32) (param $src_len i32)
+                           (param $args_ptr i32) (param $args_len i32)
+                           (result i32)
+    (local $h i32)
+    (local $rc i32)
+    (local $len i32)
+    (local.set $h (call $invoke_streaming
+      (i32.const 0) (i32.const 15)
+      (i32.const 16) (i32.const 5)
+      (i32.const 32) (i32.const 2)))
+    (if (i32.le_s (local.get $h) (i32.const 0))
+      (then
+        (local.set $len (call $call_result_size))
+        (drop (call $call_result_read (i32.const 8192) (local.get $len)))
+        (call $host_set_error (i32.const 8192) (local.get $len))
+        (return (i32.const 0))))
+    (block $refused
+      (loop $again
+        (local.set $rc
+          (call $stream_read (local.get $h) (i32.const 4096) (i32.const 64)))
+        (br_if $refused (i32.lt_s (local.get $rc) (i32.const 0)))
+        (br $again)))
+    (if (result i32) (i32.eq (local.get $rc) (i32.const {cancelled}))
+      (then {on_cancelled})
+      (else
+        (if (result i32) (i32.eq (local.get $rc) (i32.const {eof}))
+          (then (call $host_set_result (i32.const 64) (i32.const 5)) (i32.const 1))
+          (else (call $host_set_result (i32.const 80) (i32.const 7)) (i32.const 1))))))
+)
+"#;
+
+/// Compile the read-until-refused mock — see [`READ_UNTIL_REFUSED_WAT`]
+/// — with `on_cancelled` as its response to `STREAM_CANCELLED`.
+pub fn build_read_until_refused_wasm_bytes(on_cancelled: OnCancelled) -> Vec<u8> {
+    use gwead::kernel::streams::{STREAM_CANCELLED, STREAM_EOF};
+    let on_cancelled = match on_cancelled {
+        OnCancelled::ReturnResult => {
+            "(call $host_set_result (i32.const 48) (i32.const 11)) (i32.const 1)"
+        }
+        OnCancelled::RaiseError => {
+            "(call $host_set_error (i32.const 96) (i32.const 21)) (i32.const 0)"
+        }
+    };
+    let wat = READ_UNTIL_REFUSED_WAT
+        .replace("{cancelled}", &STREAM_CANCELLED.to_string())
+        .replace("{eof}", &STREAM_EOF.to_string())
+        .replace("{on_cancelled}", on_cancelled);
+    wat::parse_str(&wat).expect("read-until-refused wat parses")
+}
+
 /// Compile the spinning twin — see [`SPINNING_WAT`].
 pub fn build_spinning_wasm_bytes() -> Vec<u8> {
     wat::parse_str(SPINNING_WAT).expect("spinning script-runtime wat parses")

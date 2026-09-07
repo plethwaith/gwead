@@ -194,7 +194,7 @@ pub struct StreamInner {
     pub closed: bool,
     /// The text behind the last negative code this handle returned
     /// that a code alone cannot carry: the source's error for
-    /// `STREAM_IO_ERROR`, and why a write was released for
+    /// `STREAM_IO_ERROR`, and why a read or write was released for
     /// `STREAM_CANCELLED`. Only those two codes write it, and only a
     /// later one of them replaces it — reading it does not clear it,
     /// and a close does not either, so a guest can size a buffer with
@@ -252,9 +252,10 @@ impl StreamState {
     }
 
     /// The text behind the last `STREAM_IO_ERROR` or `STREAM_CANCELLED`
-    /// this handle returned, if any: the source's error for a read,
+    /// this handle returned, if any: the source's error for a failed
+    /// read, [`STREAM_READ_CANCELLED_TEXT`] for a released read, or
     /// [`STREAM_CANCELLED_TEXT`] for a released write. Kept until a
-    /// later one of those two replaces it — fetching it does not clear
+    /// later one of those replaces it — fetching it does not clear
     /// it, and a close does not either. Takes the per-stream lock
     /// briefly.
     pub fn last_error(&self) -> Option<String> {
@@ -767,7 +768,28 @@ impl StreamState {
     /// read gate in every build, so a violation costs latency rather
     /// than data, and the contention is logged at `warn` so the
     /// underlying planner or plugin bug still surfaces.
-    pub async fn read_async(&self, buf: &mut [u8]) -> i32 {
+    ///
+    /// A source that stays open but never yields — an
+    /// embedder-registered readable with no idle bound, or an
+    /// upstream gone quiet without closing — parks the reading guest
+    /// on its `stream_read` host import, where it cannot poll
+    /// `is_cancelled`; a parked read never gets back to its own code
+    /// to notice a cancel. So a pull that has to wait is raced
+    /// against `cancel`, the mirror of what [`Self::write_async`]
+    /// does for a parked send: when the token fires first the read
+    /// returns [`STREAM_CANCELLED`] with nothing copied into `buf`,
+    /// and the source is put back untouched. Only a *parked* pull is
+    /// released; a chunk, an error item, or an end the source already
+    /// had ready is reported whatever the token says, and bytes
+    /// already pulled into `leftover` are handed out under a fired
+    /// token without consulting it. The release records why, for
+    /// `stream_last_error`.
+    ///
+    /// The read gate wait above is **not** raced against `cancel`.
+    /// Contention there is already a logged bug, and whoever holds
+    /// the gate is itself racing its own read against its own token,
+    /// so it is released in turn.
+    pub async fn read_async(&self, buf: &mut [u8], cancel: &CancellationToken) -> i32 {
         use futures::StreamExt;
 
         // Serialise against any other reader of this same handle. The
@@ -820,6 +842,7 @@ impl StreamState {
         // Step 2: pull next chunk if needed, no lock held.
         let mut io_error: Option<std::io::Error> = None;
         let mut eof = false;
+        let mut released = false;
         if leftover.is_none() {
             // Skip empty chunks rather than reporting them as EOF.
             //
@@ -830,12 +853,60 @@ impl StreamState {
             // guest treating the first `-1` as terminal (the correct
             // reading) would silently truncate. Sources that emit empty
             // chunks are legal — a chunked HTTP body can produce one —
-            // so they are consumed and ignored here. Each
-            // iteration awaits, so a source that only ever yields empty
-            // chunks parks this task rather than spinning a core.
+            // so they are consumed and ignored here.
+            //
+            // A source with nothing queued goes `Pending` on its own —
+            // a genuine suspension point, so the task is off the
+            // executor while it waits — but a source with several
+            // empty chunks queued back to back resolves `Ready` on
+            // every one of them, and `select!`'s `biased` ordering
+            // picks a ready `source.next()` over the token every
+            // time: the same ready-wins rule `write_async`'s single
+            // race already has (it has no loop of its own to spin —
+            // one send either commits or doesn't). For a *real* chunk
+            // that costs nothing — one ends the call right there —
+            // but an all-empty run costs one more loop iteration per
+            // chunk, and a source that never stops offering one would
+            // loop here forever with nothing to show the caller.
+            // `yield_now` after each empty chunk keeps that loop
+            // cooperative: it hands control back to the executor once
+            // per chunk without changing which side of the race wins,
+            // so other tasks keep running.
+            //
+            // That suspension point is also what lets an *external*
+            // deadline still cut this call off, even though `select!`
+            // itself never resolves in the token's favour while the
+            // source keeps answering: dropping this future at all
+            // requires the executor to get control back first, so a
+            // caller racing it against a hard deadline —
+            // `run_with_wallclock_timeout`'s drop-after-grace, or a
+            // `JoinSet` abort, both of which land only at a
+            // suspension point — can still end it from outside,
+            // discarding the call rather than waiting for it to
+            // return a code. Nothing here promises even that on its
+            // own, though: an uncapped action, or an embedder calling
+            // `read_async_shared` outside the kernel entirely, has no
+            // such deadline to land on.
             loop {
-                match source.next().await {
-                    Some(Ok(chunk)) if chunk.is_empty() => continue,
+                // The source is polled first, every poll: a chunk, an
+                // error item, or an end that is already there is
+                // reported whatever the token says, and only a source
+                // that has to wait falls through to the token. A
+                // `Pending` poll leaves the source valid, so losing
+                // the race puts it back as it was.
+                let item = tokio::select! {
+                    biased;
+                    item = source.next() => item,
+                    () = cancel.cancelled() => {
+                        released = true;
+                        break;
+                    }
+                };
+                match item {
+                    Some(Ok(chunk)) if chunk.is_empty() => {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
                     Some(Ok(chunk)) => {
                         leftover = Some(chunk);
                         break;
@@ -917,6 +988,9 @@ impl StreamState {
                 inner.last_error = Some(kept);
                 log_preview = Some(preview);
             }
+            if released {
+                inner.last_error = Some(STREAM_READ_CANCELLED_TEXT.to_string());
+            }
             if !inner.closed
                 && let StreamDirection::Readable {
                     source: cur_source,
@@ -957,7 +1031,9 @@ impl StreamState {
             }
         }
 
-        if io_error.is_some() {
+        if released {
+            STREAM_CANCELLED
+        } else if io_error.is_some() {
             STREAM_IO_ERROR
         } else if eof {
             STREAM_EOF
@@ -1046,7 +1122,15 @@ impl StreamState {
 /// pipelines scale: a slow `recv()` on
 /// stream X doesn't block reads on stream Y, and even reads on
 /// the same stream serialize cleanly rather than racing.
-pub async fn read_async_shared(arc: &SharedStreamRegistry, id: StreamId, buf: &mut [u8]) -> i32 {
+///
+/// `cancel` is the reading invocation's token; see
+/// [`StreamState::read_async`] for what it does to a parked read.
+pub async fn read_async_shared(
+    arc: &SharedStreamRegistry,
+    id: StreamId,
+    buf: &mut [u8],
+    cancel: &CancellationToken,
+) -> i32 {
     let state = {
         let reg = lock_shared(arc);
         match reg.streams.get(&id) {
@@ -1054,7 +1138,7 @@ pub async fn read_async_shared(arc: &SharedStreamRegistry, id: StreamId, buf: &m
             None => return STREAM_INVALID_HANDLE,
         }
     };
-    state.read_async(buf).await
+    state.read_async(buf, cancel).await
 }
 
 /// Shared-registry entry point for the wasm `stream_write` host
@@ -1102,16 +1186,23 @@ pub const STREAM_CLOSED: i32 = -4;
 pub const STREAM_IO_ERROR: i32 = -5;
 /// Buffer pointer + length exceeds the wasm module's linear memory.
 pub const STREAM_OOB: i32 = -6;
-/// A write waiting for room on a full channel was released by the
-/// invocation's cancellation token — the caller's cancel or the
-/// wallclock watchdog. Nothing was committed.
+/// A wait was released by the invocation's cancellation token — the
+/// caller's cancel or the wallclock watchdog: a write waiting for
+/// room on a full channel, or a read waiting on a source that had not
+/// yet yielded. Nothing was committed and the source or channel is
+/// untouched.
 /// Distinct from [`STREAM_CLOSED`] so a guest can tell a consumer that
 /// went away (finish cleanly) from a stop it was told to make.
 pub const STREAM_CANCELLED: i32 = -7;
 /// The text [`StreamState::last_error`] carries for a write that
-/// returned [`STREAM_CANCELLED`].
+/// returned [`STREAM_CANCELLED`]. See [`STREAM_READ_CANCELLED_TEXT`]
+/// for the read side's text.
 pub const STREAM_CANCELLED_TEXT: &str =
     "write released by the step's cancellation token; nothing was committed";
+/// The text [`StreamState::last_error`] carries for a read that
+/// returned [`STREAM_CANCELLED`].
+pub const STREAM_READ_CANCELLED_TEXT: &str =
+    "read released by the step's cancellation token; the source was left as it was";
 /// What [`StreamState::last_error`] records for a source that failed
 /// with an empty message, so a recorded failure never sizes as 0 —
 /// which `stream_last_error` reserves for "nothing recorded".
@@ -1309,15 +1400,15 @@ mod tests {
 
         // Ask for 5, then 5, then the rest, then EOF.
         let mut buf = [0u8; 5];
-        assert_eq!(state.read_async(&mut buf).await, 5);
+        assert_eq!(state.read_async(&mut buf, &never()).await, 5);
         assert_eq!(&buf, b"hello");
-        assert_eq!(state.read_async(&mut buf).await, 5);
+        assert_eq!(state.read_async(&mut buf, &never()).await, 5);
         assert_eq!(&buf, b" worl");
         // Only "d" remains; 1 byte returned.
-        assert_eq!(state.read_async(&mut buf[..1]).await, 1);
+        assert_eq!(state.read_async(&mut buf[..1], &never()).await, 1);
         assert_eq!(buf[0], b'd');
         // Source exhausted → EOF.
-        assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_EOF);
     }
 
     #[tokio::test]
@@ -1328,11 +1419,11 @@ mod tests {
             vec![Bytes::from_static(b"AAAA"), Bytes::from_static(b"BBBB")],
         );
         let mut buf = [0u8; 4];
-        assert_eq!(state.read_async(&mut buf).await, 4);
+        assert_eq!(state.read_async(&mut buf, &never()).await, 4);
         assert_eq!(&buf, b"AAAA");
-        assert_eq!(state.read_async(&mut buf).await, 4);
+        assert_eq!(state.read_async(&mut buf, &never()).await, 4);
         assert_eq!(&buf, b"BBBB");
-        assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_EOF);
     }
 
     #[tokio::test]
@@ -1341,7 +1432,10 @@ mod tests {
         let (id, _rx) = reg.register_writable("application/octet-stream", 1);
         let state = reg.get(id).unwrap();
         let mut buf = [0u8; 8];
-        assert_eq!(state.read_async(&mut buf).await, STREAM_DIRECTION_MISMATCH);
+        assert_eq!(
+            state.read_async(&mut buf, &never()).await,
+            STREAM_DIRECTION_MISMATCH
+        );
     }
 
     #[tokio::test]
@@ -1350,7 +1444,7 @@ mod tests {
         let bogus = NonZeroU32::new(42).unwrap();
         let mut buf = [0u8; 4];
         assert_eq!(
-            read_async_shared(&arc, bogus, &mut buf).await,
+            read_async_shared(&arc, bogus, &mut buf, &never()).await,
             STREAM_INVALID_HANDLE
         );
     }
@@ -1365,7 +1459,7 @@ mod tests {
         reg.close(id);
         let state = reg.get(id).unwrap();
         let mut buf = [0u8; 4];
-        assert_eq!(state.read_async(&mut buf).await, STREAM_CLOSED);
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_CLOSED);
     }
 
     /// EOF sticks. An embedder may register any source, and a bare
@@ -1382,10 +1476,10 @@ mod tests {
         let id = reg.register_readable("application/octet-stream", source);
         let state = reg.streams.get(&id).unwrap().clone();
         let mut buf = [0u8; 8];
-        assert_eq!(state.read_async(&mut buf).await, 2);
-        assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
-        assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
-        assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
+        assert_eq!(state.read_async(&mut buf, &never()).await, 2);
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_EOF);
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_EOF);
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_EOF);
     }
 
     /// What a guest sees of a producer that fails: the error code once,
@@ -1408,10 +1502,10 @@ mod tests {
         let id = reg.register_readable("application/octet-stream", source);
         let state = reg.streams.get(&id).unwrap().clone();
         let mut buf = [0u8; 8];
-        assert_eq!(state.read_async(&mut buf).await, 2);
-        assert_eq!(state.read_async(&mut buf).await, STREAM_IO_ERROR);
-        assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
-        assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
+        assert_eq!(state.read_async(&mut buf, &never()).await, 2);
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_IO_ERROR);
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_EOF);
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_EOF);
     }
 
     /// The code says the source failed; the text says why, and the
@@ -1430,22 +1524,412 @@ mod tests {
         let id = reg.register_readable("application/octet-stream", source);
         let state = reg.get(id).unwrap();
         let mut buf = [0u8; 8];
-        assert_eq!(state.read_async(&mut buf).await, 2);
+        assert_eq!(state.read_async(&mut buf, &never()).await, 2);
         assert_eq!(state.last_error(), None, "a clean read records nothing");
-        assert_eq!(state.read_async(&mut buf).await, STREAM_IO_ERROR);
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_IO_ERROR);
         assert_eq!(state.last_error().as_deref(), Some("upstream fell over"));
-        assert_eq!(state.read_async(&mut buf).await, STREAM_EOF);
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_EOF);
         assert_eq!(
             state.last_error().as_deref(),
             Some("upstream fell over"),
             "the EOF after the error item does not clear it"
         );
         assert_eq!(reg.close_handle(id), 0);
-        assert_eq!(state.read_async(&mut buf).await, STREAM_CLOSED);
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_CLOSED);
         assert_eq!(
             state.last_error().as_deref(),
             Some("upstream fell over"),
             "a close does not clear it either"
+        );
+    }
+
+    // --- Read-cancel backstop: racing a parked read against the
+    // step's cancellation token, mirroring the write-side races below.
+
+    /// A channel-backed readable source for the read-cancel tests:
+    /// holding `tx` keeps the source open and quiet, parking a read.
+    /// `tx.try_send(Ok(chunk))` yields a chunk, `tx.try_send(Err(err))`
+    /// yields an error item, and `drop(tx)` ends the source.
+    fn channel_readable(
+        reg: &mut StreamRegistry,
+    ) -> (
+        Arc<StreamState>,
+        futures::channel::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    ) {
+        let (tx, rx) = futures::channel::mpsc::channel(8);
+        let id = reg.register_readable("application/octet-stream", Box::pin(rx));
+        (reg.get(id).expect("just registered"), tx)
+    }
+
+    /// A token that fires while a read is parked on a quiet source
+    /// releases it: it returns `STREAM_CANCELLED`, `last_error` names
+    /// why, and the handle stays open. The source went back untouched
+    /// — a chunk sent after the release is still delivered. The
+    /// documented stale case at the end mirrors the write side's:
+    /// nothing clears the slot, so a `STREAM_CLOSED` after the cancel
+    /// still finds the cancel's text.
+    #[tokio::test]
+    async fn parked_read_is_released_when_the_token_fires() {
+        let mut reg = StreamRegistry::new();
+        let (state, mut tx) = channel_readable(&mut reg);
+        let cancel = CancellationToken::new();
+
+        let firing = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                cancel.cancel();
+            })
+        };
+        let mut buf = [0u8; 8];
+        assert_eq!(state.read_async(&mut buf, &cancel).await, STREAM_CANCELLED);
+        firing.await.unwrap();
+        assert_eq!(
+            state.last_error().as_deref(),
+            Some(STREAM_READ_CANCELLED_TEXT)
+        );
+        assert!(!state.is_closed());
+
+        tx.try_send(Ok(Bytes::from_static(b"late"))).unwrap();
+        assert_eq!(state.read_async(&mut buf, &never()).await, 4);
+        assert_eq!(&buf[..4], b"late", "the source was left as it was");
+
+        let id = state.id;
+        reg.close(id);
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_CLOSED);
+        assert_eq!(
+            state.last_error().as_deref(),
+            Some(STREAM_READ_CANCELLED_TEXT)
+        );
+    }
+
+    /// A token that has already fired releases a would-be-parked read
+    /// without waiting at all, like the write side's
+    /// `write_under_a_fired_token_does_not_park`. A closed handle
+    /// under a fired token is still `STREAM_CLOSED` — decided in step
+    /// 1, before the race.
+    #[tokio::test]
+    async fn read_under_a_fired_token_does_not_park() {
+        let mut reg = StreamRegistry::new();
+        let (state, _tx) = channel_readable(&mut reg);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut buf = [0u8; 8];
+        {
+            let mut parked = std::pin::pin!(state.read_async(&mut buf, &cancel));
+            assert_eq!(
+                futures::poll!(parked.as_mut()),
+                std::task::Poll::Ready(STREAM_CANCELLED)
+            );
+        }
+
+        let (state, _tx) = channel_readable(&mut reg);
+        reg.close(state.id);
+        let mut closed = std::pin::pin!(state.read_async(&mut buf, &cancel));
+        assert_eq!(
+            futures::poll!(closed.as_mut()),
+            std::task::Poll::Ready(STREAM_CLOSED)
+        );
+    }
+
+    /// The source is polled first, every iteration: a chunk it
+    /// already has ready is returned under a fired token, the
+    /// leftover from it is handed out the same way, and only once
+    /// both are drained does the fired token release the read. Pins
+    /// D3 and D5.
+    #[tokio::test]
+    async fn a_chunk_that_is_ready_is_returned_under_a_fired_token() {
+        let mut reg = StreamRegistry::new();
+        let (state, mut tx) = channel_readable(&mut reg);
+        tx.try_send(Ok(Bytes::from_static(b"abcdef"))).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let mut buf = [0u8; 4];
+        assert_eq!(state.read_async(&mut buf, &cancel).await, 4);
+        assert_eq!(&buf, b"abcd");
+        assert_eq!(state.read_async(&mut buf, &cancel).await, 2);
+        assert_eq!(
+            &buf[..2],
+            b"ef",
+            "the leftover path, still under the fired token"
+        );
+        assert_eq!(
+            state.read_async(&mut buf, &cancel).await,
+            STREAM_CANCELLED,
+            "leftover drained, source open but nothing ready"
+        );
+    }
+
+    /// A parked read learns that its source ended before it learns
+    /// the token fired, whichever order the two happened in: the end
+    /// of the source wins over a fired token, and it sticks — a fresh
+    /// read after is `STREAM_EOF` again, not `STREAM_CANCELLED`. This
+    /// pins the residual untold window: a relay guest that is between
+    /// reads when its callee's sender drops sees a plain `STREAM_EOF`,
+    /// not a telling.
+    #[tokio::test]
+    async fn parked_read_reports_the_end_of_its_source_over_a_fired_token() {
+        for source_ends_first in [true, false] {
+            let mut reg = StreamRegistry::new();
+            let (state, tx) = channel_readable(&mut reg);
+            let cancel = CancellationToken::new();
+            let mut buf = [0u8; 8];
+
+            {
+                let mut parked = std::pin::pin!(state.read_async(&mut buf, &cancel));
+                assert!(
+                    futures::poll!(parked.as_mut()).is_pending(),
+                    "a quiet source parks the read"
+                );
+                if source_ends_first {
+                    drop(tx);
+                    cancel.cancel();
+                } else {
+                    cancel.cancel();
+                    drop(tx);
+                }
+                assert_eq!(
+                    futures::poll!(parked.as_mut()),
+                    std::task::Poll::Ready(STREAM_EOF),
+                    "source_ends_first = {source_ends_first}"
+                );
+            }
+            assert_eq!(
+                state.read_async(&mut buf, &never()).await,
+                STREAM_EOF,
+                "sticky"
+            );
+        }
+    }
+
+    /// Same shape as the sibling above, with the source failing
+    /// instead of ending: the error item wins over a fired token too,
+    /// and `last_error` records the source's own text, not the cancel
+    /// text. The source goes back after an error item as it always
+    /// does, so a further read reaches its `None`.
+    #[tokio::test]
+    async fn parked_read_reports_a_failed_source_over_a_fired_token() {
+        let mut reg = StreamRegistry::new();
+        let (state, mut tx) = channel_readable(&mut reg);
+        let cancel = CancellationToken::new();
+        let mut buf = [0u8; 8];
+
+        {
+            let mut parked = std::pin::pin!(state.read_async(&mut buf, &cancel));
+            assert!(futures::poll!(parked.as_mut()).is_pending());
+            cancel.cancel();
+            tx.try_send(Err(std::io::Error::other("upstream fell over")))
+                .unwrap();
+            assert_eq!(
+                futures::poll!(parked.as_mut()),
+                std::task::Poll::Ready(STREAM_IO_ERROR)
+            );
+        }
+        assert_eq!(state.last_error().as_deref(), Some("upstream fell over"));
+
+        drop(tx);
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_EOF);
+    }
+
+    /// The cancel text and a source's own error text share one slot:
+    /// the last writer wins, so a release records the cancel text, a
+    /// following failure replaces it, and releasing again puts the
+    /// cancel text back.
+    #[tokio::test]
+    async fn a_released_read_records_why_and_a_later_failure_replaces_it() {
+        let mut reg = StreamRegistry::new();
+        let (state, mut tx) = channel_readable(&mut reg);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut buf = [0u8; 8];
+
+        assert_eq!(state.read_async(&mut buf, &cancel).await, STREAM_CANCELLED);
+        assert_eq!(
+            state.last_error().as_deref(),
+            Some(STREAM_READ_CANCELLED_TEXT)
+        );
+
+        tx.try_send(Err(std::io::Error::other("boom"))).unwrap();
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_IO_ERROR);
+        assert_eq!(state.last_error().as_deref(), Some("boom"));
+
+        assert_eq!(state.read_async(&mut buf, &cancel).await, STREAM_CANCELLED);
+        assert_eq!(
+            state.last_error().as_deref(),
+            Some(STREAM_READ_CANCELLED_TEXT)
+        );
+    }
+
+    /// The race is per iteration of the pull loop: empty chunks are
+    /// still consumed and skipped under a fired token, and only once
+    /// the source has nothing left ready does the token release the
+    /// read — not a 0-byte read.
+    #[tokio::test]
+    async fn empty_chunks_under_a_fired_token_are_skipped_and_the_wait_is_released() {
+        let mut reg = StreamRegistry::new();
+        let (state, mut tx) = channel_readable(&mut reg);
+        tx.try_send(Ok(Bytes::new())).unwrap();
+        tx.try_send(Ok(Bytes::new())).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let mut buf = [0u8; 8];
+        assert_eq!(state.read_async(&mut buf, &cancel).await, STREAM_CANCELLED);
+    }
+
+    /// An empty chunk ahead of real content does not change who wins:
+    /// the token was already fired before the read even started, and
+    /// the real chunk right behind the empty one still wins the race,
+    /// exactly as it would with no empty chunk in front of it.
+    #[tokio::test]
+    async fn a_chunk_behind_a_leading_empty_chunk_still_wins_under_a_fired_token() {
+        let mut reg = StreamRegistry::new();
+        let (state, mut tx) = channel_readable(&mut reg);
+        tx.try_send(Ok(Bytes::new())).unwrap();
+        tx.try_send(Ok(Bytes::from_static(b"abc"))).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let mut buf = [0u8; 8];
+        assert_eq!(state.read_async(&mut buf, &cancel).await, 3);
+        assert_eq!(&buf[..3], b"abc");
+    }
+
+    /// Same, with the source ending right behind the empty chunk
+    /// instead of yielding real content: `STREAM_EOF` still wins over
+    /// the fired token. (Stickiness itself — a source put back as the
+    /// sentinel `empty()` stream rather than its own exhausted self —
+    /// is pinned separately by
+    /// `read_past_eof_returns_eof_again_without_polling_the_source`,
+    /// whose unfused `Unfold` would panic if polled again without that
+    /// swap; this channel-backed source is fused on its own and would
+    /// report `STREAM_EOF` again regardless, so a second read here
+    /// wouldn't distinguish the two. It would, however, show the
+    /// sentinel `empty()` source itself still beating a fired token —
+    /// the second assertion below.)
+    #[tokio::test]
+    async fn an_end_behind_a_leading_empty_chunk_still_wins_under_a_fired_token() {
+        let mut reg = StreamRegistry::new();
+        let (state, mut tx) = channel_readable(&mut reg);
+        tx.try_send(Ok(Bytes::new())).unwrap();
+        drop(tx);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let mut buf = [0u8; 8];
+        assert_eq!(state.read_async(&mut buf, &cancel).await, STREAM_EOF);
+        assert_eq!(
+            state.read_async(&mut buf, &cancel).await,
+            STREAM_EOF,
+            "the sentinel source still beats the fired token"
+        );
+    }
+
+    /// Same, with the source failing right behind the empty chunk:
+    /// `STREAM_IO_ERROR` still wins, and `last_error` is the source's
+    /// text, not the cancel text — a relay forwarding the upstream's
+    /// error still gets it even though the step was already
+    /// cancelling.
+    #[tokio::test]
+    async fn an_error_behind_a_leading_empty_chunk_still_wins_under_a_fired_token() {
+        let mut reg = StreamRegistry::new();
+        let (state, mut tx) = channel_readable(&mut reg);
+        tx.try_send(Ok(Bytes::new())).unwrap();
+        tx.try_send(Err(std::io::Error::other("boom"))).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let mut buf = [0u8; 8];
+        assert_eq!(state.read_async(&mut buf, &cancel).await, STREAM_IO_ERROR);
+        assert_eq!(state.last_error().as_deref(), Some("boom"));
+    }
+
+    /// Bound on the hand-poll loop below, in case `yield_now` is ever
+    /// replaced by something that stops resolving `Ready` on its very
+    /// next poll — see that test's doc comment for why this is needed
+    /// at all.
+    const MAX_SUSPENSIONS: u32 = 64;
+
+    /// Each empty chunk costs one suspension: hand-polled over three
+    /// empty chunks then a real one, under a token that never fires,
+    /// counting how many times the outer `read_async` future itself
+    /// returns `Poll::Pending`. `bytes_source`'s `stream::iter` never
+    /// goes `Pending` on its own — every item is `Ready` the instant
+    /// it's polled — so any suspension seen here can only be
+    /// `yield_now`'s. Without it the whole call resolves to `"abc"` in
+    /// a single poll, zero suspensions, and the `suspensions >= 3`
+    /// assertion below fails instantly.
+    ///
+    /// The hand-poll loop drives `read_async` itself, so nothing here
+    /// ever hands control back to the *runtime* the way an `.await` on
+    /// the whole call would — a `Poll::Pending` from `read_async` just
+    /// sends this loop straight around to poll it again. That is only
+    /// safe because `yield_now` is known to resolve `Ready` on its
+    /// very next poll. A production change that swapped it for
+    /// something needing a real external wakeup to advance — a timer,
+    /// or another task (the token included, since it's fired from
+    /// one) — would make every poll here return the same `Pending`
+    /// forever, and this loop would spin hot rather than fail.
+    /// `MAX_SUSPENSIONS` turns that into a fast, clean failure instead
+    /// of a CI hang: this test has no per-test timeout of its own to
+    /// fall back on.
+    #[tokio::test]
+    async fn each_empty_chunk_yields_once_before_the_next_real_item() {
+        let mut reg = StreamRegistry::new();
+        let state = register_readable(
+            &mut reg,
+            vec![
+                Bytes::new(),
+                Bytes::new(),
+                Bytes::new(),
+                Bytes::from_static(b"abc"),
+            ],
+        );
+        let cancel = never();
+        let mut buf = [0u8; 8];
+        let mut suspensions = 0;
+        let n = {
+            let mut fut = std::pin::pin!(state.read_async(&mut buf, &cancel));
+            loop {
+                match futures::poll!(fut.as_mut()) {
+                    std::task::Poll::Pending => {
+                        suspensions += 1;
+                        assert!(
+                            suspensions < MAX_SUSPENSIONS,
+                            "gave up after {MAX_SUSPENSIONS} suspensions with no result — \
+                             yield_now (or whatever replaced it) no longer resolves on \
+                             its own next poll"
+                        );
+                    }
+                    std::task::Poll::Ready(n) => break n,
+                }
+            }
+        };
+        assert_eq!(n, 3);
+        assert_eq!(&buf[..3], b"abc");
+        assert!(
+            suspensions >= 3,
+            "expected at least one suspension per empty chunk, got {suspensions}"
+        );
+    }
+
+    /// The shared registry entry point passes the token through, so
+    /// the short entry itself is covered by name.
+    #[tokio::test]
+    async fn read_async_shared_passes_the_token() {
+        let reg: SharedStreamRegistry = Default::default();
+        let (_tx, rx) = futures::channel::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+        let id = {
+            let mut reg = lock_shared(&reg);
+            reg.register_readable("application/octet-stream", Box::pin(rx))
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            read_async_shared(&reg, id, &mut buf, &cancel).await,
+            STREAM_CANCELLED
         );
     }
 
@@ -1573,7 +2057,10 @@ mod tests {
             Box::pin(futures::stream::iter(vec![Err(std::io::Error::other(""))]));
         let id = reg.register_readable("application/octet-stream", source);
         let state = reg.get(id).unwrap();
-        assert_eq!(state.read_async(&mut [0u8; 8]).await, STREAM_IO_ERROR);
+        assert_eq!(
+            state.read_async(&mut [0u8; 8], &never()).await,
+            STREAM_IO_ERROR
+        );
         assert_eq!(state.last_error().as_deref(), Some(EMPTY_ERROR_TEXT));
     }
 
@@ -1592,7 +2079,10 @@ mod tests {
         )]));
         let id = reg.register_readable("application/octet-stream", source);
         let state = reg.get(id).unwrap();
-        assert_eq!(state.read_async(&mut [0u8; 8]).await, STREAM_IO_ERROR);
+        assert_eq!(
+            state.read_async(&mut [0u8; 8], &never()).await,
+            STREAM_IO_ERROR
+        );
         let kept = state.last_error().expect("recorded");
         assert!(
             kept.len() <= MAX_LAST_ERROR_BYTES,
@@ -1643,15 +2133,15 @@ mod tests {
         let id = reg.register_readable("application/octet-stream", source);
         let state = reg.get(id).unwrap();
         let mut buf = [0u8; 8];
-        assert_eq!(state.read_async(&mut buf).await, STREAM_IO_ERROR);
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_IO_ERROR);
         assert_eq!(state.last_error().as_deref(), Some("first"));
-        assert_eq!(state.read_async(&mut buf).await, 2);
+        assert_eq!(state.read_async(&mut buf, &never()).await, 2);
         assert_eq!(
             state.last_error().as_deref(),
             Some("first"),
             "a clean read keeps it"
         );
-        assert_eq!(state.read_async(&mut buf).await, STREAM_IO_ERROR);
+        assert_eq!(state.read_async(&mut buf, &never()).await, STREAM_IO_ERROR);
         assert_eq!(state.last_error().as_deref(), Some("second"));
     }
 
@@ -1671,9 +2161,9 @@ mod tests {
         };
         for branch in branches {
             let mut buf = [0u8; 8];
-            assert_eq!(read_async_shared(&reg, branch, &mut buf).await, 2);
+            assert_eq!(read_async_shared(&reg, branch, &mut buf, &never()).await, 2);
             assert_eq!(
-                read_async_shared(&reg, branch, &mut buf).await,
+                read_async_shared(&reg, branch, &mut buf, &never()).await,
                 STREAM_IO_ERROR
             );
             let state = lock_shared(&reg).get(branch).unwrap();

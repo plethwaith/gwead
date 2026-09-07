@@ -55,17 +55,19 @@ pub(super) struct ScriptRuntimeStoreData {
     /// cancellation surface.
     pub(super) cancel: tokio_util::sync::CancellationToken,
     /// Whether a host import has told the guest its step was
-    /// cancelled. Exactly three imports set it: `is_cancelled`
-    /// answering 1, a `stream_write` returning `STREAM_CANCELLED`, and
-    /// `host_invoke` failing because the callee stopped on this step's
-    /// fired token. A callee's own deadline under a quiet token is the
-    /// callee's failure and sets nothing; under a fired token it is
-    /// counted as a telling, the deadline being the same event seen
-    /// one level down. A streaming callee stopped by the token reaches
-    /// the guest through `stream_read`, as EOF or as an error item at
-    /// the end of an inherited budget; neither is a telling, so
-    /// `host_invoke_streaming` and `stream_read` never set it. A guest
-    /// has no typed cancellation
+    /// cancelled. Exactly four imports set it: `is_cancelled`
+    /// answering 1, a `stream_write` or `stream_read` returning
+    /// `STREAM_CANCELLED`, and `host_invoke` failing because the
+    /// callee stopped on this step's fired token. A callee's own
+    /// deadline under a quiet token is the callee's failure and sets
+    /// nothing; under a fired token it is counted as a telling, the
+    /// deadline being the same event seen one level down. A streaming
+    /// callee stopped by the token reaches the guest through
+    /// `stream_read`: a read parked when the token fires is released
+    /// as `STREAM_CANCELLED` and is a telling; a stream that had
+    /// already ended by the time the guest read it is `STREAM_EOF` or
+    /// an error item and is not. `host_invoke_streaming` itself never
+    /// sets the flag. A guest has no typed cancellation
     /// of its own, so `step_script` reads a script error from a guest
     /// that was told as the cancellation surfacing through the guest's
     /// error idiom — and only then; a guest that was never told keeps

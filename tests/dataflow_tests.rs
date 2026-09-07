@@ -150,6 +150,66 @@ fn dataflow_producer<'a>(
     })
 }
 
+/// Long-running producer that stays open and quiet after its prelude:
+/// writes `prelude_chunks` chunks of 8 bytes (through
+/// `write_async_shared` with the token, so a consumer racing its read
+/// against the same token has provably started on the right handle
+/// before the stall), then holds — `tokio::time::sleep(hold_ms)`,
+/// deliberately **not** raced against the token, because this fixture
+/// exists to be a source that stays open and quiet after the step is
+/// cancelled — then closes the writable. The scheduler does not abort
+/// step tasks on cancel, so a downstream reader parked on this
+/// producer's stream stays parked for the whole `hold_ms`, whatever
+/// the token does.
+///
+/// Params:
+/// - `prelude_chunks` (u64, default 1) — 8-byte chunks written before
+///   the stall
+/// - `hold_ms` (u64, default 1500) — how long the writable stays open
+///   and quiet before it closes
+fn dataflow_stalled_producer<'a>(
+    ex: &'a mut (dyn PluginExecution + Send),
+    params: &'a Value,
+) -> Pin<Box<dyn Future<Output = Result<StepOutput, StepError>> + Send + 'a>> {
+    Box::pin(async move {
+        let prelude_chunks = params
+            .get("prelude_chunks")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1);
+        let hold_ms = params
+            .get("hold_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1500);
+        let step_id = ex.current_step_id().to_string();
+        let writable: StreamId = match ex.dataflow_outputs().get(&step_id).copied() {
+            Some(id) => id,
+            None => {
+                return Err(StepError::Failed(format!(
+                    "dataflow_stalled_producer: no pre-provisioned writable for '{step_id}'"
+                )));
+            }
+        };
+        let streams_arc = ex.streams().clone();
+        let cancel = ex.cancel_token();
+        for _ in 0..prelude_chunks {
+            let n = streams::write_async_shared(&streams_arc, writable, &[0u8; 8], &cancel).await;
+            if n < 0 {
+                streams::lock_shared(&streams_arc).close_handle(writable);
+                return Ok(StepOutput::from(json!({
+                    "held_ms": 0,
+                    "cancelled": cancel.is_cancelled(),
+                })));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(hold_ms)).await;
+        streams::lock_shared(&streams_arc).close_handle(writable);
+        Ok(StepOutput::from(json!({
+            "held_ms": hold_ms,
+            "cancelled": cancel.is_cancelled(),
+        })))
+    })
+}
+
 /// Variant of `dataflow_producer` that also emits `StepProgress`
 /// telemetry every chunk so tests can assert the
 /// sidechannel actually carries step-body-emitted events.
@@ -233,12 +293,20 @@ fn dataflow_consumer<'a>(
         let mut total_bytes: u64 = 0;
         let mut chunks: u64 = 0;
         let mut first_byte: Option<u8> = None;
+        let mut stopped_on: Option<i32> = None;
         loop {
             if cancel.is_cancelled() {
                 break;
             }
-            let n = streams::read_async_shared(&streams_arc, handle, &mut buf).await;
+            let n = streams::read_async_shared(&streams_arc, handle, &mut buf, &cancel).await;
             if n == STREAM_EOF {
+                break;
+            }
+            if n == streams::STREAM_CANCELLED {
+                // A parked read released by the token: winding down,
+                // not a failure — mirrors how a released write is
+                // reported by the producer side.
+                stopped_on = Some(n);
                 break;
             }
             if n < 0 {
@@ -264,6 +332,7 @@ fn dataflow_consumer<'a>(
             "chunks": chunks,
             "first_byte": first_byte.map(|b| b as u64),
             "cancelled": cancel.is_cancelled(),
+            "stopped_on": stopped_on,
         })))
     })
 }
@@ -308,23 +377,31 @@ fn seed_dataflow_test_impls(table: &mut gwead::kernel::native_impls::NativeStepI
     table
         .insert("test.test_dataflow_fixture.panicker", dataflow_panicker)
         .expect("no collision on fresh table");
+    table
+        .insert(
+            "test.test_dataflow_fixture.stalled_producer",
+            dataflow_stalled_producer,
+        )
+        .expect("no collision on fresh table");
 }
 
 const DATAFLOW_TEST_FIXTURE_MANIFEST: &str = r#"{
     "name": "test_dataflow_fixture",
     "version": "0.0.0",
-    "description": "Wires the four dataflow_tests step bodies (producer, producer_with_progress, consumer, panicker) for the streaming/dataflow scheduler tests.",
+    "description": "Wires the five dataflow_tests step bodies (producer, producer_with_progress, consumer, panicker, stalled_producer) for the streaming/dataflow scheduler tests.",
     "stepTypeDefs": [
         {"name": "test_dataflow_fixture.dataflow_producer",               "freelyUsable": true},
         {"name": "test_dataflow_fixture.dataflow_producer_with_progress", "freelyUsable": true},
         {"name": "test_dataflow_fixture.dataflow_consumer",               "freelyUsable": true},
-        {"name": "test_dataflow_fixture.dataflow_panicker",               "freelyUsable": true}
+        {"name": "test_dataflow_fixture.dataflow_panicker",               "freelyUsable": true},
+        {"name": "test_dataflow_fixture.dataflow_stalled_producer",       "freelyUsable": true}
     ],
     "stepTypeImpls": [
         {"stepType": "test_dataflow_fixture.dataflow_producer",               "kind": "native", "implRef": "test.test_dataflow_fixture.producer"},
         {"stepType": "test_dataflow_fixture.dataflow_producer_with_progress", "kind": "native", "implRef": "test.test_dataflow_fixture.producer_with_progress"},
         {"stepType": "test_dataflow_fixture.dataflow_consumer",               "kind": "native", "implRef": "test.test_dataflow_fixture.consumer"},
-        {"stepType": "test_dataflow_fixture.dataflow_panicker",               "kind": "native", "implRef": "test.test_dataflow_fixture.panicker"}
+        {"stepType": "test_dataflow_fixture.dataflow_panicker",               "kind": "native", "implRef": "test.test_dataflow_fixture.panicker"},
+        {"stepType": "test_dataflow_fixture.dataflow_stalled_producer",       "kind": "native", "implRef": "test.test_dataflow_fixture.stalled_producer"}
     ]
 }"#;
 
@@ -1404,6 +1481,34 @@ fn kernel_with_relay(kernel: Kernel, step_type: &str, params: Value) -> Arc<Kern
     kernel_with_relay_under(kernel, step_type, params, None)
 }
 
+/// [`kernel_with_relay_under`] for the [`GUEST_STEP`] guest, plus a
+/// second dataflow action, `stall`, whose one long-running step holds
+/// its writable open and quiet for 1500 ms — see
+/// [`dataflow_stalled_producer`]. Plugin `p` invoking its own `stall`
+/// needs no grant. `relay`'s script step stays long-running, so
+/// [`relay_unread`] works unchanged.
+fn kernel_with_relay_and_stall(
+    kernel: Kernel,
+    params: Value,
+    wallclock_ms: Option<u64>,
+) -> Arc<Kernel> {
+    let mut k = kernel;
+    let mut actions = IndexMap::new();
+    let mut relay = dataflow_action(vec![long_running_step("producer", GUEST_STEP, params)]);
+    relay.wallclock_timeout_ms = wallclock_ms;
+    actions.insert("relay".to_string(), relay);
+    actions.insert(
+        "stall".to_string(),
+        dataflow_action(vec![long_running_step(
+            "hold",
+            "test_dataflow_fixture.dataflow_stalled_producer",
+            json!({ "hold_ms": 1500 }),
+        )]),
+    );
+    k.register_plugin(simple_manifest("p", actions)).unwrap();
+    k.into_arc()
+}
+
 /// How a stalled relay is brought to an end.
 enum Stall {
     /// Give the producer time to fill the channel and park, then
@@ -1597,5 +1702,158 @@ async fn a_guest_that_raises_under_the_wallclock_deadline_reports_the_deadline()
     assert!(
         producer_completed(&events),
         "the guest raised on its own, not dropped at the grace: {events:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Read-cancel backstop: racing a parked `stream_read` against the
+// step's cancellation token, mirroring the write-side races above.
+// ---------------------------------------------------------------------------
+
+/// A native (non-wasm) consumer parked in `read_async_shared` on a
+/// source that stays open and quiet after the step's own cancel:
+/// `dataflow_stalled_producer` deliberately does not race its hold
+/// against the token, and the scheduler does not abort step tasks on
+/// cancel, so the source is still open and quiet when the consumer's
+/// read parks. Cancelling the pipeline releases the read: the
+/// consumer reports `STREAM_CANCELLED`, having already read the
+/// prelude the producer wrote before it stalled.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_releases_a_native_consumer_parked_on_a_stalled_source() {
+    let mut kernel = boot_kernel();
+    let action = dataflow_action(vec![
+        long_running_step(
+            "producer",
+            "test_dataflow_fixture.dataflow_stalled_producer",
+            json!({ "hold_ms": 1500 }),
+        ),
+        step_deps(
+            "consumer",
+            "test_dataflow_fixture.dataflow_consumer",
+            json!({ "source": "producer" }),
+            &["producer"],
+        ),
+    ]);
+    let mut actions = IndexMap::new();
+    actions.insert("relay".to_string(), action);
+    kernel
+        .register_plugin(simple_manifest("p", actions))
+        .unwrap();
+    let kernel = kernel.into_arc();
+
+    let handle = kernel
+        .execute("p", "relay", json!({}))
+        .with_config(&json!({}))
+        .with_exec_ctx(gwead::kernel::ExecutionContext::default())
+        .into_dataflow_handle()
+        .expect("handle");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    handle.cancel();
+    let action_result = tokio::time::timeout(Duration::from_secs(5), handle.result)
+        .await
+        .expect("the parked read is released and the pipeline ends")
+        .expect("delivered")
+        .expect("ok");
+
+    let consumer = &action_result.step_results["consumer"];
+    assert_eq!(
+        consumer["stopped_on"],
+        json!(streams::STREAM_CANCELLED),
+        "the parked read was released by the token"
+    );
+    assert_eq!(
+        consumer["total_bytes"],
+        json!(8),
+        "it read the prelude, then parked"
+    );
+}
+
+/// The same stall with a real wasm guest: a relay guest invokes
+/// `p.stall` through `host_invoke_streaming` and loops on the
+/// `stream_read` import, parking once `stall`'s one step has written
+/// its prelude and gone quiet. Cancelling the handle releases the
+/// import with `STREAM_CANCELLED`, which the guest reports as its
+/// result — the code a relay guest keys its shutdown on.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_releases_a_wasm_guest_parked_in_stream_read() {
+    let kernel = kernel_with_relay_and_stall(
+        boot_kernel_with(
+            gwead::kernel::RuntimeLimits::default(),
+            common::script_runtime_mock::build_read_until_refused_wasm_bytes(
+                common::script_runtime_mock::OnCancelled::ReturnResult,
+            ),
+        ),
+        guest_params("-- reads until refused"),
+        None,
+    );
+    let (result, _) = relay_unread(&kernel, Stall::Cancel).await;
+    let action_result = result.expect("ok");
+    assert_eq!(
+        action_result.step_results["producer"],
+        json!("cancelled"),
+        "the guest's parked read returned STREAM_CANCELLED"
+    );
+}
+
+/// A binding that raises on `STREAM_CANCELLED` instead of letting its
+/// script return: the guest has no typed cancellation of its own, so
+/// the host reads an error from a guest its released read told of the
+/// cancel as the cancel — the #17 end-to-end case. The pipeline winds
+/// down as it does for a guest that returned — `Ok`, not a step
+/// failure carrying the guest's own error text.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guest_that_raises_on_a_released_read_is_winding_down_not_failing() {
+    let kernel = kernel_with_relay_and_stall(
+        boot_kernel_with(
+            gwead::kernel::RuntimeLimits::default(),
+            common::script_runtime_mock::build_read_until_refused_wasm_bytes(
+                common::script_runtime_mock::OnCancelled::RaiseError,
+            ),
+        ),
+        guest_params("-- raises when refused"),
+        None,
+    );
+    let (result, _) = relay_unread(&kernel, Stall::Cancel).await;
+    let action_result = match result {
+        Ok(r) => r,
+        Err(e) => panic!("a guest error after the cancel is the cancel, not a failure: {e}"),
+    };
+    assert!(
+        action_result.step_results.get("producer").is_none(),
+        "a step that wound down on the cancel recorded no result — the \
+         guest did not merely return under some other code: {:?}",
+        action_result.step_results
+    );
+}
+
+/// The wallclock watchdog fires the same token, releasing a wasm guest
+/// parked in `stream_read`. Unlike the write side, the code the guest
+/// actually sees is not asserted here: the streamed callee inherits
+/// the parent's deadline too, so at that instant the reader's token
+/// release races the error item the callee's own watchdog records at
+/// the end of its inherited budget, and either path ends the pipeline
+/// the same way — this is the residual untold window the read-cancel
+/// backstop documents rather than closes.
+#[tokio::test(flavor = "multi_thread")]
+async fn wallclock_deadline_releases_a_wasm_guest_parked_in_stream_read() {
+    let kernel = kernel_with_relay_and_stall(
+        boot_kernel_with(
+            gwead::kernel::RuntimeLimits::default(),
+            common::script_runtime_mock::build_read_until_refused_wasm_bytes(
+                common::script_runtime_mock::OnCancelled::ReturnResult,
+            ),
+        ),
+        guest_params("-- reads until refused"),
+        Some(150),
+    );
+    let (result, events) = relay_unread(&kernel, Stall::WaitForDeadline).await;
+    assert!(
+        matches!(result, Err(KernelError::ExecutionTimeout { .. })),
+        "the release is reported as the deadline: {result:?}"
+    );
+    assert!(
+        producer_completed(&events),
+        "the guest returned on its own, not dropped at the grace: {events:?}"
     );
 }

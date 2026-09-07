@@ -147,11 +147,14 @@ of the same handle; see `read_async_shared` in
 1. Bounds-check `buf_ptr .. buf_ptr + buf_len` against linear memory
    → `STREAM_OOB` on overrun.
 2. If the leftover cursor is empty, swap the source out of the
-   registry entry and `source.next().await` with the lock released,
-   skipping any empty `Bytes` chunks (an empty chunk is never reported
-   as EOF or as a zero-length read), then put the source back. `None`
-   from the source returns `STREAM_EOF`; `Err` returns
-   `STREAM_IO_ERROR`.
+   registry entry and `source.next().await` — **raced against the
+   step's cancellation token** — with the lock released, skipping any
+   empty `Bytes` chunks (an empty chunk is never reported as EOF or as
+   a zero-length read), then put the source back. `None` from the
+   source returns `STREAM_EOF`; `Err` returns `STREAM_IO_ERROR`; if
+   the token fires while the source has not yet yielded, the read
+   returns `STREAM_CANCELLED`, nothing is copied, and the source is
+   put back exactly as it was.
 3. Copy `min(buf_len, leftover.len())` bytes into `buf_ptr`.
 4. Advance the cursor: `leftover = Some(chunk.slice(n..))` if bytes
    remain; otherwise `None`.
@@ -161,6 +164,14 @@ The leftover cursor is what keeps the host-side zero-copy invariant:
 a 64 KiB network chunk backs up to 16 × 4 KiB wasm reads by handing
 out refcounted `Bytes::slice` views — the underlying allocation is
 never duplicated.
+
+A pull that has to wait is raced against the step's cancellation
+token — the one `is_cancelled` reports, which the wallclock watchdog
+also fires. Only the wait is released: the source is polled first, so
+a chunk already pulled or ready, an error item, or the end of the
+source is reported whatever the token says, and only a source that
+has to wait falls through to the token. A guest that sees
+`STREAM_CANCELLED` should stop reading and return.
 
 ### `stream_write`
 
@@ -199,10 +210,10 @@ import).
 ### `stream_last_error`
 
 The text behind the last `STREAM_IO_ERROR` or `STREAM_CANCELLED` the
-handle returned: for a read, the source's own error (a streaming
-callee's is `"<plugin>.<action> failed: <error>"`, where the error
-part reads `… panicked: …` when the callee panicked); for a write,
-why it was released. Copies up to `buf_len` bytes
+handle returned: for a failed read, the source's own error (a
+streaming callee's is `"<plugin>.<action> failed: <error>"`, where the
+error part reads `… panicked: …` when the callee panicked); for a
+released read or write, why it was released. Copies up to `buf_len` bytes
 of it into linear memory at `buf_ptr` and returns the text's **full**
 byte length, so a first call with `buf_len` `0` sizes the buffer and
 a second call fills it. Returns `0` when the handle has recorded
@@ -247,7 +258,7 @@ and for a streaming callee it is what correlates the callee's own
 | `-4` | `STREAM_CLOSED` | Handle closed via `stream_close`, or (on write) the paired consumer has gone away. |
 | `-5` | `STREAM_IO_ERROR` | Readable source returned an I/O error (its text is kept for `stream_last_error`), or the guest exports no `memory`. |
 | `-6` | `STREAM_OOB` | `buf_ptr + buf_len` exceeded linear memory (or `buf_len` was negative). Checked before the handle is looked up and before any byte is copied — for `stream_last_error`, on a size probe with nothing recorded too. |
-| `-7` | `STREAM_CANCELLED` | A write waiting for room on a full channel was released by the step's cancellation token (caller cancel or wallclock deadline). Nothing was committed. A text saying so is kept for `stream_last_error`. |
+| `-7` | `STREAM_CANCELLED` | A wait was released by the step's cancellation token (caller cancel or wallclock deadline): a write waiting for room on a full channel, or a read waiting on a source that had not yielded. Nothing was committed and the source is untouched. A text saying which is kept for `stream_last_error`. |
 
 Defined in [`streams.rs`](streams.rs). Any guest-side binding, ABI
 doc, or host function impl must reference these constants by name to
@@ -281,33 +292,42 @@ illustration, a Lua runtime module might expose the three calls under
 `io.stream.*`:
 
 ```lua
-local chunk = io.stream.read(handle, 4096)     -- string | nil (EOF)
+local chunk = io.stream.read(handle, 4096)     -- string | nil (EOF) | false (cancelled)
 io.stream.write(handle, chunk)                 -- bytes committed | false (cancelled)
 io.stream.close(handle)
 ```
 
-A binding like this would raise a language-level error on any
-non-EOF negative code from `read` and any negative code from `write`
-other than `STREAM_CANCELLED` — with the text `stream_last_error`
-hands back as the error's message when the code is
-`STREAM_IO_ERROR`, so a relay's error says what its upstream said
-rather than only that it failed — leaving the guest's usual
-error-recovery idiom (`pcall` in Lua) to plugins that want to treat
-failures non-fatally. `STREAM_CANCELLED` is not a failure: it is the
-step's own cancel reaching a parked write, the same fact
-`is_cancelled` reports, and a binding should surface it the same way
-— `write` returning `false`, say, so the script stops producing and
-returns normally. A guest has no typed cancellation of its own; a
-script error raised after the step's token has fired is reported by
-the host as the cancellation rather than as a failure — provided a
-host import told the guest about the cancel first (a write returning
-`STREAM_CANCELLED`, `is_cancelled` answering 1, or a plain invoke
-whose callee was stopped by the step's token — a streaming callee's
-stop arrives through `stream_read`, as EOF or as an error item,
-untold either way); a guest that was never told keeps its own
-failure. So a binding that does raise on the code still
-winds down correctly, but the guest's own error text is then only
-logged.
+A binding like this would raise a language-level error on any negative
+code from `read` other than `STREAM_EOF` and `STREAM_CANCELLED`,
+and any negative code from `write` other than `STREAM_CANCELLED`
+— with the text `stream_last_error` hands back as the error's
+message when the code is `STREAM_IO_ERROR`, so a relay's error says
+what its upstream said rather than only that it failed — leaving
+the guest's usual error-recovery idiom (`pcall` in Lua) to plugins
+that want to treat failures non-fatally. `STREAM_CANCELLED` is not a
+failure: it is the step's own cancel reaching a parked read or write,
+the same fact `is_cancelled` reports, and a binding should surface
+it the same way — `read` and `write` both returning `false`,
+say, so the script stops and returns normally. `read`'s `false`
+is deliberately distinct from its `nil`: `nil` is `STREAM_EOF` (the
+source is exhausted), `false` is `STREAM_CANCELLED` (the wait was
+released, the source is untouched) — a script that treats them
+alike would stop identically either way, but a relay forwarding
+the distinction upstream needs to tell them apart. A guest has
+no typed cancellation of its own; a script error raised after the
+step's token has fired is reported by the host as the cancellation
+rather than as a failure — provided a host import told the guest
+about the cancel first (a read or write returning `STREAM_CANCELLED`,
+`is_cancelled` answering 1, or a plain invoke whose callee was stopped
+by the step's token). A streaming callee's own stop arrives through
+`stream_read`: a read parked when the token fires is released as
+`STREAM_CANCELLED` and is a telling; a stream that had already ended
+by the time the guest read it is `STREAM_EOF` or an error item, and
+tells nothing — so a relay that does work between reads should
+still poll `is_cancelled` after a short stream before raising. A
+guest that was never told keeps its own failure. So a binding that
+does raise on the code still winds down correctly, but the guest's
+own error text is then only logged.
 
 ## Example: a streaming HTTP step (embedder-provided)
 
