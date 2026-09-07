@@ -855,22 +855,34 @@ impl StreamState {
             // chunks are legal — a chunked HTTP body can produce one —
             // so they are consumed and ignored here.
             //
-            // A realistic source eventually goes `Pending` between
-            // items — that's a genuine suspension point, so the task
-            // is off the executor while it waits — but nothing here
-            // guarantees that: a source that always has another empty
-            // chunk ready would let `select!`'s `biased` ordering keep
-            // picking it forever, same as an always-ready source of
-            // *real* chunks would (the design this loop shares with
-            // `write_async`: a source that never has to wait never
-            // falls through to the token). The difference is that a
-            // real chunk ends the call in one step; an all-empty
-            // source loops here indefinitely with nothing to show the
-            // caller. `yield_now` after each empty chunk keeps that
-            // loop cooperative — it hands the executor back so other
-            // tasks (including whatever would eventually stop feeding
-            // this one) keep running — without changing which side of
-            // the race wins.
+            // A source with nothing queued goes `Pending` on its own —
+            // a genuine suspension point, so the task is off the
+            // executor while it waits — but a source with several
+            // empty chunks queued back to back resolves `Ready` on
+            // every one of them, and `select!`'s `biased` ordering
+            // picks a ready `source.next()` over the token every
+            // time (the design this loop shares with `write_async`:
+            // a source that never has to wait never falls through to
+            // the token). For a *real* chunk that costs nothing — one
+            // ends the call right there — but an all-empty run costs
+            // one more loop iteration per chunk, and a source that
+            // never stops offering one would loop here forever with
+            // nothing to show the caller. `yield_now` after each empty
+            // chunk keeps that loop cooperative: it hands control back
+            // to the executor once per chunk without changing which
+            // side of the race wins, so other tasks keep running, and
+            // — because dropping this future at all requires the
+            // executor to get control back first — a caller racing
+            // this call against a hard deadline (`run_with_wallclock_
+            // timeout`'s drop-after-grace, or a `JoinSet` abort, both
+            // of which land only at a suspension point) can still cut
+            // it off. Nothing here promises that on its own: an
+            // uncapped action, or an embedder calling
+            // `read_async_shared` outside the kernel entirely, has no
+            // such deadline to land on, and a purely synchronous
+            // source that never has to wait is defined to keep
+            // winning the race against `cancel`, same as a real
+            // chunk would.
             loop {
                 // The source is polled first, every poll: a chunk, an
                 // error item, or an end that is already there is
@@ -1782,7 +1794,14 @@ mod tests {
 
     /// Same, with the source ending right behind the empty chunk
     /// instead of yielding real content: `STREAM_EOF` still wins over
-    /// the fired token, and it's sticky.
+    /// the fired token. (Stickiness itself — a source put back as the
+    /// sentinel `empty()` stream rather than its own exhausted self —
+    /// is pinned separately by
+    /// `parked_read_reports_the_end_of_its_source_over_a_fired_token`,
+    /// whose unfused source would panic if read a second time without
+    /// that swap; this channel-backed source would report `STREAM_EOF`
+    /// again on its own regardless, so a second read here would not
+    /// distinguish the two.)
     #[tokio::test]
     async fn an_end_behind_a_leading_empty_chunk_still_wins_under_a_fired_token() {
         let mut reg = StreamRegistry::new();
@@ -1793,7 +1812,6 @@ mod tests {
         cancel.cancel();
 
         let mut buf = [0u8; 8];
-        assert_eq!(state.read_async(&mut buf, &cancel).await, STREAM_EOF);
         assert_eq!(state.read_async(&mut buf, &cancel).await, STREAM_EOF);
     }
 
@@ -1816,50 +1834,44 @@ mod tests {
         assert_eq!(state.last_error().as_deref(), Some("boom"));
     }
 
-    /// A source that never goes `Pending` — always immediately ready
-    /// with another empty chunk — never releases under a fired token:
-    /// by the same "ready wins" rule a source of real chunks already
-    /// has, a source that never has to wait never falls through to
-    /// the token, empty or not. That is out of scope for this
-    /// backstop to bound; what it must not do is monopolize the
-    /// executor while it spins. `yield_now` after each empty chunk
-    /// keeps the loop cooperative: a concurrent task still makes
-    /// progress while this read never returns.
+    /// Each empty chunk costs one suspension: hand-polled over three
+    /// empty chunks then a real one, under a token that never fires,
+    /// counting how many times the outer `read_async` future itself
+    /// returns `Poll::Pending`. `bytes_source`'s `stream::iter` never
+    /// goes `Pending` on its own — every item is `Ready` the instant
+    /// it's polled — so any suspension seen here can only be
+    /// `yield_now`'s. Without it the whole call would resolve to
+    /// `"abc"` in a single poll, zero suspensions; the assertion below
+    /// is what a reverted `yield_now` fails in 0.00s.
     #[tokio::test]
-    async fn a_source_that_never_goes_pending_does_not_starve_the_executor() {
+    async fn each_empty_chunk_yields_once_before_the_next_real_item() {
         let mut reg = StreamRegistry::new();
-        let source: ReadableSource = Box::pin(futures::stream::repeat_with(|| Ok(Bytes::new())));
-        let id = reg.register_readable("application/octet-stream", source);
-        let state = reg.get(id).unwrap();
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let mut buf = [0u8; 8];
-
-        let ticks = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let ticker = {
-            let ticks = ticks.clone();
-            tokio::spawn(async move {
-                for _ in 0..5 {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-            })
-        };
-
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            state.read_async(&mut buf, &cancel),
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "an always-ready source never releases, by design"
+        let state = register_readable(
+            &mut reg,
+            vec![
+                Bytes::new(),
+                Bytes::new(),
+                Bytes::new(),
+                Bytes::from_static(b"abc"),
+            ],
         );
-        ticker.await.unwrap();
-        assert_eq!(
-            ticks.load(std::sync::atomic::Ordering::SeqCst),
-            5,
-            "the ticker ran concurrently — the empty-chunk loop did not block the executor"
+        let cancel = never();
+        let mut buf = [0u8; 8];
+        let mut suspensions = 0;
+        let n = {
+            let mut fut = std::pin::pin!(state.read_async(&mut buf, &cancel));
+            loop {
+                match futures::poll!(fut.as_mut()) {
+                    std::task::Poll::Pending => suspensions += 1,
+                    std::task::Poll::Ready(n) => break n,
+                }
+            }
+        };
+        assert_eq!(n, 3);
+        assert_eq!(&buf[..3], b"abc");
+        assert!(
+            suspensions >= 3,
+            "expected at least one suspension per empty chunk, got {suspensions}"
         );
     }
 

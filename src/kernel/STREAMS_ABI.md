@@ -297,38 +297,38 @@ io.stream.write(handle, chunk)                 -- bytes committed | false (cance
 io.stream.close(handle)
 ```
 
-A binding like this would raise a language-level error on any
-negative code from `read` other than `STREAM_EOF` and
+A binding like this would raise a language-level error on
+any negative code from `read` other than `STREAM_EOF` and
 `STREAM_CANCELLED`, and any negative code from `write` other than
-`STREAM_CANCELLED` — with the text `stream_last_error`
-hands back as the error's message when the code is
-`STREAM_IO_ERROR`, so a relay's error says what its upstream said
-rather than only that it failed — leaving the guest's usual
-error-recovery idiom (`pcall` in Lua) to plugins that want to treat
-failures non-fatally. `STREAM_CANCELLED` is not a failure: it is the
-step's own cancel reaching a parked read or write, the same fact
-`is_cancelled` reports, and a binding should surface it the same way
-— `read` and `write` both returning `false`, say, so the script stops
-and returns normally. `read`'s `false` is deliberately distinct from
-its `nil`: `nil` is `STREAM_EOF` (the source is exhausted), `false` is
-`STREAM_CANCELLED` (the wait was released, the source is untouched) —
-a script that treats them alike would stop identically either way, but
-a relay forwarding the distinction upstream needs to tell them apart.
+`STREAM_CANCELLED` — with the text `stream_last_error` hands
+back as the error's message when the code is `STREAM_IO_ERROR`,
+so a relay's error says what its upstream said rather than only
+that it failed — leaving the guest's usual error-recovery
+idiom (`pcall` in Lua) to plugins that want to treat failures
+non-fatally. `STREAM_CANCELLED` is not a failure: it is the
+step's own cancel reaching a parked read or write, the same
+fact `is_cancelled` reports, and a binding should surface it
+the same way — `read` and `write` both returning `false`,
+say, so the script stops and returns normally. `read`'s `false`
+is deliberately distinct from its `nil`: `nil` is `STREAM_EOF`
+(the source is exhausted), `false` is `STREAM_CANCELLED` (the
+wait was released, the source is untouched) — a script that
+treats them alike would stop identically either way, but a relay
+forwarding the distinction upstream needs to tell them apart.
 A guest has no typed cancellation of its own; a script error raised
 after the step's token has fired is reported by the host as the
-cancellation rather than as a failure — provided a host import told
-the guest about the cancel first (a read or write returning
+cancellation rather than as a failure — provided a host import
+told the guest about the cancel first (a read or write returning
 `STREAM_CANCELLED`, `is_cancelled` answering 1, or a plain invoke
-whose callee was stopped by the step's token). A
-streaming callee's own stop arrives through `stream_read`: a read
-parked when the token fires is released as `STREAM_CANCELLED` and is
-a telling; a stream that had already ended by the time the guest read
-it is `STREAM_EOF` or an error item, and tells nothing — so a relay
-that does work between reads should still poll `is_cancelled` after a
+whose callee was stopped by the step's token). A streaming callee's
+own stop arrives through `stream_read`: a read parked when the
+token fires is released as `STREAM_CANCELLED` and is a telling;
+a stream that had already ended by the time the guest read it is
+`STREAM_EOF` or an error item, and tells nothing — so a relay that
+does work between reads should still poll `is_cancelled` after a
 short stream before raising. A guest that was never told keeps its
-own failure. So a binding that does raise on the code still
-winds down correctly, but the guest's own error text is then only
-logged.
+own failure. So a binding that does raise on the code still winds
+down correctly, but the guest's own error text is then only logged.
 
 ## Example: a streaming HTTP step (embedder-provided)
 
