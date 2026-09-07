@@ -875,19 +875,18 @@ impl StreamState {
             //
             // That suspension point is also what lets an *external*
             // deadline still cut this call off, even though `select!`
-            // itself never resolves in the token's favour here:
-            // dropping this future at all requires the executor to
-            // get control back first, so a caller racing it against a
-            // hard deadline — `run_with_wallclock_timeout`'s
-            // drop-after-grace, or a `JoinSet` abort, both of which
-            // land only at a suspension point — can still end it from
-            // outside, discarding the call rather than waiting for it
-            // to return a code. Nothing here promises even that on
-            // its own, though: an uncapped action, or an embedder
-            // calling `read_async_shared` outside the kernel
-            // entirely, has no such deadline to land on, and this
-            // function's own race keeps favouring the source for as
-            // long as it keeps answering.
+            // itself never resolves in the token's favour while the
+            // source keeps answering: dropping this future at all
+            // requires the executor to get control back first, so a
+            // caller racing it against a hard deadline —
+            // `run_with_wallclock_timeout`'s drop-after-grace, or a
+            // `JoinSet` abort, both of which land only at a
+            // suspension point — can still end it from outside,
+            // discarding the call rather than waiting for it to
+            // return a code. Nothing here promises even that on its
+            // own, though: an uncapped action, or an embedder calling
+            // `read_async_shared` outside the kernel entirely, has no
+            // such deadline to land on.
             loop {
                 // The source is polled first, every poll: a chunk, an
                 // error item, or an end that is already there is
@@ -1846,9 +1845,10 @@ mod tests {
         assert_eq!(state.last_error().as_deref(), Some("boom"));
     }
 
-    /// Bound on the hand-poll loop below, in case the empty-chunk arm
-    /// ever stops resolving `Ready` on its very next poll — see that
-    /// test's doc comment for why this is needed at all.
+    /// Bound on the hand-poll loop below, in case `yield_now` is ever
+    /// replaced by something that stops resolving `Ready` on its very
+    /// next poll — see that test's doc comment for why this is needed
+    /// at all.
     const MAX_SUSPENSIONS: u32 = 64;
 
     /// Each empty chunk costs one suspension: hand-polled over three
@@ -1861,18 +1861,19 @@ mod tests {
     /// a single poll, zero suspensions, and the `suspensions >= 3`
     /// assertion below fails instantly.
     ///
-    /// The hand-poll loop drives this future itself, so nothing here
-    /// ever hands control back to the *test's own* task the way an
-    /// `.await` on the whole call would — a `Poll::Pending` from
-    /// `read_async` just sends this loop straight around to poll it
-    /// again. That is only safe because `yield_now` is known to
-    /// resolve `Ready` on its very next poll. A production change that
-    /// swapped it for something needing a real external wakeup to
-    /// advance — a timer, another task, the token itself — would make
-    /// every poll here return the same `Pending` forever, and this
-    /// loop would spin hot rather than fail. `MAX_SUSPENSIONS` turns
-    /// that into a fast, clean failure instead of a CI hang: this test
-    /// has no per-test timeout of its own to fall back on.
+    /// The hand-poll loop drives `read_async` itself, so nothing here
+    /// ever hands control back to the *runtime* the way an `.await` on
+    /// the whole call would — a `Poll::Pending` from `read_async` just
+    /// sends this loop straight around to poll it again. That is only
+    /// safe because `yield_now` is known to resolve `Ready` on its
+    /// very next poll. A production change that swapped it for
+    /// something needing a real external wakeup to advance — a timer,
+    /// or another task (the token included, since it's fired from
+    /// one) — would make every poll here return the same `Pending`
+    /// forever, and this loop would spin hot rather than fail.
+    /// `MAX_SUSPENSIONS` turns that into a fast, clean failure instead
+    /// of a CI hang: this test has no per-test timeout of its own to
+    /// fall back on.
     #[tokio::test]
     async fn each_empty_chunk_yields_once_before_the_next_real_item() {
         let mut reg = StreamRegistry::new();
@@ -1897,7 +1898,8 @@ mod tests {
                         assert!(
                             suspensions < MAX_SUSPENSIONS,
                             "gave up after {MAX_SUSPENSIONS} suspensions with no result — \
-                             the empty-chunk arm no longer resolves on its own next poll"
+                             yield_now (or whatever replaced it) no longer resolves on \
+                             its own next poll"
                         );
                     }
                     std::task::Poll::Ready(n) => break n,
