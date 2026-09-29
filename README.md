@@ -35,6 +35,15 @@ to embedders; enforcing them is the embedder's choice.
 The crate is published as [`gwead` on crates.io](https://crates.io/crates/gwead);
 this repository is its source.
 
+## wasmtime and the MSRV
+
+Gwead runs guests on wasmtime and follows its long-term-support
+releases: it builds on wasmtime 48, an LTS line whose security fixes
+arrive as 48.0.x patches that keep the API compatible and aim to keep
+the MSRV, and Gwead takes them in patch releases. Gwead moves to the next LTS line only in a
+minor release, and raises its minimum supported Rust version (1.95,
+set by wasmtime) only then, never in a patch release.
+
 ## Documentation
 
 Crate-level architecture documentation lives in [`src/lib.rs`](src/lib.rs).

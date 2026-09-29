@@ -318,8 +318,8 @@ fn parent_state_with_deadline(
     deadline: Option<tokio::time::Instant>,
 ) -> ExecutionState {
     let parent_action: Action = serde_json::from_value(json!({ "steps": [] })).unwrap();
-    let engine = wasmtime::Engine::new(wasmtime::Config::new().consume_fuel(true))
-        .expect("engine constructs");
+    let engine =
+        wasmtime::Engine::new(&super::runtime::engine_config()).expect("engine constructs");
     ExecutionState::new(ExecutionStateParams {
         plugin_name: "test_caller".to_string(),
         step_type_access: Default::default(),
@@ -747,8 +747,8 @@ async fn trait_dispatch_role_without_kernel_back_ref_errors_cleanly() {
     // that bypass `Kernel::into_arc`.
     let parent_action: super::types::Action =
         serde_json::from_value(json!({ "steps": [] })).unwrap();
-    let engine = wasmtime::Engine::new(wasmtime::Config::new().consume_fuel(true))
-        .expect("engine constructs");
+    let engine =
+        wasmtime::Engine::new(&super::runtime::engine_config()).expect("engine constructs");
     let state = ExecutionState::new(ExecutionStateParams {
         plugin_name: "test_caller".to_string(),
         step_type_access: Default::default(),

@@ -446,6 +446,62 @@ async fn dispatch_trait_step_core(
     }
 }
 
+/// The WebAssembly features every guest engine enables, and no others.
+///
+/// This is the list documented under "Wasm features" in
+/// [`crate::kernel::abi`], and it changes only together with that
+/// documentation (`abi::tests::the_engine_enables_exactly_the_documented_wasm_features`
+/// compares the two). Each flag is spelled out rather than taken from a
+/// wasmparser preset, so a wasmtime update cannot change the set by
+/// changing what a preset contains. The component model is not in it:
+/// Gwead only compiles core modules.
+pub(crate) const WASM_FEATURES: wasmtime::WasmFeatures = wasmtime::WasmFeatures::MUTABLE_GLOBAL
+    .union(wasmtime::WasmFeatures::SATURATING_FLOAT_TO_INT)
+    .union(wasmtime::WasmFeatures::SIGN_EXTENSION)
+    .union(wasmtime::WasmFeatures::REFERENCE_TYPES)
+    .union(wasmtime::WasmFeatures::MULTI_VALUE)
+    .union(wasmtime::WasmFeatures::BULK_MEMORY)
+    .union(wasmtime::WasmFeatures::SIMD)
+    .union(wasmtime::WasmFeatures::RELAXED_SIMD)
+    .union(wasmtime::WasmFeatures::THREADS)
+    .union(wasmtime::WasmFeatures::TAIL_CALL)
+    .union(wasmtime::WasmFeatures::FLOATS)
+    .union(wasmtime::WasmFeatures::MULTI_MEMORY)
+    .union(wasmtime::WasmFeatures::EXCEPTIONS)
+    .union(wasmtime::WasmFeatures::MEMORY64)
+    .union(wasmtime::WasmFeatures::EXTENDED_CONST)
+    .union(wasmtime::WasmFeatures::FUNCTION_REFERENCES)
+    .union(wasmtime::WasmFeatures::GC)
+    .union(wasmtime::WasmFeatures::GC_TYPES);
+
+/// The wasmtime configuration of every engine the kernel builds, test
+/// engines included.
+///
+/// Fuel metering is on: guest modules — the interpreter behind a
+/// `script` step and the module behind a `wasm` step — are the only
+/// code that consumes fuel, at wasmtime's per-operation costs (see the
+/// "Fuel" section of [`crate::kernel::abi`]); host step bodies
+/// dispatched through the linker run pure Rust and are not metered. The
+/// kernel sets a per-invocation budget on each guest store via
+/// [`RuntimeLimits::fuel_budget`](crate::kernel::RuntimeLimits::fuel_budget).
+///
+/// The wasm features are exactly [`WASM_FEATURES`]. Every feature is
+/// switched off first, then the list switched on, because
+/// `Config::wasm_features` records both requests and wasmtime resolves
+/// them as `(defaults & !disabled) | enabled`: without the first call, a
+/// feature that a later wasmtime turns on by default would be enabled
+/// here silently.
+///
+/// Async support needs no call: `Config::async_support` is a deprecated
+/// no-op in wasmtime 48.
+pub(crate) fn engine_config() -> wasmtime::Config {
+    let mut config = wasmtime::Config::new();
+    config.consume_fuel(true);
+    config.wasm_features(wasmtime::WasmFeatures::all(), false);
+    config.wasm_features(WASM_FEATURES, true);
+    config
+}
+
 /// The wasmtime runtime wrapper.
 pub struct WasmRuntime {
     engine: Engine,
@@ -457,8 +513,9 @@ pub struct WasmRuntime {
 }
 
 impl WasmRuntime {
-    /// Create a new wasm runtime with the engine configured for
-    /// fuel-based instruction metering.
+    /// Create a new wasm runtime whose engine comes from
+    /// `engine_config`: fuel metering on, and only the wasm features
+    /// the `kernel::abi` docs list.
     ///
     /// The runtime starts with an empty
     /// `additional_imports` table — the five body-shaped kernel
@@ -468,19 +525,7 @@ impl WasmRuntime {
     /// `intrinsics.json`, same path any external plugin's step bodies
     /// take.
     pub fn new() -> Result<Self, KernelError> {
-        // `consume_fuel(true)` switches the engine into a mode where
-        // every wasm instruction consumes one unit of fuel from the
-        // Store. Guest modules — the interpreter behind a `script` step
-        // and the module behind a `wasm` step — are the only code that
-        // consumes fuel; host step bodies dispatched through the linker
-        // run pure Rust and aren't metered. The kernel sets a
-        // per-invocation budget on each guest store via
-        // `RuntimeLimits::fuel_budget`.
-        let mut config = wasmtime::Config::new();
-        config.consume_fuel(true);
-        // (wasmtime supports async unconditionally — `Config::async_support`
-        // is a deprecated no-op, so no explicit opt-in here.)
-        let engine = Engine::new(&config)
+        let engine = Engine::new(&engine_config())
             .map_err(|e| KernelError::Runtime(format!("Failed to construct wasm engine: {e}")))?;
         Ok(Self {
             engine,
@@ -2486,10 +2531,7 @@ mod dispatch_trait_step_tests {
         let mut action: Action = serde_json::from_value(json!({ "steps": [] })).unwrap();
         action.steps.push(step);
 
-        // wasmtime supports async unconditionally
-        // (`Config::async_support` is a deprecated no-op). We
-        // enable fuel consumption to mirror production engine config.
-        let engine = wasmtime::Engine::new(wasmtime::Config::new().consume_fuel(true)).unwrap();
+        let engine = wasmtime::Engine::new(&super::engine_config()).unwrap();
 
         ExecutionState::new(ExecutionStateParams {
             plugin_name: "test_plugin".to_string(),

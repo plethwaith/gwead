@@ -853,7 +853,8 @@ fn classify_manifest(json: &str) -> Result<ClassifiedManifest, KernelError> {
 #[non_exhaustive]
 pub struct RuntimeLimits {
     /// Wasm fuel budget per guest invocation (a `script` interpreter
-    /// run or a `wasm` step). Each instruction consumes 1 unit.
+    /// run or a `wasm` step). What a unit buys is wasmtime's to define;
+    /// see [the fuel model](crate::kernel::abi#fuel).
     /// Exhaustion fails the step: a `script` step's as
     /// [`KernelError::FuelExhausted`], a `wasm` step's as
     /// [`KernelError::Execution`] naming the cap. Default:
