@@ -39,10 +39,11 @@ this repository is its source.
 
 Gwead runs guests on wasmtime and follows its long-term-support
 releases: it builds on wasmtime 48, an LTS line whose security fixes
-arrive as 48.0.x patches that keep the API compatible and aim to keep
-the MSRV, and Gwead takes them in patch releases. Gwead moves to the next LTS line only in a
-minor release, and raises its minimum supported Rust version (1.95,
-set by wasmtime) only then, never in a patch release.
+arrive as 48.0.x patches that keep the API compatible and aim to
+keep the MSRV, and Gwead takes them in patch releases. Gwead moves
+to the next LTS line only in a minor release, and raises its minimum
+supported Rust version (1.95, set by wasmtime) only then, never in a
+patch release.
 
 ## Documentation
 

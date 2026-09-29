@@ -469,7 +469,8 @@ async fn each_listed_wasm_feature_compiles_at_registration() {
 /// Pins the "Wasm features" section of the `kernel::abi` docs: a
 /// feature outside the list is refused when the plugin registers, with
 /// the compile error naming the plugin and the module, never at run
-/// time.
+/// time. Shared memory, which those docs list under `threads`, is the
+/// exception: it registers and fails at instantiation.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wasm_feature_outside_the_list_is_refused_at_registration() {
     let cases: &[(&str, &str)] = &[
@@ -523,8 +524,8 @@ async fn assert_exhausts_a_small_budget(wat: &str) {
 
 /// Pins the "Fuel" section of the `kernel::abi` docs: fuel spent by a
 /// callee reached through `call_ref` counts against the run's budget.
-/// The function calls itself twice through `call_ref`, each followed by
-/// a plain call, over 2^17 calls in all.
+/// The function calls itself twice through `call_ref` and calls an
+/// empty function twice, over 2^17 calls in all.
 #[tokio::test(flavor = "multi_thread")]
 async fn wasm_call_ref_callee_fuel_counts_toward_the_budget() {
     assert_exhausts_a_small_budget(

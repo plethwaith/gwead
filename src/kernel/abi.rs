@@ -51,7 +51,8 @@
 //!
 //! Every engine the kernel builds enables exactly the WebAssembly
 //! features below, and no others. A module that uses any other feature
-//! fails to compile when its plugin is registered. The list is part of
+//! fails to compile when its plugin is registered, except for shared
+//! memory, which the `threads` entry describes. The list is part of
 //! the guest ABI: it changes only on purpose, in a minor release, and
 //! the release notes say so. It began as the core-wasm features wasmtime
 //! 48 enables by default. The component model is not enabled: Gwead

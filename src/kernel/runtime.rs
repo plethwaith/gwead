@@ -451,10 +451,12 @@ async fn dispatch_trait_step_core(
 /// This is the list documented under "Wasm features" in
 /// [`crate::kernel::abi`], and it changes only together with that
 /// documentation (`abi::tests::the_engine_enables_exactly_the_documented_wasm_features`
-/// compares the two). Each flag is spelled out rather than taken from a
+/// compares the two). Each flag is named here rather than taken from a
 /// wasmparser preset, so a wasmtime update cannot change the set by
-/// changing what a preset contains. The component model is not in it:
-/// Gwead only compiles core modules.
+/// changing what a preset contains. `REFERENCE_TYPES` and
+/// `BULK_MEMORY` each carry a further flag of their own
+/// (`CALL_INDIRECT_OVERLONG` and `BULK_MEMORY_OPT`). The component
+/// model is not in it: Gwead only compiles core modules.
 pub(crate) const WASM_FEATURES: wasmtime::WasmFeatures = wasmtime::WasmFeatures::MUTABLE_GLOBAL
     .union(wasmtime::WasmFeatures::SATURATING_FLOAT_TO_INT)
     .union(wasmtime::WasmFeatures::SIGN_EXTENSION)
