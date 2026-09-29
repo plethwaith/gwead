@@ -87,13 +87,12 @@
 //!
 //! Each guest run (a `script` interpreter run or a `wasm` step) gets
 //! [`RuntimeLimits::fuel_budget`](crate::kernel::RuntimeLimits::fuel_budget)
-//! units of fuel, and running out fails the step. What an operation
-//! costs is defined by wasmtime, not by Gwead, and is approximate: most
-//! instructions cost one unit and a few cost none. Costs may shift
-//! between Gwead minor releases, and a wasmtime security fix in a patch
-//! release can correct an undercount, as 48.0.3 did for `call_ref` and
-//! caught exceptions. Size a budget with headroom; do not rely on exact
-//! counts.
+//! units of fuel. What an operation costs is defined by wasmtime, not by
+//! Gwead, and is approximate: most instructions cost one unit and a few
+//! cost none. Costs may shift between Gwead minor releases, and a
+//! wasmtime security fix in a patch release can correct an undercount,
+//! as 48.0.3 did for `call_ref` and caught exceptions. Size a budget
+//! with headroom; do not rely on exact counts.
 //!
 //! Bulk operations (`memory.copy`, `memory.fill`, `memory.init`,
 //! `table.copy`, `table.fill`, `table.init`, `table.grow`, and the GC
