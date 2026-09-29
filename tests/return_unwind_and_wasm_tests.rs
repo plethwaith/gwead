@@ -379,15 +379,16 @@ fn register_wasm_module(wat: &str) -> Result<Arc<Kernel>, KernelError> {
 }
 
 /// Pins the "Wasm features" section of the `kernel::abi` docs from the
-/// guest's side: a module using each listed feature registers. A
-/// feature dropped from the engine's list turns its case into
-/// `compile failed`.
+/// guest's side: a module for each of 18 of the 20 listed features
+/// registers (`call_indirect_overlong` and `gc_types` have no case of
+/// their own). Dropping any one flag from `WASM_FEATURES` fails this
+/// test.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_listed_wasm_feature_compiles_at_registration() {
     let cases: &[(&str, &str)] = &[
         (
             "mutable_global",
-            r#"(module (global (mut i32) (i32.const 0)) (func (export "run") (global.set 0 (i32.const 1))))"#,
+            r#"(module (global (export "g") (mut i32) (i32.const 0)) (func (export "run") (global.set 0 (i32.const 1))))"#,
         ),
         (
             "saturating_float_to_int",
@@ -523,9 +524,7 @@ async fn assert_exhausts_a_small_budget(wat: &str) {
 /// Pins the "Fuel" section of the `kernel::abi` docs: fuel spent by a
 /// callee reached through `call_ref` counts against the run's budget.
 /// The function calls itself twice through `call_ref`, each followed by
-/// a plain call, over 2^17 calls in all. The plain call matters: the
-/// caller must reload the fuel counter after the `call_ref`, or its
-/// next save overwrites what the callee spent.
+/// a plain call, over 2^17 calls in all.
 #[tokio::test(flavor = "multi_thread")]
 async fn wasm_call_ref_callee_fuel_counts_toward_the_budget() {
     assert_exhausts_a_small_budget(
@@ -547,7 +546,7 @@ async fn wasm_call_ref_callee_fuel_counts_toward_the_budget() {
 /// Pins the "Fuel" section of the `kernel::abi` docs: fuel spent by a
 /// callee that throws to a `try_table` catch in its caller counts
 /// against the run's budget. The function catches two calls to itself
-/// and throws again, over 2^17 calls in all.
+/// and throws again, 2^17 - 1 calls in all.
 #[tokio::test(flavor = "multi_thread")]
 async fn wasm_caught_exception_keeps_the_throwers_fuel() {
     assert_exhausts_a_small_budget(
@@ -569,10 +568,11 @@ async fn wasm_caught_exception_keeps_the_throwers_fuel() {
 }
 
 /// Pins the "Fuel" section of the `kernel::abi` docs: a bulk operation
-/// is charged for the length it asks for before it runs, so one longer
-/// than the fuel left ends in fuel exhaustion. The same module under a
-/// budget larger than the length reaches the operation and traps out of
-/// bounds, so the length alone decides which failure a guest sees.
+/// whose length is not a small constant is checked against the fuel
+/// left before it runs, so one longer than the fuel left ends in fuel
+/// exhaustion. The same module under a budget larger than the length
+/// reaches the operation and traps out of bounds, so the length against
+/// the fuel left decides which failure a guest sees.
 #[tokio::test(flavor = "multi_thread")]
 async fn wasm_oversized_memory_fill_exhausts_fuel_rather_than_trapping() {
     let wat = r#"(module (memory 1)
@@ -608,9 +608,10 @@ async fn wasm_oversized_memory_fill_exhausts_fuel_rather_than_trapping() {
     );
 }
 
-/// Pins the "Fuel" section of the `kernel::abi` docs: `table.grow` is
-/// charged for the elements it asks for before it runs, so an oversized
-/// one ends in fuel exhaustion rather than returning `-1` to the guest.
+/// Pins the "Fuel" section of the `kernel::abi` docs: a `table.grow`
+/// whose length is not a small constant is checked against the fuel
+/// left before it runs, so an oversized one ends in fuel exhaustion
+/// rather than returning `-1` to the guest.
 #[tokio::test(flavor = "multi_thread")]
 async fn wasm_oversized_table_grow_exhausts_fuel_rather_than_returning_minus_one() {
     let wat = r#"(module (table 1 funcref)

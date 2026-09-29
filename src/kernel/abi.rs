@@ -57,11 +57,12 @@
 //! 48 enables by default. The component model is not enabled: Gwead
 //! loads core modules only.
 //!
-//! Names are wasmparser's feature names; a few (`floats`, `gc_types`,
-//! `call_indirect_overlong`, `bulk_memory_opt`) are parts of a proposal
-//! rather than proposals.
+//! Names are wasmparser's feature names; a few are not proposals:
+//! `call_indirect_overlong` and `bulk_memory_opt` are parts of one, and
+//! `floats` and `gc_types` are wasmparser switches that belong to no
+//! proposal.
 //!
-//! - `mutable_global`: mutable globals, imported and exported
+//! - `mutable_global`: importing and exporting mutable globals
 //! - `saturating_float_to_int`: the saturating `trunc_sat` conversions
 //! - `sign_extension`: `i32.extend8_s` and the other sign-extension operators
 //! - `reference_types`: several tables, and `table.get`, `table.set`, `table.grow` and `table.fill`
@@ -71,8 +72,8 @@
 //! - `bulk_memory_opt`: `memory.copy` and `memory.fill`
 //! - `simd`: 128-bit `v128` vector operations
 //! - `relaxed_simd`: the relaxed SIMD operations
-//! - `threads`: shared memories and atomic operations
-//! - `tail_call`: `return_call`, `return_call_indirect`, `return_call_ref`
+//! - `threads`: atomic operations. Shared memory is not enabled, so a module that declares a shared memory registers but fails at instantiation on every run
+//! - `tail_call`: `return_call` and `return_call_indirect`
 //! - `floats`: floating-point types and operations
 //! - `multi_memory`: more than one memory in a module
 //! - `exceptions`: tags, `throw`, `throw_ref`, and `try_table` with `catch` clauses
@@ -97,9 +98,11 @@
 //! Bulk operations (`memory.copy`, `memory.fill`, `memory.init`,
 //! `table.copy`, `table.fill`, `table.init`, `table.grow`, and the GC
 //! proposal's array operations) are charged one unit per byte or element
-//! they ask for, before they run. One that asks for more than the fuel
-//! left ends in fuel exhaustion, even where it would otherwise have
-//! trapped out of bounds or, for `table.grow`, returned `-1`.
+//! they ask for. Unless the length is a constant of at most 128, the
+//! charge is checked against the fuel left before the operation runs,
+//! and one that asks for more than is left ends in fuel exhaustion, even
+//! where it would otherwise have trapped out of bounds or, for
+//! `table.grow`, returned `-1`.
 //! `memory.grow` is not charged by the number of pages it asks for; a
 //! grow past the memory cap returns `-1`.
 //!

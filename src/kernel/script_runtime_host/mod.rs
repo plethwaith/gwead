@@ -503,10 +503,9 @@ async fn execute_in_store(
 /// charges one unit and saves the counter to the store immediately
 /// before the call, so the meter reads below the budget for anything
 /// `start` then does, however it fails. That save is load-bearing,
-/// because Cranelift does not save the counter at every instruction
-/// — only at calls, returns, `unreachable`, `throw`, and function
-/// exit — so a trap from division or a dynamically out-of-bounds load
-/// in `start` flushes nothing of `start`'s own spending, and it is
+/// because Cranelift does not save the counter before a division or a
+/// dynamically out-of-bounds load, so a trap from either in `start`
+/// flushes nothing of `start`'s own spending, and it is
 /// `module_start`'s saved unit that the gate sees in that case.
 /// Verified against wasmtime 48: `require_startup_func` in
 /// `wasmtime-environ`, `translate_module_startup`,
@@ -1598,7 +1597,7 @@ mod step_script_tests {
 
     /// The same refusal for a module that also has work for its startup
     /// function: a data segment and a global whose initialiser is a
-    /// constant expression of several operators. wasmtime charges fuel
+    /// constant expression of several operators. wasmtime can charge fuel
     /// for both when it runs the startup function, but the memory is
     /// refused before that function runs, so the meter still reads the
     /// whole budget and the failure is still the typed memory cap.
