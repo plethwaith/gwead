@@ -46,6 +46,69 @@
 //! and `gwead2` shims side by side and run a mixed fleet through one
 //! migration, which is the property the bare `"gwead"` name could never
 //! provide.
+//!
+//! ## Wasm features
+//!
+//! Every engine the kernel builds enables exactly the WebAssembly
+//! features below, and no others. A module that uses any other feature
+//! fails to compile when its plugin is registered, except for shared
+//! memory, which the `threads` entry describes. The list is part of
+//! the guest ABI: it changes only on purpose, in a minor release, and
+//! the release notes say so. It began as the core-wasm features wasmtime
+//! 48 enables by default. The component model is not enabled: Gwead
+//! loads core modules only.
+//!
+//! Names are wasmparser's feature names; a few are not proposals:
+//! `call_indirect_overlong` and `bulk_memory_opt` are parts of one, and
+//! `floats` and `gc_types` are wasmparser switches that belong to no
+//! proposal.
+//!
+//! - `mutable_global`: importing and exporting mutable globals
+//! - `saturating_float_to_int`: the saturating `trunc_sat` conversions
+//! - `sign_extension`: `i32.extend8_s` and the other sign-extension operators
+//! - `reference_types`: several tables, and `table.get`, `table.set`, `table.grow` and `table.fill`
+//! - `call_indirect_overlong`: over-long encodings of `call_indirect`'s table index
+//! - `multi_value`: functions and blocks with several results
+//! - `bulk_memory`: `memory.init`, `data.drop`, `table.init`, `table.copy`, `elem.drop`, and passive segments
+//! - `bulk_memory_opt`: `memory.copy` and `memory.fill`
+//! - `simd`: 128-bit `v128` vector operations
+//! - `relaxed_simd`: the relaxed SIMD operations
+//! - `threads`: atomic operations. Shared memory is not enabled, so a module that declares a shared memory registers but fails at instantiation on every run
+//! - `tail_call`: `return_call` and `return_call_indirect`
+//! - `floats`: floating-point types and operations
+//! - `multi_memory`: more than one memory in a module
+//! - `exceptions`: tags, `throw`, `throw_ref`, and `try_table` with `catch` clauses
+//! - `memory64`: 64-bit memories and tables, indexed by `i64`
+//! - `extended_const`: `i32.add`, `i32.sub`, `i32.mul` and their `i64` forms in constant expressions
+//! - `function_references`: typed function references, `call_ref`, `ref.as_non_null`, `br_on_null`
+//! - `gc`: struct and array types and their operations, `i31`, and `ref.cast`
+//! - `gc_types`: the garbage-collected reference types, such as `externref` and `anyref`
+//!
+//! ## Fuel
+//!
+//! Each guest run (a `script` interpreter run or a `wasm` step) gets
+//! [`RuntimeLimits::fuel_budget`](crate::kernel::RuntimeLimits::fuel_budget)
+//! units of fuel. What an operation costs is defined by wasmtime, not by
+//! Gwead, and is approximate: most instructions cost one unit and a few
+//! cost none. Costs may shift between Gwead minor releases, and a
+//! wasmtime security fix in a patch release can correct an undercount,
+//! as 48.0.3 did for `call_ref` and caught exceptions. Size a budget
+//! with headroom; do not rely on exact counts.
+//!
+//! Bulk operations (`memory.copy`, `memory.fill`, `memory.init`,
+//! `table.copy`, `table.fill`, `table.init`, `table.grow`, and the GC
+//! proposal's array operations) are charged one unit per byte or element
+//! they ask for. Unless the length is a constant of at most 128, the
+//! charge is checked against the fuel left before the operation runs,
+//! and one that asks for more than is left ends in fuel exhaustion, even
+//! where it would otherwise have trapped out of bounds or, for
+//! `table.grow`, returned `-1`.
+//! `memory.grow` is not charged by the number of pages it asks for; a
+//! grow past the memory cap returns `-1`.
+//!
+//! Instantiation can consume fuel too: the module's `start` function,
+//! and wasmtime's initialisation of its globals, tables and data
+//! segments.
 
 /// The current wasm ABI version.
 ///
@@ -70,7 +133,10 @@ pub const ABI_MODULE: &str = "gwead1";
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{ABI_MODULE, ABI_VERSION};
+    use crate::kernel::runtime::WasmRuntime;
 
     /// The module name and the version number are two encodings of one
     /// fact; a bump that touches only one of them ships a kernel whose
@@ -87,5 +153,47 @@ mod tests {
     #[test]
     fn abi_module_name_is_versioned() {
         assert_ne!(ABI_MODULE, "gwead");
+    }
+
+    /// The "Wasm features" section of the module docs is the guest ABI's
+    /// feature list. Its bullets are compared with the features the
+    /// production engine reports as enabled (`WasmRuntime::new`'s engine,
+    /// through `Config`'s `Debug` output, one `wasm_<name>: <bool>` pair
+    /// per wasmparser flag), so neither the documentation nor
+    /// `WASM_FEATURES` nor the mask in `engine_config` can change without
+    /// the other. An unparsable `Debug` format yields an empty set, which
+    /// cannot equal the documented list.
+    #[test]
+    fn the_engine_enables_exactly_the_documented_wasm_features() {
+        let runtime = WasmRuntime::new().expect("runtime constructs");
+        let debug = format!("{:?}", runtime.engine().config());
+        let enabled: BTreeSet<String> = debug
+            .trim_start_matches("Config { ")
+            .split(", ")
+            .filter_map(|pair| pair.split_once(": "))
+            .filter(|(key, value)| key.starts_with("wasm_") && *value == "true")
+            .map(|(key, _)| key.trim_start_matches("wasm_").to_string())
+            .collect();
+
+        let source = include_str!("abi.rs");
+        let start = source
+            .find("\n//! ## Wasm features\n")
+            .expect("the Wasm features section exists");
+        let section = &source[start + 1..];
+        let end = section.find("\n//! ## ").unwrap_or(section.len());
+        let documented: BTreeSet<String> = section[..end]
+            .lines()
+            .filter_map(|line| line.strip_prefix("//! - `"))
+            .filter_map(|rest| rest.split_once("`:"))
+            .map(|(name, _)| name.to_string())
+            .collect();
+
+        let only_in_engine: Vec<_> = enabled.difference(&documented).collect();
+        let only_in_docs: Vec<_> = documented.difference(&enabled).collect();
+        assert!(
+            !documented.is_empty() && only_in_engine.is_empty() && only_in_docs.is_empty(),
+            "the engine and the abi docs disagree: enabled but undocumented \
+             {only_in_engine:?}; documented but not enabled {only_in_docs:?}"
+        );
     }
 }

@@ -2,7 +2,7 @@
 name = "gwead"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.95"
 description = "Gwead — a WebAssembly plugin microkernel: a data-driven engine that loads plugin manifests and executes capability steps in sandboxed wasm."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/plethwaith/gwead"
@@ -27,12 +27,17 @@ thiserror = "2"
 tracing = "0.1"
 regex = "1"
 
-# 47.x is the lowest non-LTS line clear of RUSTSEC-2026-0222 (wasmtime,
-# cross-engine type-index confusion) and RUSTSEC-2026-0188 (wasmtime-wasi,
-# hard-link/rename FilePerms bypass), as well as RUSTSEC-2026-0149. It
-# sets the crate's MSRV: wasmtime 46+ requires Rust 1.94.
-wasmtime = "47"
-wasmtime-wasi = "47"
+# Gwead follows wasmtime's long-term-support releases. wasmtime 48 is an
+# LTS line, supported by wasmtime for 24 months from its release, and takes
+# its security fixes as 48.0.x patches that keep the API compatible and aim
+# to keep the MSRV; Gwead picks those up in patch releases. Gwead moves to
+# the next LTS line only in a minor release, and raises its MSRV only then,
+# never in a patch release.
+# 48.0.3 is the first 48.x clear of RUSTSEC-2026-0314 (wasmtime-wasi),
+# RUSTSEC-2026-0315 and RUSTSEC-2026-0316. wasmtime sets the crate's MSRV:
+# 48 requires Rust 1.95.
+wasmtime = "48.0.3"
+wasmtime-wasi = "48.0.3"
 base64 = "0.22"
 
 # JSON Schema (Draft 2020-12) validation of manifests against the published

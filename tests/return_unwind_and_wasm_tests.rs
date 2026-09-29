@@ -365,6 +365,308 @@ async fn wasm_table_grow_past_cap_is_denied() {
     );
 }
 
+/// Register one plugin holding a single module and a `wasm` step that
+/// runs it, on a kernel with default limits. Registration is where the
+/// module compiles, so a refused feature surfaces here.
+fn register_wasm_module(wat: &str) -> Result<Arc<Kernel>, KernelError> {
+    let mut k = Kernel::boot(KernelConfig::default()).expect("kernel boot");
+    k.register_plugin(wasm_manifest(
+        "p",
+        one_module("m", wat),
+        vec![step("exec", "wasm", json!({ "module": "m" }))],
+    ))?;
+    Ok(k.into_arc())
+}
+
+/// Pins the "Wasm features" section of the `kernel::abi` docs from the
+/// guest's side: a module for each of 18 of the 20 listed features
+/// registers (`call_indirect_overlong` and `gc_types` have no case of
+/// their own). Dropping any one flag from `WASM_FEATURES` fails this
+/// test.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_listed_wasm_feature_compiles_at_registration() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "mutable_global",
+            r#"(module (global (export "g") (mut i32) (i32.const 0)) (func (export "run") (global.set 0 (i32.const 1))))"#,
+        ),
+        (
+            "saturating_float_to_int",
+            r#"(module (func (export "run") (drop (i32.trunc_sat_f32_s (f32.const 1)))))"#,
+        ),
+        (
+            "sign_extension",
+            r#"(module (func (export "run") (drop (i32.extend8_s (i32.const 1)))))"#,
+        ),
+        (
+            "reference_types",
+            r#"(module (table 1 funcref) (table 1 funcref) (func (export "run") (drop (table.get 1 (i32.const 0)))))"#,
+        ),
+        (
+            "multi_value",
+            r#"(module (func $two (result i32 i32) (i32.const 1) (i32.const 2)) (func (export "run") (call $two) (drop) (drop)))"#,
+        ),
+        (
+            "bulk_memory",
+            r#"(module (memory 1) (data $d "ab") (func (export "run") (memory.init $d (i32.const 0) (i32.const 0) (i32.const 2)) (data.drop $d)))"#,
+        ),
+        (
+            "bulk_memory_opt",
+            r#"(module (memory 1) (func (export "run") (memory.fill (i32.const 0) (i32.const 0) (i32.const 1)) (memory.copy (i32.const 0) (i32.const 1) (i32.const 1))))"#,
+        ),
+        (
+            "simd",
+            r#"(module (func (export "run") (drop (i32x4.add (v128.const i32x4 0 0 0 0) (v128.const i32x4 1 1 1 1)))))"#,
+        ),
+        (
+            "relaxed_simd",
+            r#"(module (func (export "run") (drop (i32x4.relaxed_trunc_f32x4_s (v128.const f32x4 0 0 0 0)))))"#,
+        ),
+        (
+            "threads",
+            r#"(module (memory 1 1 shared) (func (export "run") (drop (i32.atomic.load (i32.const 0)))))"#,
+        ),
+        (
+            "tail_call",
+            r#"(module (func $g) (func (export "run") (return_call $g)))"#,
+        ),
+        (
+            "floats",
+            r#"(module (func (export "run") (drop (f64.add (f64.const 1) (f64.const 2)))))"#,
+        ),
+        (
+            "multi_memory",
+            r#"(module (memory 1) (memory 1) (func (export "run") (drop (i32.load 1 (i32.const 0)))))"#,
+        ),
+        (
+            "exceptions",
+            r#"(module (tag $e) (func (export "run") (block $c (try_table (catch $e $c) (throw $e)))))"#,
+        ),
+        (
+            "memory64",
+            r#"(module (memory i64 1) (func (export "run") (drop (i32.load (i64.const 0)))))"#,
+        ),
+        (
+            "extended_const",
+            r#"(module (global i32 (i32.add (i32.const 1) (i32.const 2))) (func (export "run")))"#,
+        ),
+        (
+            "function_references",
+            r#"(module (type $t (func)) (func $f) (elem declare func $f) (func (export "run") (call_ref $t (ref.func $f))))"#,
+        ),
+        (
+            "gc",
+            r#"(module (type $s (struct (field i32))) (func (export "run") (drop (struct.new $s (i32.const 1)))))"#,
+        ),
+    ];
+    for (feature, wat) in cases {
+        if let Err(e) = register_wasm_module(wat) {
+            panic!("a module using `{feature}` must register: {e}");
+        }
+    }
+}
+
+/// Pins the "Wasm features" section of the `kernel::abi` docs: a
+/// feature outside the list is refused when the plugin registers, with
+/// the compile error naming the plugin and the module, never at run
+/// time. Shared memory, which those docs list under `threads`, is the
+/// exception: it registers and fails at instantiation.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wasm_feature_outside_the_list_is_refused_at_registration() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "wide_arithmetic",
+            r#"(module (func (export "run") i64.const 0 i64.const 0 i64.const 0 i64.const 0 i64.add128 drop drop))"#,
+        ),
+        (
+            "custom_page_sizes",
+            r#"(module (memory 1 (pagesize 1)) (func (export "run")))"#,
+        ),
+        (
+            "legacy_exceptions",
+            r#"(module (tag $e) (func (export "run") try catch $e end))"#,
+        ),
+    ];
+    for (feature, wat) in cases {
+        match register_wasm_module(wat) {
+            Ok(_) => panic!("a module using `{feature}` must be refused at registration"),
+            Err(KernelError::Validation(msg)) => assert!(
+                msg.starts_with("Plugin 'p' wasm_module 'm': compile failed:"),
+                "`{feature}`: {msg}"
+            ),
+            Err(other) => panic!("`{feature}`: expected a validation error, got {other:?}"),
+        }
+    }
+}
+
+/// Run `wat` under a fuel budget of 100,000 units and require the run
+/// to end by exhausting it. Both callers spend on the order of a
+/// million units, an order of magnitude past the budget, but only when
+/// every callee's spending is counted.
+async fn assert_exhausts_a_small_budget(wat: &str) {
+    let kernel = boot_with_limits(
+        vec![wasm_manifest(
+            "p",
+            one_module("m", wat),
+            vec![step("exec", "wasm", json!({ "module": "m" }))],
+        )],
+        RuntimeLimits::default().with_fuel_budget(100_000),
+    );
+    let err = run(&kernel, "p")
+        .await
+        .expect_err("the callees' fuel must exhaust the budget");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exhausted its fuel budget (100000 units) during 'run'"),
+        "error should name the fuel cap and the phase: {msg}"
+    );
+}
+
+/// Pins the "Fuel" section of the `kernel::abi` docs: fuel spent by a
+/// callee reached through `call_ref` counts against the run's budget.
+/// The function calls itself twice through `call_ref` and calls an
+/// empty function twice, over 2^17 calls in all.
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_call_ref_callee_fuel_counts_toward_the_budget() {
+    assert_exhausts_a_small_budget(
+        r#"(module
+          (type $t (func (param i32)))
+          (func $noop)
+          (func $f (type $t) (param $n i32)
+            (if (i32.eqz (local.get $n)) (then (return)))
+            (call_ref $t (i32.sub (local.get $n) (i32.const 1)) (ref.func $f))
+            (call $noop)
+            (call_ref $t (i32.sub (local.get $n) (i32.const 1)) (ref.func $f))
+            (call $noop))
+          (elem declare func $f)
+          (func (export "run") (call $f (i32.const 16))))"#,
+    )
+    .await;
+}
+
+/// Pins the "Fuel" section of the `kernel::abi` docs: fuel spent by a
+/// callee that throws to a `try_table` catch in its caller counts
+/// against the run's budget. The function catches two calls to itself
+/// and throws again, 2^17 - 1 calls in all.
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_caught_exception_keeps_the_throwers_fuel() {
+    assert_exhausts_a_small_budget(
+        r#"(module
+          (tag $e)
+          (func $g (param $n i32)
+            (if (i32.eqz (local.get $n)) (then (throw $e)))
+            (block $c1
+              (try_table (catch $e $c1)
+                (call $g (i32.sub (local.get $n) (i32.const 1)))))
+            (block $c2
+              (try_table (catch $e $c2)
+                (call $g (i32.sub (local.get $n) (i32.const 1)))))
+            (throw $e))
+          (func (export "run")
+            (block $c (try_table (catch $e $c) (call $g (i32.const 16))))))"#,
+    )
+    .await;
+}
+
+/// Pins the "Fuel" section of the `kernel::abi` docs: a bulk operation
+/// whose length is not a small constant is checked against the fuel
+/// left before it runs, so one longer than the fuel left ends in fuel
+/// exhaustion. The same module under a budget larger than the length
+/// reaches the operation and traps out of bounds, so the length against
+/// the fuel left decides which failure a guest sees.
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_oversized_memory_fill_exhausts_fuel_rather_than_trapping() {
+    let wat = r#"(module (memory 1)
+        (func (export "run")
+          (memory.fill (i32.const 0) (i32.const 0) (i32.const 0x7fffffff))))"#;
+    let kernel_with = |budget: u64| {
+        boot_with_limits(
+            vec![wasm_manifest(
+                "p",
+                one_module("m", wat),
+                vec![step("exec", "wasm", json!({ "module": "m" }))],
+            )],
+            RuntimeLimits::default().with_fuel_budget(budget),
+        )
+    };
+
+    let err = run(&kernel_with(1_000_000), "p")
+        .await
+        .expect_err("the fill must exhaust the budget");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exhausted its fuel budget (1000000 units) during 'run'"),
+        "an oversized fill under a small budget is fuel exhaustion: {msg}"
+    );
+
+    let err = run(&kernel_with(10_000_000_000), "p")
+        .await
+        .expect_err("the fill must trap out of bounds");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("trapped during 'run'") && !msg.contains("fuel"),
+        "an oversized fill under a large budget is a plain trap: {msg}"
+    );
+}
+
+/// Pins the "Fuel" section of the `kernel::abi` docs: a `table.grow`
+/// whose length is not a small constant is checked against the fuel
+/// left before it runs, so an oversized one ends in fuel exhaustion
+/// rather than returning `-1` to the guest.
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_oversized_table_grow_exhausts_fuel_rather_than_returning_minus_one() {
+    let wat = r#"(module (table 1 funcref)
+        (func (export "run")
+          (if (i32.eq (table.grow (ref.null func) (i32.const 0x7fffffff)) (i32.const -1))
+            (then unreachable))))"#;
+    let kernel = boot_with_limits(
+        vec![wasm_manifest(
+            "p",
+            one_module("m", wat),
+            vec![step("exec", "wasm", json!({ "module": "m" }))],
+        )],
+        RuntimeLimits::default().with_fuel_budget(1_000_000),
+    );
+
+    let err = run(&kernel, "p")
+        .await
+        .expect_err("the grow must exhaust the budget");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exhausted its fuel budget (1000000 units) during 'run'"),
+        "an oversized table.grow is fuel exhaustion, not -1: {msg}"
+    );
+}
+
+/// Pins the "Fuel" section of the `kernel::abi` docs: `memory.grow` is
+/// not charged by the number of pages it asks for. A grow of 32,767
+/// pages under a 10,000-unit budget reaches the memory cap and returns
+/// `-1`, which the guest turns into a plain trap.
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_memory_grow_is_not_charged_by_size() {
+    let wat = r#"(module (memory 1)
+        (func (export "run")
+          (if (i32.eq (memory.grow (i32.const 0x7fff)) (i32.const -1))
+            (then unreachable))))"#;
+    let kernel = boot_with_limits(
+        vec![wasm_manifest(
+            "p",
+            one_module("m", wat),
+            vec![step("exec", "wasm", json!({ "module": "m" }))],
+        )],
+        RuntimeLimits::default().with_fuel_budget(10_000),
+    );
+
+    let err = run(&kernel, "p")
+        .await
+        .expect_err("the denied grow must trap");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("trapped during 'run'") && !msg.contains("fuel"),
+        "a grow past the cap is a plain trap, not fuel exhaustion: {msg}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Guest-supplied pointers into host imports
 // ---------------------------------------------------------------------------

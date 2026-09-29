@@ -493,22 +493,26 @@ async fn execute_in_store(
 /// "before", by a wasmtime mechanism worth naming, since a wasmtime
 /// that dropped it would reopen the gate: instantiation runs a
 /// module-startup function wasmtime synthesises (no wasm body of its
-/// own), which applies data and element segments and then calls the
-/// module's `start`. Memories are created, and a declared minimum
-/// past the cap refused, before that function runs, so a refusal
+/// own), which initialises globals, tables, and data and element
+/// segments, charging fuel for the constant expressions and segment
+/// bytes it evaluates, and then calls the module's `start`. Memories
+/// are created, and a declared minimum past the cap refused, when the
+/// instance is allocated, before that function runs, so a refusal
 /// there leaves the meter untouched. The call into `start` is
 /// hand-written in the Cranelift backend as `module_start`, which
 /// charges one unit and saves the counter to the store immediately
 /// before the call, so the meter reads below the budget for anything
 /// `start` then does, however it fails. That save is load-bearing,
-/// because Cranelift does not save the counter at every instruction
-/// — only at calls, returns, `unreachable`, and function exit — so a
-/// trap from division or a dynamically out-of-bounds load in `start`
+/// because Cranelift does not save the counter before a division or a
+/// dynamically out-of-bounds load, so a trap from either in `start`
 /// flushes nothing of `start`'s own spending, and it is
 /// `module_start`'s saved unit that the gate sees in that case.
-/// Verified against wasmtime 47: `require_startup_func` in
-/// `wasmtime-environ`, and `module_start` and `fuel_before_op` in
-/// `wasmtime-internal-cranelift`'s `func_environ.rs`.
+/// Verified against wasmtime 48: `require_startup_func` in
+/// `wasmtime-environ`, `translate_module_startup`,
+/// `translate_const_expr`, `module_initialize_memory_segment`,
+/// `module_start` and `fuel_before_op` in `wasmtime-internal-cranelift`'s
+/// `func_environ.rs`, and `allocate_memories` in `wasmtime`'s
+/// `runtime/vm/instance/allocator.rs`.
 fn classify_from_store(
     store: &wasmtime::Store<ScriptRuntimeStoreData>,
     err: &wasmtime::Error,
@@ -532,9 +536,7 @@ async fn run_guest(
     guest: Vec<u8>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> ScriptOutcome {
-    let mut config = wasmtime::Config::new();
-    config.consume_fuel(true);
-    let engine = Engine::new(&config).expect("engine");
+    let engine = Engine::new(&crate::kernel::runtime::engine_config()).expect("engine");
     let module = Module::new(&engine, &guest).expect("module compiles");
     let parent = ScriptRuntimeParentContext {
         kernel: kernel.map(std::sync::Arc::downgrade),
@@ -1384,7 +1386,7 @@ mod step_script_tests {
         cancel: tokio_util::sync::CancellationToken,
         limits: crate::kernel::RuntimeLimits,
     ) -> ExecutionState {
-        let engine = Engine::new(wasmtime::Config::new().consume_fuel(true)).expect("engine");
+        let engine = Engine::new(&crate::kernel::runtime::engine_config()).expect("engine");
         let module = Module::new(&engine, guest).expect("module compiles");
         let mut runtimes = std::collections::HashMap::new();
         runtimes.insert("lua".to_string(), std::sync::Arc::new(module));
@@ -1573,6 +1575,43 @@ mod step_script_tests {
               (memory (export "memory") 64)
               (func (export "alloc") (param i32) (result i32) (i32.const 0))
               (func (export "execute") (param i32 i32 i32 i32) (result i32) (i32.const 1))
+            )
+        "#;
+        let guest = wat::parse_str(wat).expect("wat parses");
+        let limits = crate::kernel::RuntimeLimits::default().with_max_memory_bytes(CAP);
+        let mut state = state(guest, tokio_util::sync::CancellationToken::new(), limits);
+        let result = run(&mut state).await;
+        assert!(
+            matches!(&result, Err(StepError::Failed(text))
+                if text == "MemoryLimitExceeded: wasm linear memory exceeded 1048576 bytes (at instantiate)"),
+            "{result:?}"
+        );
+        assert!(
+            matches!(&state.resource_violation,
+                Some(ResourceViolation::MemoryLimit { bytes: CAP, detail })
+                    if detail == "step '': memory minimum size of 64 pages exceeds memory limits"),
+            "{:?}",
+            state.resource_violation
+        );
+    }
+
+    /// The same refusal for a module that also has work for its startup
+    /// function: a data segment and a global whose initialiser is a
+    /// constant expression of several operators. wasmtime can charge fuel
+    /// for both when it runs the startup function, but the memory is
+    /// refused before that function runs, so the meter still reads the
+    /// whole budget and the failure is still the typed memory cap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_declared_minimum_past_the_cap_is_the_memory_cap_with_segments_to_initialise() {
+        const CAP: usize = 1024 * 1024;
+        let wat = r#"
+            (module
+              (memory (export "memory") 64)
+              (data (i32.const 0) "segment bytes wasmtime copies at startup")
+              (global $computed (mut i32) (i32.add (i32.const 1) (i32.const 2)))
+              (func (export "alloc") (param i32) (result i32) (i32.const 0))
+              (func (export "execute") (param i32 i32 i32 i32) (result i32)
+                (global.get $computed))
             )
         "#;
         let guest = wat::parse_str(wat).expect("wat parses");
@@ -1887,10 +1926,7 @@ mod abi_alignment_tests {
     /// pass by comparing the test's own constants to themselves.
     #[tokio::test(flavor = "multi_thread")]
     async fn register_all_binds_expected_host_imports() {
-        // wasmtime supports async unconditionally (`Config::async_support`
-        // is a deprecated no-op), so the engine accepts async imports
-        // without an explicit Config flag.
-        let engine = Engine::default();
+        let engine = Engine::new(&crate::kernel::runtime::engine_config()).expect("engine");
         let mut linker = Linker::<store_data::ScriptRuntimeStoreData>::new(&engine);
         // Run the same registration path `run_script_runtime` runs.
         imports::register_all(&mut linker).expect("register_all binds imports cleanly");

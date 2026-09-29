@@ -2430,9 +2430,10 @@ fn step_wasm<'a>(
         // failure was the fuel meter rather than module logic. Keep
         // `{e}` — the trap display carries the wasm backtrace, i.e.
         // WHERE execution was when the meter ran dry, which a module
-        // author debugging a near-miss budget wants. Fuel can run out
-        // at instantiation too, in the module's `start` function, so
-        // both calls are classified. The memory cap is not named:
+        // author debugging a near-miss budget wants. Fuel is spent at
+        // instantiation too, by the initialisation of the module's
+        // globals and segments and by its `start` function, so both
+        // calls are classified. The memory cap is not named:
         // during the entry a `memory.grow` past the cap answers -1 to
         // the module rather than trapping, so whatever trap follows
         // is the module's own; at instantiation a declared minimum
