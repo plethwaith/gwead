@@ -1020,7 +1020,7 @@ pub trait PluginExecution: sealed::Sealed + Send {
     fn dataflow_outputs(&self) -> &std::sync::Arc<HashMap<String, super::streams::StreamId>>;
 
     /// Recursion depth for nested `invoke` chains. Used by the
-    /// `invoke` step body to enforce `INVOKE_MAX_DEPTH`.
+    /// `invoke` step body to enforce the invoke depth cap of 16.
     fn invoke_depth(&self) -> u32;
 
     /// Event-dispatch cascade depth.

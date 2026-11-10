@@ -266,8 +266,11 @@ impl PluginRegistry {
         self.step_type_defs.insert(key, (plugin.to_string(), def));
     }
 
-    /// Look up a step type definition by registry key (see
-    /// `Self::step_type_key`). Returns `Some((registering_plugin,
+    /// Look up a step type definition by registry key:
+    /// a bare name for a kernel step type, otherwise the written
+    /// `<plugin>.<name>` prefixed with the declaring plugin's namespace
+    /// and `/` (`tenant_a/vault.sign`), or unprefixed in the root
+    /// namespace. Returns `Some((registering_plugin,
     /// &def))` when present; `def.name` is the name as written.
     pub fn get_step_type_def(&self, key: &str) -> Option<(&str, &StepTypeDef)> {
         self.step_type_defs.get(key).map(|(p, d)| (p.as_str(), d))
@@ -485,8 +488,9 @@ impl PluginRegistry {
     /// alias. The registry stores at most one entry per alias
     /// (duplicates rejected at registration), so this returns 0 or 1
     /// candidates — callers `.first()` to pick. The `Vec` shape matches
-    /// [`Self::plugins_for_role`] and `Self::step_type_impl_candidates`.
-    /// `alias` is a registry key — see `Self::step_type_key`.
+    /// [`Self::plugins_for_role`].
+    /// `alias` is a registry key, in the form
+    /// [`Self::get_step_type_def`] describes.
     pub fn step_type_alias_candidates(&self, alias: &str) -> Vec<(String, String)> {
         self.step_type_aliases
             .get(alias)

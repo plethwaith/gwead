@@ -24,9 +24,9 @@ supported Rust version is the `rust-version` in `Cargo.toml`.
 API, as produced by [cargo-public-api](https://crates.io/crates/cargo-public-api).
 It changes only on purpose, in the same pull request as the code that
 changes it, so a reviewer reads the API change as a diff of that file.
-Items that are not in the listing are crate-private, and stay that way
-until someone needs them: publishing an item later is additive, and
-removing one is breaking.
+Items that are not in the listing are not part of the API, and stay
+that way until someone needs them: publishing an item later is
+additive, and removing one is breaking.
 
 Regenerate it with:
 
@@ -49,8 +49,12 @@ the last release tag:
 git diff v<last release> -- public-api.txt
 ```
 
-An empty diff or one that only adds lines is a patch release. A removed
-or changed line is a minor release.
+A removed or changed line is a minor release. An added line can be
+breaking too: a new method without a default on a trait that embedders
+implement (`SecretResolver`, `DispatchOrchestrator`), or a new `pub`
+field on a struct that is not `#[non_exhaustive]` (such as
+`ActionResult`). Read added lines for those before calling a release a
+patch.
 
 ## Scheduled CI
 

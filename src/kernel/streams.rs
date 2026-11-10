@@ -32,9 +32,8 @@
 //!
 //! ## Direction
 //!
-//! A stream is either `StreamDirection::Readable` (host provides a
-//! source, plugin pulls via `stream_read`) or
-//! `StreamDirection::Writable` (plugin pushes via `stream_write`,
+//! A stream is either readable (host provides a source, plugin pulls
+//! via `stream_read`) or writable (plugin pushes via `stream_write`,
 //! host consumes from a receiver). One direction per handle — attempting
 //! `stream_write` on a readable returns `DIRECTION_MISMATCH`.
 
@@ -118,11 +117,6 @@ pub type WritableSender = mpsc::Sender<Result<Bytes, std::io::Error>>;
 pub type WritableReceiver = mpsc::Receiver<Result<Bytes, std::io::Error>>;
 
 /// Direction-specific state for a stream.
-///
-/// Publicly reachable via [`StreamRegistry::get`], so it is
-/// `#[non_exhaustive]` — both at the enum level (a third direction
-/// stays additive) and per variant (the cursor fields are kernel
-/// bookkeeping; nothing outside the kernel should be building one).
 #[non_exhaustive]
 pub(crate) enum StreamDirection {
     /// Host → plugin. The plugin calls `stream_read` to pull bytes.
@@ -313,7 +307,7 @@ impl StreamState {
 /// The registry-wide outer mutex (via [`SharedStreamRegistry`]) is
 /// held only briefly for HashMap insert / lookup / clear ops. All
 /// stream-state mutation goes through the per-stream
-/// `StreamState::lock_inner` mutex, so a slow read on one stream
+/// mutex, so a slow read on one stream
 /// never blocks operations on another.
 pub struct StreamRegistry {
     streams: HashMap<StreamId, Arc<StreamState>>,

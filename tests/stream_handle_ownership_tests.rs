@@ -134,6 +134,10 @@ async fn a_callee_cannot_read_the_callers_handles() {
         Err(e) => e.to_string(),
     };
     assert!(
+        !rendered.contains("script runtime instantiation failed"),
+        "the thief never ran, so nothing was tested: {rendered}"
+    );
+    assert!(
         !rendered.contains(SECRET),
         "callee read the caller's stream: {rendered}"
     );

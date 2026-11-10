@@ -400,7 +400,7 @@ impl DataflowStreamingHandle {
 
 /// Hard cap on event-dispatch cascade depth.
 ///
-/// Mirrors `host_api::INVOKE_MAX_DEPTH` but tracks a different
+/// Mirrors the invoke depth cap (also 16) but tracks a different
 /// recursion shape: explicit `invoke` calls (`invoke_depth`) versus
 /// event-driven cascades (`dispatch_depth`). Both can coexist in the
 /// same execution chain.
@@ -2101,8 +2101,8 @@ impl Kernel {
     ///
     /// Each action's step graph is validated for unique ids,
     /// resolvable references, and acyclic shape, then layered into topological
-    /// waves. The plan is stored in the registry and consumed by
-    /// `WasmRuntime::execute_dag` at invocation time.
+    /// waves. The plan is stored in the registry and consumed at
+    /// invocation time.
     ///
     /// Registers into the **root namespace**, so the plugin's identity
     /// is exactly its manifest name. This is the right entry point for

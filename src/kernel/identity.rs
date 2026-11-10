@@ -16,13 +16,13 @@
 //!   `invoke:plugin:a:b` would have two readings and the parser would
 //!   silently pick one.
 //!
-//! Neither is expressible under `validate_name`. Both are ruled out
-//! by the grammar from the start: tightening a name grammar later
-//! would reject manifests that previously loaded.
+//! Neither is expressible under the name grammar. Both are ruled out
+//! from the start: tightening a name grammar later would reject
+//! manifests that previously loaded.
 //!
 //! ## The reserved separator
 //!
-//! `NAMESPACE_SEPARATOR` (`/`) divides a plugin's embedder-supplied
+//! The namespace separator, `/`, divides a plugin's embedder-supplied
 //! namespace from its manifest-declared local name. The root namespace
 //! is spelled as the empty string, so a root-namespace identity is
 //! exactly the local name with no prefix and no separator — so a
@@ -34,8 +34,7 @@
 //! in namespace `foo`, and the two would collide on one registry key.
 //!
 //! References that already carry a separator are rejected as **reserved
-//! syntax** rather than accepted as literals — see
-//! `validate_reference`. This is the same discipline the permission
+//! syntax** rather than accepted as literals. This is the same discipline the permission
 //! grammar applies to glob characters and to dot-free categories:
 //! reserve the syntax while it still means nothing, so that giving it a
 //! meaning later cannot silently reinterpret a grant somebody already
@@ -110,7 +109,7 @@ impl fmt::Display for NameKind {
     }
 }
 
-/// Rejection reasons from `validate_name` / `validate_reference`.
+/// Reasons a name or reference is rejected by the identity grammar.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum NameError {

@@ -30,7 +30,6 @@
 //!   such as `script` — insufficient on its own: the plugin must also
 //!   appear in the embedder's
 //!   [`KernelConfig::trusted_step_type_providers`](super::KernelConfig::trusted_step_type_providers).
-//!   See `Permission::ProvideStepType`.
 //! - `bind:native_impl:<implRef>` — declares intent to *bind* a native
 //!   step body shipped by another plugin. The mirror image of
 //!   `provide:`: that one supplies code others run, this one runs code
@@ -38,20 +37,18 @@
 //!   like `provide:step_type:` — insufficient on its own: the embedder
 //!   must authorise the exact pair via
 //!   [`KernelConfig::native_impl_bindings`](super::KernelConfig::native_impl_bindings).
-//!   See `Permission::BindNativeImpl`.
 //!
 //! ## Category reservation
 //!
 //! **Dot-free category names are reserved for the kernel.** An
-//! unrecognised dot-free category is rejected at parse time
-//! (`PermissionParseError::ReservedCategory`) rather than silently
-//! landing as `Permission::AppDefined`.
+//! unrecognised dot-free category is rejected at parse time rather
+//! than silently accepted as an embedder category.
 //!
 //! Embedder categories must carry a dot-namespaced prefix:
 //! `acme.events:publish:catalog.item.created`, not
-//! `events:publish:...`. Those parse to `Permission::AppDefined`,
-//! where the kernel stores the raw `(kind, value)` pair and the
-//! embedder enforces it in its own layer. The kernel does NOT know
+//! `events:publish:...`. Those are embedder categories: the kernel
+//! keeps the grant, and the embedder enforces it in its own layer,
+//! reading it from `PluginManifest::permissions`. The kernel does NOT know
 //! about events / audit / storage / etc. — those concerns belong to
 //! the app, not the engine.
 //!
@@ -78,8 +75,8 @@
 //!
 //! ## Pattern syntax
 //!
-//! `HostPattern` and `PathPattern` support exactly three shapes,
-//! and `NamePattern` two:
+//! Host and path patterns support exactly three shapes, and name
+//! patterns two:
 //!
 //! - `*` — match anything
 //! - `*.<suffix>` (host) — match anything ending in `.suffix` or
@@ -103,12 +100,13 @@
 //! The kernel enforces `invoke:`, `step_type:`, and `provide:`
 //! itself, on its own dispatch surfaces.
 //!
-//! `network:egress` and `blobs` are **advisory**. The kernel has zero
-//! call sites for `check_network_egress` and `check_blobs` — it
-//! ships no HTTP client and no blob store, so there is no boundary
-//! for it to gate. They are parsed, stored, and offered to the
-//! embedder. **If your step type performs network or blob I/O, it
-//! MUST call the matching `check_*` itself and refuse on `Denied`.**
+//! `network:egress` and `blobs` are **advisory**. The kernel never calls
+//! `PluginExecution::check_network_egress` or
+//! `PluginExecution::check_blobs`. It ships no HTTP client and no blob
+//! store, so there is no boundary for it to gate. They are parsed,
+//! stored, and offered to the embedder. **If your step type performs
+//! network or blob I/O, it MUST call the matching
+//! `PluginExecution::check_*` itself and refuse on `Err`.**
 //! A grant nobody checks restricts nothing.
 //!
 //! Both are also the weakest kind of gate: a step type that never
@@ -1385,5 +1383,17 @@ mod tests {
         assert!(check_blobs(&grants, BlobOp::Read, "media/x").is_granted());
         // Write isn't granted just because Read is.
         assert!(!check_blobs(&grants, BlobOp::Write, "media/x").is_granted());
+    }
+
+    #[test]
+    fn manifest_list_fails_on_an_empty_entry() {
+        // An empty entry in the middle fails the whole list.
+        let raw = vec![
+            "network:egress:*".to_string(),
+            "".to_string(),
+            "blobs:read:*".to_string(),
+        ];
+        let err = parse_manifest_permissions(&raw, &[]).unwrap_err();
+        assert!(matches!(err, PermissionParseError::Empty));
     }
 }

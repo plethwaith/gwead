@@ -507,6 +507,29 @@ async fn step_types_alias_rejects_reserved_intrinsic_names() {
     );
 }
 
+/// A `script` step runs the standard mock guest, which imports
+/// `host_set_result` from the kernel's ABI module and returns a fixed
+/// string through it. A step that instantiates and returns that string
+/// shows the mock's import name matches the module the kernel registers.
+#[tokio::test(flavor = "multi_thread")]
+async fn script_step_runs_the_standard_mock_guest() {
+    let kernel = boot(vec![manifest(
+        "p",
+        vec![step(
+            "code",
+            "script",
+            json!({ "language": "lua", "source": "-- not interpreted" }),
+        )],
+    )]);
+    let result = kernel
+        .execute("p", "go", json!({}))
+        .with_config(&Value::Null)
+        .run()
+        .await
+        .expect("script step runs");
+    assert_eq!(result.step_results["code"], json!("mock-script-result"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn script_with_unsupported_language_rejected_at_register() {
     init_tracing();

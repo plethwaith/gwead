@@ -18,10 +18,12 @@ embedders depend on Gwead, never the reverse.
 **0.3.0 — a chosen public API, without wasmtime.** Breaking for embedders
 (the Rust API is now the listing in [`public-api.txt`](public-api.txt),
 wasmtime is private, the MSRV is 1.95) and for guests (the ABI import
-module is `gwead@1`, and the set of wasm features is pinned); manifests
-written for 0.2.0 load unchanged. The manifest format is half of Gwead's
-public API; the Rust API in [`public-api.txt`](public-api.txt) is the
-other. The manifest contract is the pair of meta-schemas in [`schemas/`](schemas/) (JSON Schema
+module is `gwead@1`, and the set of wasm features is pinned); manifest
+JSON written for 0.2.0 loads unchanged, but a guest it carries imports
+`gwead1`, fails to instantiate, and must be rebuilt against `gwead@1`.
+The manifest format is half of Gwead's public API; the Rust API in
+[`public-api.txt`](public-api.txt) is the other. The manifest contract
+is the pair of meta-schemas in [`schemas/`](schemas/) (JSON Schema
 Draft 2020-12), and every manifest loaded from JSON (`Kernel::load_manifest`,
 `register_plugin_from_json`, `register_spi_from_json`) is validated against
 them at load, on the raw JSON before deserialization. Manifests may declare

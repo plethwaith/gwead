@@ -87,7 +87,7 @@ pub struct SecretRequest<'a> {
     ///
     /// Guaranteed by the kernel to be the executing plugin itself or
     /// one of its ancestors, so a resolver is never asked for a sibling
-    /// tenant's secrets — see `subject_is_on_chain`.
+    /// tenant's secrets.
     pub subject: &'a str,
     /// The plugin whose execution this is running inside.
     ///
@@ -101,7 +101,7 @@ pub struct SecretRequest<'a> {
     /// everything it holds. **The kernel intersects the result with
     /// this list regardless**, so honouring it is an optimisation rather
     /// than a security obligation, and a resolver bug cannot widen what
-    /// a manifest declared. See `intersect_declared`.
+    /// a manifest declared.
     pub declared_keys: &'a [String],
     /// The subset of [`Self::declared_keys`] that `subject`'s manifest
     /// marked `overridable` in `usesSecrets` — keys a level *below* the subject

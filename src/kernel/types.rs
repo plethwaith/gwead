@@ -43,7 +43,7 @@ pub struct PluginManifest {
     /// Constrained to the identifier grammar in
     /// [`kernel::identity`](crate::kernel::identity) — ASCII letters,
     /// digits, `_` and `-`, not leading `-`, at most
-    /// `MAX_NAME_LEN` bytes —
+    /// 128 bytes —
     /// because it is the registry key *and* appears verbatim inside
     /// permission strings. `/` is rejected as reserved namespace
     /// syntax.
@@ -115,8 +115,7 @@ pub struct PluginManifest {
     /// with this list, so a
     /// plugin can never see a key it did not declare, even if the
     /// resolver hands over more and even if the embedder's bag holds a
-    /// whole tenant's credentials. See
-    /// `intersect_declared`.
+    /// whole tenant's credentials.
     ///
     /// Declaring nothing means seeing nothing, and costs no resolver
     /// round trip. That is the safe default and it is also the honest
@@ -229,8 +228,9 @@ pub struct StepTypeDef {
     ///
     /// A plugin may always use step types it defined itself, and the
     /// kernel's own reserved intrinsics (`let`, `ifs`, `script`, …) are
-    /// usable by everyone regardless of this flag — see
-    /// `super::host_api::RESERVED_STEP_TYPE_NAMES`.
+    /// usable by everyone regardless of this flag. The intrinsics are `ifs`, `for_each`,
+    /// `repeat`, `parallel`, `return`, `try`, `script`, `throw_error`,
+    /// `invoke`, `wasm` and `let`.
     #[serde(default)]
     pub freely_usable: bool,
 
@@ -280,7 +280,7 @@ pub struct StepTypeDef {
     /// other to that plugin's action name. The kernel walks them at
     /// registration: if both keys are present as literal
     /// strings (not templates), the kernel rejects registration when
-    /// the target doesn't exist, and emits an `super::invoke::InvokeEdge`
+    /// the target doesn't exist, and emits an invoke edge
     /// for cycle detection — same shape the hardcoded `invoke`
     /// walker emits for `{type: "invoke", plugin: …, action: …}`.
     /// Generalises that walker to custom step types whose authors
@@ -288,7 +288,7 @@ pub struct StepTypeDef {
     ///
     /// Templated values (`{plugin: "{{$vars.x}}", action: "foo"}`) and
     /// missing keys are skipped — those are runtime-resolvable and
-    /// fall under `super::host_api::INVOKE_MAX_DEPTH`.
+    /// fall under the invoke depth cap of 16.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<StepReference>,
 }
@@ -343,8 +343,7 @@ pub struct StepReference {
 /// ## Name validation
 ///
 /// `step_type` is validated as a step type *reference*: a bare kernel
-/// name, or a well-formed `<plugin>.<name>` — see
-/// `identity::validate_step_type_reference`.
+/// name, or a well-formed `<plugin>.<name>`.
 /// Ownership of the claim is checked separately at registration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
