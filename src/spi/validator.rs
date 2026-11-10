@@ -21,9 +21,6 @@ use super::loader::SpiRegistry;
 use crate::kernel::types::PluginManifest;
 
 /// Validation result for a single plugin.
-///
-/// `#[non_exhaustive]`: only [`validate_manifest`] constructs one, so
-/// a field can be added without a semver-major bump.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct ValidationResult {
@@ -52,8 +49,7 @@ pub struct ValidationResult {
     /// An optional action may be omitted, so a typo is not a
     /// [`MissingAction`](ValidationError::MissingAction); the misspelt
     /// name simply appears here, and the plugin is found wanting at
-    /// runtime instead. Tooling holding both this list and the SPI
-    /// definition can flag near misses; the validator does not guess.
+    /// runtime instead. The validator does not guess.
     pub extra_actions: Vec<String>,
 }
 

@@ -950,16 +950,6 @@ impl PermissionCheck {
 }
 
 /// Does the granted set authorise `network:egress` to `host`?
-///
-/// **Advisory — the kernel never calls this.** It ships no HTTP
-/// client, so there is no boundary for it to gate. If your step type
-/// performs network I/O it MUST call this itself and refuse on
-/// `Denied`; a grant nobody checks restricts nothing.
-///
-/// A step type that never calls this is indistinguishable from one
-/// that called it and was allowed, which is why the call shape is
-/// provisional — see
-/// [`PluginExecution::check_network_egress`](super::host_api::PluginExecution::check_network_egress).
 pub(crate) fn check_network_egress(grants: &[Permission], host: &str) -> PermissionCheck {
     for grant in grants {
         if let Permission::NetworkEgress(pat) = grant
@@ -974,9 +964,6 @@ pub(crate) fn check_network_egress(grants: &[Permission], host: &str) -> Permiss
 }
 
 /// Does the granted set authorise the blob `op` against `key`?
-///
-/// **Advisory — the kernel never calls this**, for the same reason as
-/// [`check_network_egress`]. Your step type owns the gate.
 pub(crate) fn check_blobs(grants: &[Permission], op: BlobOp, key: &str) -> PermissionCheck {
     for grant in grants {
         if let Permission::Blobs(grant_op, pattern) = grant
