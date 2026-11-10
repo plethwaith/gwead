@@ -23,7 +23,7 @@ use super::types::{Action, PluginManifest, StepTypeDef};
 /// Step order is driven entirely by the host-side DAG scheduler; wasm
 /// modules enter at the *step* level (scripted step types), not the
 /// action level.
-pub struct ActionRegistration {
+pub(crate) struct ActionRegistration {
     pub action: Action,
     pub plan: DagPlan,
 }
@@ -53,7 +53,6 @@ pub struct ToolDescriptor {
 }
 
 /// The plugin registry.
-#[derive(Default)]
 pub struct PluginRegistry {
     /// Action registrations: `(plugin_name, action_name) → ActionRegistration`
     modules: HashMap<(String, String), ActionRegistration>,
@@ -136,7 +135,7 @@ pub struct PluginRegistry {
 /// One row of the step-type implementation registry — the value the
 /// kernel needs to dispatch a step to the right wasm module.
 #[derive(Debug, Clone)]
-pub struct StepTypeImplEntry {
+pub(crate) struct StepTypeImplEntry {
     /// The plugin that registered this impl. Used to find the
     /// matching `wasm_modules` entry via
     /// [`PluginRegistry::get_plugin_wasm_module`].
@@ -147,7 +146,7 @@ pub struct StepTypeImplEntry {
 }
 
 impl PluginRegistry {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             modules: HashMap::new(),
             roles: HashMap::new(),
@@ -175,7 +174,7 @@ impl PluginRegistry {
     /// A *user* of a step type computes the same key by resolving the
     /// owner segment along its own chain — see
     /// `Kernel::step_type_access_for`.
-    pub fn step_type_key(plugin: &str, written: &str) -> String {
+    pub(crate) fn step_type_key(plugin: &str, written: &str) -> String {
         if written.contains(super::identity::STEP_TYPE_SEPARATOR) {
             super::identity::qualify(super::identity::namespace_of(plugin), written)
         } else {
@@ -191,7 +190,7 @@ impl PluginRegistry {
     /// [`Self::commit_step_type_impl`] so the whole of a manifest can
     /// be checked before any of it is applied — see
     /// `Kernel::prepare_step_types`.
-    pub fn step_type_impl_owner(
+    pub(crate) fn step_type_impl_owner(
         &self,
         step_type: &str,
         matches: Option<&str>,
@@ -207,7 +206,7 @@ impl PluginRegistry {
     /// **Overwrites** any existing entry, so callers must have checked
     /// [`Self::step_type_impl_owner`] first. This is the commit half
     /// of a checked registration, not a safe standalone operation.
-    pub fn commit_step_type_impl(
+    pub(crate) fn commit_step_type_impl(
         &mut self,
         plugin: &str,
         step_type: &str,
@@ -233,7 +232,7 @@ impl PluginRegistry {
     /// 0 or 1 candidates — callers `.first()` or `.into_iter().next()`
     /// to pick. The `Vec` shape matches [`Self::plugins_for_role`]: the
     /// kernel exposes catalogue queries, the caller picks.
-    pub fn step_type_impl_candidates(
+    pub(crate) fn step_type_impl_candidates(
         &self,
         step_type: &str,
         matches: Option<&str>,
@@ -248,7 +247,7 @@ impl PluginRegistry {
     /// (those with `matches = None`) are skipped — the caller is
     /// querying by selector value, so only selector-bearing impls
     /// matter.
-    pub fn step_type_impl_matches(&self, step_type: &str) -> Vec<&str> {
+    pub(crate) fn step_type_impl_matches(&self, step_type: &str) -> Vec<&str> {
         self.step_type_impls
             .keys()
             .filter(|(t, _)| t == step_type)
@@ -262,13 +261,13 @@ impl PluginRegistry {
     /// **Overwrites** any existing entry. Check
     /// [`Self::get_step_type_def`] first; this is the commit half of a
     /// checked registration — see `Kernel::prepare_step_types`.
-    pub fn commit_step_type_def(&mut self, plugin: &str, def: StepTypeDef) {
+    pub(crate) fn commit_step_type_def(&mut self, plugin: &str, def: StepTypeDef) {
         let key = Self::step_type_key(plugin, &def.name);
         self.step_type_defs.insert(key, (plugin.to_string(), def));
     }
 
     /// Look up a step type definition by registry key (see
-    /// [`Self::step_type_key`]). Returns `Some((registering_plugin,
+    /// `Self::step_type_key`). Returns `Some((registering_plugin,
     /// &def))` when present; `def.name` is the name as written.
     pub fn get_step_type_def(&self, key: &str) -> Option<(&str, &StepTypeDef)> {
         self.step_type_defs.get(key).map(|(p, d)| (p.as_str(), d))
@@ -306,7 +305,7 @@ impl PluginRegistry {
     /// Cache a wasm module a plugin manifest carried as a
     /// `wasm_modules` entry. Keyed by `(plugin, module)` so
     /// each plugin keeps its own namespace.
-    pub fn register_plugin_wasm_module(
+    pub(crate) fn register_plugin_wasm_module(
         &mut self,
         plugin: &str,
         module_name: &str,
@@ -320,7 +319,7 @@ impl PluginRegistry {
     /// [`Self::register_plugin_wasm_module`]. Returns `None` when the
     /// plugin or module name isn't recognised — the `wasm` step type's
     /// body translates that to a structured `StepError::Failed`.
-    pub fn get_plugin_wasm_module(
+    pub(crate) fn get_plugin_wasm_module(
         &self,
         plugin: &str,
         module_name: &str,
@@ -333,7 +332,7 @@ impl PluginRegistry {
     /// Add a `(plugin, action)` entry to the subscription map for the
     /// given event type. Idempotent on `(event, plugin, action)` so
     /// re-registering a plugin doesn't duplicate dispatches.
-    pub fn register_subscription(&mut self, event_type: &str, plugin: &str, action: &str) {
+    pub(crate) fn register_subscription(&mut self, event_type: &str, plugin: &str, action: &str) {
         let bucket = self
             .subscriptions
             .entry(event_type.to_string())
@@ -357,17 +356,17 @@ impl PluginRegistry {
     /// already registered. Used by `register_plugin` to combine the
     /// existing graph with the new plugin's edges before checking for
     /// structural cycles.
-    pub fn invoke_edges(&self) -> &[InvokeEdge] {
+    pub(crate) fn invoke_edges(&self) -> &[InvokeEdge] {
         &self.invoke_edges
     }
 
     /// Append edges produced by [`super::invoke::collect_edges`].
-    pub fn extend_invoke_edges(&mut self, edges: impl IntoIterator<Item = InvokeEdge>) {
+    pub(crate) fn extend_invoke_edges(&mut self, edges: impl IntoIterator<Item = InvokeEdge>) {
         self.invoke_edges.extend(edges);
     }
 
     /// Register an action's execution plan.
-    pub fn register_action(
+    pub(crate) fn register_action(
         &mut self,
         plugin_name: &str,
         action_name: &str,
@@ -381,13 +380,13 @@ impl PluginRegistry {
     }
 
     /// Register a plugin's manifest for introspection.
-    pub fn register_manifest(&mut self, manifest: &PluginManifest) {
+    pub(crate) fn register_manifest(&mut self, manifest: &PluginManifest) {
         self.manifests
             .insert(manifest.name.clone(), manifest.clone());
     }
 
     /// Register a plugin's SPI role mapping.
-    pub fn register_role(&mut self, role: &str, plugin_name: &str) {
+    pub(crate) fn register_role(&mut self, role: &str, plugin_name: &str) {
         self.roles
             .entry(role.to_string())
             .or_default()
@@ -395,7 +394,11 @@ impl PluginRegistry {
     }
 
     /// Get a registered action.
-    pub fn get_action(&self, plugin_name: &str, action_name: &str) -> Option<&ActionRegistration> {
+    pub(crate) fn get_action(
+        &self,
+        plugin_name: &str,
+        action_name: &str,
+    ) -> Option<&ActionRegistration> {
         self.modules
             .get(&(plugin_name.to_string(), action_name.to_string()))
     }
@@ -472,7 +475,7 @@ impl PluginRegistry {
     /// [`Self::step_type_alias_candidates`] first; this is the commit
     /// half of a checked registration — see
     /// `Kernel::register_plugin`'s pre-flight block.
-    pub fn commit_step_type_alias(&mut self, alias: &str, plugin: &str, action: &str) {
+    pub(crate) fn commit_step_type_alias(&mut self, alias: &str, plugin: &str, action: &str) {
         let key = Self::step_type_key(plugin, alias);
         self.step_type_aliases
             .insert(key, (plugin.to_string(), action.to_string()));
@@ -482,8 +485,8 @@ impl PluginRegistry {
     /// alias. The registry stores at most one entry per alias
     /// (duplicates rejected at registration), so this returns 0 or 1
     /// candidates — callers `.first()` to pick. The `Vec` shape matches
-    /// [`Self::plugins_for_role`] and [`Self::step_type_impl_candidates`].
-    /// `alias` is a registry key — see [`Self::step_type_key`].
+    /// [`Self::plugins_for_role`] and `Self::step_type_impl_candidates`.
+    /// `alias` is a registry key — see `Self::step_type_key`.
     pub fn step_type_alias_candidates(&self, alias: &str) -> Vec<(String, String)> {
         self.step_type_aliases
             .get(alias)
@@ -497,7 +500,7 @@ impl PluginRegistry {
     /// validated. Overwrites any prior entry; the kernel rejects
     /// re-registration of a live plugin, and reload goes through
     /// [`Self::unregister_plugin`] first.
-    pub fn set_permissions(&mut self, plugin: &str, perms: Vec<Permission>) {
+    pub(crate) fn set_permissions(&mut self, plugin: &str, perms: Vec<Permission>) {
         self.permissions.insert(plugin.to_string(), perms);
     }
 
@@ -505,7 +508,7 @@ impl PluginRegistry {
     /// empty slice for unregistered plugins or plugins that declared
     /// no permissions — both translate to default-deny at the host
     /// step boundary.
-    pub fn permissions_for(&self, plugin: &str) -> &[Permission] {
+    pub(crate) fn permissions_for(&self, plugin: &str) -> &[Permission] {
         self.permissions
             .get(plugin)
             .map(|v| v.as_slice())
@@ -528,7 +531,7 @@ impl PluginRegistry {
     /// Returns `false` when no manifest by that name was registered —
     /// callers translate that to a clear "not loaded" error rather than
     /// silently succeeding.
-    pub fn unregister_plugin(&mut self, plugin_name: &str) -> bool {
+    pub(crate) fn unregister_plugin(&mut self, plugin_name: &str) -> bool {
         if !self.manifests.contains_key(plugin_name) {
             return false;
         }

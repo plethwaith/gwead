@@ -15,11 +15,13 @@ embedders depend on Gwead, never the reverse.
 
 ## Status
 
-**0.2.0 — typed cancellation and stream failure reporting.** Breaking for
-embedders (typed errors gained fields, stream reads and writes take the
-step's cancellation token, one validation warning became data); manifests
-written for 0.1.0 load unchanged. The manifest format is Gwead's public API; its
-contract is the pair of meta-schemas in [`schemas/`](schemas/) (JSON Schema
+**0.3.0 — a chosen public API, without wasmtime.** Breaking for embedders
+(the Rust API is now the listing in [`public-api.txt`](public-api.txt),
+wasmtime is private, the MSRV is 1.95) and for guests (the ABI import
+module is `gwead@1`, and the set of wasm features is pinned); manifests
+written for 0.2.0 load unchanged. The manifest format is half of Gwead's
+public API; the Rust API in [`public-api.txt`](public-api.txt) is the
+other. The manifest contract is the pair of meta-schemas in [`schemas/`](schemas/) (JSON Schema
 Draft 2020-12), and every manifest loaded from JSON (`Kernel::load_manifest`,
 `register_plugin_from_json`, `register_spi_from_json`) is validated against
 them at load, on the raw JSON before deserialization. Manifests may declare
@@ -38,19 +40,22 @@ this repository is its source.
 ## wasmtime and the MSRV
 
 Gwead runs guests on wasmtime and follows its long-term-support
-releases: it builds on wasmtime 48, an LTS line whose security fixes
-arrive as 48.0.x patches that keep the API compatible and aim to
-keep the MSRV, and Gwead takes them in patch releases. Gwead moves
-to the next LTS line only in a minor release, and raises its minimum
-supported Rust version (1.95, set by wasmtime) only then, never in a
-patch release.
+releases. wasmtime 48 is an LTS line, supported by wasmtime for 24
+months from its release, with security fixes as 48.0.x patches.
+wasmtime is not part of Gwead's public API, so those patches reach an
+embedder through its own `cargo update`. The requirement in
+`Cargo.toml` is the oldest 48.x Gwead accepts: it rises, in a Gwead
+patch release, when an advisory makes an older 48.x unsafe. Gwead moves
+to the next LTS line, and raises its minimum supported Rust version
+(1.95, set by wasmtime), only in a minor release.
 
 ## Documentation
 
 Crate-level architecture documentation lives in [`src/lib.rs`](src/lib.rs).
 See also [`src/dsl/README.md`](src/dsl/README.md) for the expression DSL and
 [`src/kernel/STREAMS_ABI.md`](src/kernel/STREAMS_ABI.md) for the streams ABI
-contract between kernel and guest runtimes.
+contract between kernel and guest runtimes. [`CONTRIBUTING.md`](CONTRIBUTING.md)
+says how to build and test, and how the public API listing is kept.
 
 ## License
 

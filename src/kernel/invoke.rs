@@ -84,17 +84,6 @@ where
     }
 }
 
-/// An [`AliasResolver`] that never resolves anything. Useful for tests
-/// that don't exercise aliases and for callers that don't want alias
-/// resolution.
-pub struct NoAliases;
-
-impl AliasResolver for NoAliases {
-    fn resolve(&self, _alias: &str) -> Option<(String, String)> {
-        None
-    }
-}
-
 /// Collect every statically-resolvable invoke edge declared by `action`.
 ///
 /// Covers two shapes:
@@ -470,6 +459,16 @@ mod tests {
     use super::*;
     use indexmap::IndexMap;
     use serde_json::{Value, json};
+
+    /// An [`AliasResolver`] that never resolves anything, for tests that
+    /// don't exercise aliases.
+    struct NoAliases;
+
+    impl AliasResolver for NoAliases {
+        fn resolve(&self, _alias: &str) -> Option<(String, String)> {
+            None
+        }
+    }
 
     fn step(id: &str, params: Value) -> StepDef {
         StepDef {

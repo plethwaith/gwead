@@ -1772,6 +1772,39 @@ mod step_script_tests {
         }
     }
 
+    /// A guest that imports from `gwead1` names a module this kernel
+    /// does not register (`ABI_MODULE` is `gwead@1`): it fails at
+    /// instantiation and the error names the module it asked for. The
+    /// name is spelled out here, not read from `ABI_MODULE`, because
+    /// the guest is the thing that wrote it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_importing_the_previous_abi_module_fails_naming_it() {
+        let guest = wat::parse_str(
+            r#"
+            (module
+              (import "gwead1" "host_set_result" (func $set (param i32 i32)))
+              (memory (export "memory") 1)
+              (func (export "alloc") (param i32) (result i32) (i32.const 0))
+              (func (export "execute") (param i32 i32 i32 i32) (result i32)
+                (i32.const 1))
+            )
+            "#,
+        )
+        .expect("wat parses");
+        let mut state = state(
+            guest,
+            tokio_util::sync::CancellationToken::new(),
+            crate::kernel::RuntimeLimits::default(),
+        );
+        let result = run(&mut state).await;
+        assert!(
+            matches!(&result, Err(StepError::Failed(text))
+                if text.starts_with("script runtime instantiation failed:")
+                    && text.contains("unknown import: `gwead1::host_set_result` has not been defined")),
+            "{result:?}"
+        );
+    }
+
     /// A trap's backtrace prints the function names the guest's name
     /// section chose. A guest that names the function it traps in
     /// after the limiter's own error text, and traps there from

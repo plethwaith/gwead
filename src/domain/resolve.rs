@@ -158,33 +158,6 @@ fn value_to_string(val: &Value) -> String {
     }
 }
 
-/// Return every `{{…}}` placeholder in `s` whose inner expression does
-/// **not** conform to the template dialect — i.e. it neither
-/// starts with a `$`-rooted reference (`$.`, `$config.`, `$steps.`,
-/// `$item`, `$secrets`, `$trigger`, `$vars`) nor is the literal transform
-/// placeholder `value`.
-///
-/// Placeholders in another template engine's syntax (`{{config.x}}`,
-/// `{{messages}}`, `{{x | default:y}}`) are not resolved — they
-/// silently render to empty string (see the module docs and
-/// `resolve_expression_to_string`). That silent degrade means a
-/// manifest using them can ship looking fine and only break when an
-/// action actually runs. This helper turns that into a test-time signal:
-/// an embedder's manifest tests can assert it returns empty for every
-/// manifest they ship, so a stray placeholder fails in CI rather than
-/// at runtime.
-///
-/// Text-only scan (the same `{{…}}` matcher the resolver uses) — a lint
-/// over a manifest's serialized form, not a full parse.
-pub fn non_dialect_placeholders(s: &str) -> Vec<&str> {
-    TEMPLATE_RE
-        .captures_iter(s)
-        .filter_map(|caps| caps.get(1))
-        .map(|m| m.as_str().trim())
-        .filter(|inner| !inner.starts_with('$') && *inner != "value")
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,21 +376,5 @@ mod tests {
         let vars = json!({});
         let input = json!("{{value}}");
         assert_eq!(resolve_value(&input, &vars), json!("{{value}}"));
-    }
-
-    #[test]
-    fn non_dialect_placeholders_flags_bare_paths_and_allows_rooted() {
-        // Dialect-conforming ($-rooted) + the `value` placeholder are clean.
-        assert!(
-            non_dialect_placeholders(
-                "{{$.field}} {{$config.x}} {{$steps.a.result}} {{$.x ?? 'd'}} {{value}}"
-            )
-            .is_empty()
-        );
-        // Other engines' bare-path / pipe-filter forms are surfaced.
-        assert_eq!(
-            non_dialect_placeholders("{{config.x}} {{messages}} {{max_tokens | default:512}}"),
-            vec!["config.x", "messages", "max_tokens | default:512"]
-        );
     }
 }

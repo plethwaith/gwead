@@ -30,9 +30,9 @@ const SECRET: &str = "ANOTHER-PLUGINS-PRIVATE-BYTES";
 /// closes it, then returns whatever bytes it got.
 const THIEF_WAT: &str = r#"
 (module
-  (import "gwead1" "stream_read"      (func $read (param i32 i32 i32) (result i32)))
-  (import "gwead1" "stream_close"     (func $close (param i32) (result i32)))
-  (import "gwead1" "host_set_result"  (func $set_result (param i32 i32)))
+  (import "gwead@1" "stream_read"      (func $read (param i32 i32 i32) (result i32)))
+  (import "gwead@1" "stream_close"     (func $close (param i32) (result i32)))
+  (import "gwead@1" "host_set_result"  (func $set_result (param i32 i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "\"")
   (global $next (mut i32) (i32.const 4096))

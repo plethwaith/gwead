@@ -38,6 +38,7 @@ pub struct EvalContext<'a> {
 }
 
 impl<'a> EvalContext<'a> {
+    #[cfg(test)]
     pub fn empty() -> Self {
         Self {
             input: None,
@@ -51,6 +52,7 @@ impl<'a> EvalContext<'a> {
         }
     }
 
+    #[cfg(test)]
     pub fn with_implicit(source: &'a Value) -> Self {
         Self {
             implicit_source: Some(source),

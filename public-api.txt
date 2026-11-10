@@ -1,0 +1,1362 @@
+pub mod gwead
+pub use gwead::bytes
+pub use gwead::futures
+pub use gwead::indexmap
+pub use gwead::serde_json
+pub use gwead::tokio
+pub use gwead::tokio_util
+pub mod gwead::kernel
+pub mod gwead::kernel::abi
+pub const gwead::kernel::abi::ABI_MODULE: &str
+pub const gwead::kernel::abi::ABI_VERSION: u32
+pub mod gwead::kernel::dispatch
+#[non_exhaustive] pub enum gwead::kernel::dispatch::DispatchError
+pub gwead::kernel::dispatch::DispatchError::ConfigResolutionFailed(alloc::string::String)
+pub gwead::kernel::dispatch::DispatchError::RoleUnbound(alloc::string::String)
+pub gwead::kernel::dispatch::DispatchError::SelectionFailed(alloc::string::String)
+impl core::clone::Clone for gwead::kernel::dispatch::DispatchError
+pub fn gwead::kernel::dispatch::DispatchError::clone(&self) -> Self
+impl core::error::Error for gwead::kernel::dispatch::DispatchError
+impl core::fmt::Debug for gwead::kernel::dispatch::DispatchError
+pub fn gwead::kernel::dispatch::DispatchError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for gwead::kernel::dispatch::DispatchError
+pub fn gwead::kernel::dispatch::DispatchError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::dispatch::DispatchError
+impl core::marker::Send for gwead::kernel::dispatch::DispatchError
+impl core::marker::Sync for gwead::kernel::dispatch::DispatchError
+impl core::marker::Unpin for gwead::kernel::dispatch::DispatchError
+impl core::marker::UnsafeUnpin for gwead::kernel::dispatch::DispatchError
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::dispatch::DispatchError
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::dispatch::DispatchError
+#[non_exhaustive] pub enum gwead::kernel::dispatch::DispatchRequest<'a>
+pub gwead::kernel::dispatch::DispatchRequest::ByPlugin
+pub gwead::kernel::dispatch::DispatchRequest::ByPlugin::action: &'a str
+pub gwead::kernel::dispatch::DispatchRequest::ByPlugin::hints: &'a serde_json::value::Value
+pub gwead::kernel::dispatch::DispatchRequest::ByPlugin::input: &'a serde_json::value::Value
+pub gwead::kernel::dispatch::DispatchRequest::ByPlugin::plugin: &'a str
+pub gwead::kernel::dispatch::DispatchRequest::ByRole
+pub gwead::kernel::dispatch::DispatchRequest::ByRole::action: &'a str
+pub gwead::kernel::dispatch::DispatchRequest::ByRole::hints: &'a serde_json::value::Value
+pub gwead::kernel::dispatch::DispatchRequest::ByRole::input: &'a serde_json::value::Value
+pub gwead::kernel::dispatch::DispatchRequest::ByRole::role: &'a str
+impl<'a> core::clone::Clone for gwead::kernel::dispatch::DispatchRequest<'a>
+pub fn gwead::kernel::dispatch::DispatchRequest<'a>::clone(&self) -> Self
+impl<'a> core::fmt::Debug for gwead::kernel::dispatch::DispatchRequest<'a>
+pub fn gwead::kernel::dispatch::DispatchRequest<'a>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a> core::marker::Freeze for gwead::kernel::dispatch::DispatchRequest<'a>
+impl<'a> core::marker::Send for gwead::kernel::dispatch::DispatchRequest<'a>
+impl<'a> core::marker::Sync for gwead::kernel::dispatch::DispatchRequest<'a>
+impl<'a> core::marker::Unpin for gwead::kernel::dispatch::DispatchRequest<'a>
+impl<'a> core::marker::UnsafeUnpin for gwead::kernel::dispatch::DispatchRequest<'a>
+impl<'a> core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::dispatch::DispatchRequest<'a>
+impl<'a> core::panic::unwind_safe::UnwindSafe for gwead::kernel::dispatch::DispatchRequest<'a>
+pub struct gwead::kernel::dispatch::DefaultOrchestrator
+impl core::clone::Clone for gwead::kernel::dispatch::DefaultOrchestrator
+pub fn gwead::kernel::dispatch::DefaultOrchestrator::clone(&self) -> Self
+impl core::default::Default for gwead::kernel::dispatch::DefaultOrchestrator
+pub fn gwead::kernel::dispatch::DefaultOrchestrator::default() -> Self
+impl core::fmt::Debug for gwead::kernel::dispatch::DefaultOrchestrator
+pub fn gwead::kernel::dispatch::DefaultOrchestrator::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for gwead::kernel::dispatch::DefaultOrchestrator
+impl gwead::kernel::dispatch::DispatchOrchestrator for gwead::kernel::dispatch::DefaultOrchestrator
+pub fn gwead::kernel::dispatch::DefaultOrchestrator::prepare_dispatch<'a>(&'a self, gwead::kernel::dispatch::DispatchRequest<'a>, gwead::kernel::dispatch::DispatchContext<'a>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gwead::kernel::dispatch::DispatchPlan, gwead::kernel::dispatch::DispatchError>> + core::marker::Send + 'a)>>
+impl core::marker::Freeze for gwead::kernel::dispatch::DefaultOrchestrator
+impl core::marker::Send for gwead::kernel::dispatch::DefaultOrchestrator
+impl core::marker::Sync for gwead::kernel::dispatch::DefaultOrchestrator
+impl core::marker::Unpin for gwead::kernel::dispatch::DefaultOrchestrator
+impl core::marker::UnsafeUnpin for gwead::kernel::dispatch::DefaultOrchestrator
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::dispatch::DefaultOrchestrator
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::dispatch::DefaultOrchestrator
+#[non_exhaustive] pub struct gwead::kernel::dispatch::DispatchContext<'a>
+pub gwead::kernel::dispatch::DispatchContext::caller_config: &'a serde_json::value::Value
+pub gwead::kernel::dispatch::DispatchContext::caller_plugin: core::option::Option<&'a str>
+pub gwead::kernel::dispatch::DispatchContext::exec_ctx: &'a gwead::kernel::exec_context::ExecutionContext
+pub gwead::kernel::dispatch::DispatchContext::registry: &'a gwead::kernel::registry::PluginRegistry
+pub gwead::kernel::dispatch::DispatchContext::role_candidates: alloc::vec::Vec<alloc::string::String>
+impl<'a> core::marker::Freeze for gwead::kernel::dispatch::DispatchContext<'a>
+impl<'a> core::marker::Send for gwead::kernel::dispatch::DispatchContext<'a>
+impl<'a> core::marker::Sync for gwead::kernel::dispatch::DispatchContext<'a>
+impl<'a> core::marker::Unpin for gwead::kernel::dispatch::DispatchContext<'a>
+impl<'a> core::marker::UnsafeUnpin for gwead::kernel::dispatch::DispatchContext<'a>
+impl<'a> !core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::dispatch::DispatchContext<'a>
+impl<'a> !core::panic::unwind_safe::UnwindSafe for gwead::kernel::dispatch::DispatchContext<'a>
+#[non_exhaustive] pub struct gwead::kernel::dispatch::DispatchPlan
+pub gwead::kernel::dispatch::DispatchPlan::action: alloc::string::String
+pub gwead::kernel::dispatch::DispatchPlan::config: serde_json::value::Value
+pub gwead::kernel::dispatch::DispatchPlan::plugin: alloc::string::String
+impl gwead::kernel::dispatch::DispatchPlan
+pub fn gwead::kernel::dispatch::DispatchPlan::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn gwead::kernel::dispatch::DispatchPlan::with_config(self, serde_json::value::Value) -> Self
+impl core::clone::Clone for gwead::kernel::dispatch::DispatchPlan
+pub fn gwead::kernel::dispatch::DispatchPlan::clone(&self) -> Self
+impl core::fmt::Debug for gwead::kernel::dispatch::DispatchPlan
+pub fn gwead::kernel::dispatch::DispatchPlan::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::dispatch::DispatchPlan
+impl core::marker::Send for gwead::kernel::dispatch::DispatchPlan
+impl core::marker::Sync for gwead::kernel::dispatch::DispatchPlan
+impl core::marker::Unpin for gwead::kernel::dispatch::DispatchPlan
+impl core::marker::UnsafeUnpin for gwead::kernel::dispatch::DispatchPlan
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::dispatch::DispatchPlan
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::dispatch::DispatchPlan
+pub trait gwead::kernel::dispatch::DispatchOrchestrator: core::marker::Send + core::marker::Sync
+pub fn gwead::kernel::dispatch::DispatchOrchestrator::prepare_dispatch<'a>(&'a self, gwead::kernel::dispatch::DispatchRequest<'a>, gwead::kernel::dispatch::DispatchContext<'a>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gwead::kernel::dispatch::DispatchPlan, gwead::kernel::dispatch::DispatchError>> + core::marker::Send + 'a)>>
+impl gwead::kernel::dispatch::DispatchOrchestrator for gwead::kernel::dispatch::DefaultOrchestrator
+pub fn gwead::kernel::dispatch::DefaultOrchestrator::prepare_dispatch<'a>(&'a self, gwead::kernel::dispatch::DispatchRequest<'a>, gwead::kernel::dispatch::DispatchContext<'a>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gwead::kernel::dispatch::DispatchPlan, gwead::kernel::dispatch::DispatchError>> + core::marker::Send + 'a)>>
+pub mod gwead::kernel::exec_context
+pub struct gwead::kernel::exec_context::ExecutionContext(_)
+impl gwead::kernel::exec_context::ExecutionContext
+pub fn gwead::kernel::exec_context::ExecutionContext::as_value(&self) -> &serde_json::value::Value
+pub fn gwead::kernel::exec_context::ExecutionContext::empty() -> Self
+pub fn gwead::kernel::exec_context::ExecutionContext::is_empty(&self) -> bool
+pub fn gwead::kernel::exec_context::ExecutionContext::new(serde_json::value::Value) -> Self
+impl core::clone::Clone for gwead::kernel::exec_context::ExecutionContext
+pub fn gwead::kernel::exec_context::ExecutionContext::clone(&self) -> Self
+impl core::default::Default for gwead::kernel::exec_context::ExecutionContext
+pub fn gwead::kernel::exec_context::ExecutionContext::default() -> Self
+impl core::fmt::Debug for gwead::kernel::exec_context::ExecutionContext
+pub fn gwead::kernel::exec_context::ExecutionContext::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::exec_context::ExecutionContext
+impl core::marker::Send for gwead::kernel::exec_context::ExecutionContext
+impl core::marker::Sync for gwead::kernel::exec_context::ExecutionContext
+impl core::marker::Unpin for gwead::kernel::exec_context::ExecutionContext
+impl core::marker::UnsafeUnpin for gwead::kernel::exec_context::ExecutionContext
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::exec_context::ExecutionContext
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::exec_context::ExecutionContext
+pub mod gwead::kernel::execute_request
+pub struct gwead::kernel::execute_request::ExecuteActionRequest<'a>
+impl<'a> gwead::kernel::execute_request::ExecuteActionRequest<'a>
+pub fn gwead::kernel::execute_request::ExecuteActionRequest<'a>::into_continuous_handle(self) -> core::result::Result<gwead::kernel::ContinuousHandle, gwead::kernel::KernelError>
+pub fn gwead::kernel::execute_request::ExecuteActionRequest<'a>::into_dataflow_handle(self) -> core::result::Result<gwead::kernel::DataflowHandle, gwead::kernel::KernelError>
+pub fn gwead::kernel::execute_request::ExecuteActionRequest<'a>::into_dataflow_streaming_handle(self) -> core::result::Result<gwead::kernel::DataflowStreamingHandle, gwead::kernel::KernelError>
+pub async fn gwead::kernel::execute_request::ExecuteActionRequest<'a>::run(self) -> core::result::Result<gwead::kernel::types::ActionResult, gwead::kernel::KernelError>
+pub fn gwead::kernel::execute_request::ExecuteActionRequest<'a>::with_cancel(self, tokio_util::sync::cancellation_token::CancellationToken) -> Self
+pub fn gwead::kernel::execute_request::ExecuteActionRequest<'a>::with_config(self, &'a serde_json::value::Value) -> Self
+pub fn gwead::kernel::execute_request::ExecuteActionRequest<'a>::with_exec_ctx(self, gwead::kernel::exec_context::ExecutionContext) -> Self
+pub fn gwead::kernel::execute_request::ExecuteActionRequest<'a>::with_streams(self, gwead::kernel::streams::SharedStreamRegistry) -> Self
+impl<'a> core::marker::Freeze for gwead::kernel::execute_request::ExecuteActionRequest<'a>
+impl<'a> core::marker::Send for gwead::kernel::execute_request::ExecuteActionRequest<'a>
+impl<'a> core::marker::Sync for gwead::kernel::execute_request::ExecuteActionRequest<'a>
+impl<'a> core::marker::Unpin for gwead::kernel::execute_request::ExecuteActionRequest<'a>
+impl<'a> core::marker::UnsafeUnpin for gwead::kernel::execute_request::ExecuteActionRequest<'a>
+impl<'a> !core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::execute_request::ExecuteActionRequest<'a>
+impl<'a> !core::panic::unwind_safe::UnwindSafe for gwead::kernel::execute_request::ExecuteActionRequest<'a>
+pub mod gwead::kernel::host_api
+#[non_exhaustive] pub enum gwead::kernel::host_api::StepError
+pub gwead::kernel::host_api::StepError::Callee
+pub gwead::kernel::host_api::StepError::Callee::action: alloc::string::String
+pub gwead::kernel::host_api::StepError::Callee::plugin: alloc::string::String
+pub gwead::kernel::host_api::StepError::Callee::source: alloc::rcs::arc::Arc<gwead::kernel::KernelError>
+pub gwead::kernel::host_api::StepError::Cancelled
+pub gwead::kernel::host_api::StepError::Failed(alloc::string::String)
+pub gwead::kernel::host_api::StepError::Thrown(gwead::kernel::host_api::PluginErrorPayload)
+impl gwead::kernel::host_api::StepError
+pub fn gwead::kernel::host_api::StepError::from_callee(&str, &str, gwead::kernel::KernelError) -> Self
+impl core::clone::Clone for gwead::kernel::host_api::StepError
+pub fn gwead::kernel::host_api::StepError::clone(&self) -> Self
+impl core::error::Error for gwead::kernel::host_api::StepError
+impl core::fmt::Debug for gwead::kernel::host_api::StepError
+pub fn gwead::kernel::host_api::StepError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for gwead::kernel::host_api::StepError
+pub fn gwead::kernel::host_api::StepError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::host_api::StepError
+impl core::marker::Send for gwead::kernel::host_api::StepError
+impl core::marker::Sync for gwead::kernel::host_api::StepError
+impl core::marker::Unpin for gwead::kernel::host_api::StepError
+impl core::marker::UnsafeUnpin for gwead::kernel::host_api::StepError
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::host_api::StepError
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::host_api::StepError
+pub struct gwead::kernel::host_api::PluginErrorPayload
+pub gwead::kernel::host_api::PluginErrorPayload::code: alloc::string::String
+pub gwead::kernel::host_api::PluginErrorPayload::message: alloc::string::String
+pub gwead::kernel::host_api::PluginErrorPayload::params: serde_json::value::Value
+impl core::clone::Clone for gwead::kernel::host_api::PluginErrorPayload
+pub fn gwead::kernel::host_api::PluginErrorPayload::clone(&self) -> Self
+impl core::fmt::Debug for gwead::kernel::host_api::PluginErrorPayload
+pub fn gwead::kernel::host_api::PluginErrorPayload::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::host_api::PluginErrorPayload
+impl core::marker::Send for gwead::kernel::host_api::PluginErrorPayload
+impl core::marker::Sync for gwead::kernel::host_api::PluginErrorPayload
+impl core::marker::Unpin for gwead::kernel::host_api::PluginErrorPayload
+impl core::marker::UnsafeUnpin for gwead::kernel::host_api::PluginErrorPayload
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::host_api::PluginErrorPayload
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::host_api::PluginErrorPayload
+pub struct gwead::kernel::host_api::StepOutput
+pub gwead::kernel::host_api::StepOutput::metadata: indexmap::map::IndexMap<alloc::string::String, serde_json::value::Value>
+pub gwead::kernel::host_api::StepOutput::value: serde_json::value::Value
+impl gwead::kernel::host_api::StepOutput
+pub fn gwead::kernel::host_api::StepOutput::with_metadata(serde_json::value::Value, indexmap::map::IndexMap<alloc::string::String, serde_json::value::Value>) -> Self
+impl core::clone::Clone for gwead::kernel::host_api::StepOutput
+pub fn gwead::kernel::host_api::StepOutput::clone(&self) -> Self
+impl core::convert::From<serde_json::value::Value> for gwead::kernel::host_api::StepOutput
+pub fn gwead::kernel::host_api::StepOutput::from(serde_json::value::Value) -> Self
+impl core::default::Default for gwead::kernel::host_api::StepOutput
+pub fn gwead::kernel::host_api::StepOutput::default() -> Self
+impl core::fmt::Debug for gwead::kernel::host_api::StepOutput
+pub fn gwead::kernel::host_api::StepOutput::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::host_api::StepOutput
+impl core::marker::Send for gwead::kernel::host_api::StepOutput
+impl core::marker::Sync for gwead::kernel::host_api::StepOutput
+impl core::marker::Unpin for gwead::kernel::host_api::StepOutput
+impl core::marker::UnsafeUnpin for gwead::kernel::host_api::StepOutput
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::host_api::StepOutput
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::host_api::StepOutput
+pub trait gwead::kernel::host_api::PluginExecution: gwead::kernel::host_api::sealed::Sealed + core::marker::Send
+pub fn gwead::kernel::host_api::PluginExecution::cancel_token(&self) -> tokio_util::sync::cancellation_token::CancellationToken
+pub fn gwead::kernel::host_api::PluginExecution::caught_error(&self) -> core::option::Option<&str>
+pub fn gwead::kernel::host_api::PluginExecution::check_blobs(&self, gwead::kernel::permissions::BlobOp, &str) -> core::result::Result<(), alloc::string::String>
+pub fn gwead::kernel::host_api::PluginExecution::check_network_egress(&self, &str) -> core::result::Result<(), alloc::string::String>
+pub fn gwead::kernel::host_api::PluginExecution::config(&self) -> &serde_json::value::Value
+pub fn gwead::kernel::host_api::PluginExecution::current_step_id(&self) -> &str
+pub fn gwead::kernel::host_api::PluginExecution::current_step_type(&self) -> &str
+pub fn gwead::kernel::host_api::PluginExecution::dataflow_outputs(&self) -> &alloc::rcs::arc::Arc<std::collections::hash::map::HashMap<alloc::string::String, gwead::kernel::streams::StreamId>>
+pub fn gwead::kernel::host_api::PluginExecution::dispatch_depth(&self) -> u32
+pub fn gwead::kernel::host_api::PluginExecution::dispatch_role(&self, &str, &str, serde_json::value::Value, serde_json::value::Value) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gwead::kernel::types::ActionResult, gwead::kernel::KernelError>> + core::marker::Send + 'static)>>
+pub fn gwead::kernel::host_api::PluginExecution::emit_progress(&self, &str, serde_json::value::Value)
+pub fn gwead::kernel::host_api::PluginExecution::eval_path(&self, &str) -> serde_json::value::Value
+pub fn gwead::kernel::host_api::PluginExecution::eval_path_with_source(&self, &str, core::option::Option<&serde_json::value::Value>) -> serde_json::value::Value
+pub fn gwead::kernel::host_api::PluginExecution::exec_ctx(&self) -> &gwead::kernel::exec_context::ExecutionContext
+pub fn gwead::kernel::host_api::PluginExecution::get_source_result(&self, core::option::Option<&str>) -> core::option::Option<serde_json::value::Value>
+pub fn gwead::kernel::host_api::PluginExecution::get_variable(&self, &str) -> core::option::Option<&serde_json::value::Value>
+pub fn gwead::kernel::host_api::PluginExecution::input(&self) -> &serde_json::value::Value
+pub fn gwead::kernel::host_api::PluginExecution::invoke_depth(&self) -> u32
+pub fn gwead::kernel::host_api::PluginExecution::iteration_item(&self) -> core::option::Option<&serde_json::value::Value>
+pub fn gwead::kernel::host_api::PluginExecution::limits(&self) -> gwead::kernel::RuntimeLimits
+pub fn gwead::kernel::host_api::PluginExecution::plugin_name(&self) -> &str
+pub fn gwead::kernel::host_api::PluginExecution::resolution_context(&self) -> serde_json::value::Value
+pub fn gwead::kernel::host_api::PluginExecution::resolve_template(&self, &str, &serde_json::value::Value) -> alloc::string::String
+pub fn gwead::kernel::host_api::PluginExecution::resolve_value_with(&self, &serde_json::value::Value, &serde_json::value::Value) -> serde_json::value::Value
+pub fn gwead::kernel::host_api::PluginExecution::secret_resolver(&self) -> core::option::Option<&alloc::rcs::arc::Arc<dyn gwead::kernel::secrets::SecretResolver>>
+pub fn gwead::kernel::host_api::PluginExecution::secrets(&self) -> &serde_json::value::Value
+pub fn gwead::kernel::host_api::PluginExecution::set_variable(&mut self, alloc::string::String, serde_json::value::Value)
+pub fn gwead::kernel::host_api::PluginExecution::step_result(&self, &str) -> core::option::Option<serde_json::value::Value>
+pub fn gwead::kernel::host_api::PluginExecution::streams(&self) -> &gwead::kernel::streams::SharedStreamRegistry
+pub fn gwead::kernel::host_api::PluginExecution::take_readable_stream(&mut self, core::num::nonzero::NonZeroU32) -> core::option::Option<(alloc::string::String, gwead::kernel::streams::ReadableSource)>
+pub fn gwead::kernel::host_api::PluginExecution::trigger(&self) -> core::option::Option<&serde_json::value::Value>
+pub fn gwead::kernel::host_api::PluginExecution::wallclock_deadline(&self) -> core::option::Option<tokio::time::instant::Instant>
+pub mod gwead::kernel::identity
+#[non_exhaustive] pub enum gwead::kernel::identity::NameError
+pub gwead::kernel::identity::NameError::Empty
+pub gwead::kernel::identity::NameError::Empty::kind: gwead::kernel::identity::NameKind
+pub gwead::kernel::identity::NameError::InvalidChar
+pub gwead::kernel::identity::NameError::InvalidChar::ch: char
+pub gwead::kernel::identity::NameError::InvalidChar::kind: gwead::kernel::identity::NameKind
+pub gwead::kernel::identity::NameError::InvalidChar::name: alloc::string::String
+pub gwead::kernel::identity::NameError::LeadingDigit
+pub gwead::kernel::identity::NameError::LeadingDigit::kind: gwead::kernel::identity::NameKind
+pub gwead::kernel::identity::NameError::LeadingDigit::name: alloc::string::String
+pub gwead::kernel::identity::NameError::QualifiedReserved
+pub gwead::kernel::identity::NameError::QualifiedReserved::kind: gwead::kernel::identity::NameKind
+pub gwead::kernel::identity::NameError::QualifiedReserved::name: alloc::string::String
+pub gwead::kernel::identity::NameError::StepTypeNotOwned
+pub gwead::kernel::identity::NameError::StepTypeNotOwned::name: alloc::string::String
+pub gwead::kernel::identity::NameError::StepTypeNotOwned::plugin: alloc::string::String
+pub gwead::kernel::identity::NameError::TooLong
+pub gwead::kernel::identity::NameError::TooLong::kind: gwead::kernel::identity::NameKind
+pub gwead::kernel::identity::NameError::TooLong::len: usize
+pub gwead::kernel::identity::NameError::TooLong::max: usize
+pub gwead::kernel::identity::NameError::TooLong::name: alloc::string::String
+impl core::clone::Clone for gwead::kernel::identity::NameError
+pub fn gwead::kernel::identity::NameError::clone(&self) -> Self
+impl core::cmp::Eq for gwead::kernel::identity::NameError
+impl core::cmp::PartialEq for gwead::kernel::identity::NameError
+pub fn gwead::kernel::identity::NameError::eq(&self, &Self) -> bool
+impl core::error::Error for gwead::kernel::identity::NameError
+impl core::fmt::Debug for gwead::kernel::identity::NameError
+pub fn gwead::kernel::identity::NameError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for gwead::kernel::identity::NameError
+pub fn gwead::kernel::identity::NameError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for gwead::kernel::identity::NameError
+impl core::marker::Freeze for gwead::kernel::identity::NameError
+impl core::marker::Send for gwead::kernel::identity::NameError
+impl core::marker::Sync for gwead::kernel::identity::NameError
+impl core::marker::Unpin for gwead::kernel::identity::NameError
+impl core::marker::UnsafeUnpin for gwead::kernel::identity::NameError
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::identity::NameError
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::identity::NameError
+#[non_exhaustive] pub enum gwead::kernel::identity::NameKind
+pub gwead::kernel::identity::NameKind::AppCategorySegment
+pub gwead::kernel::identity::NameKind::Namespace
+pub gwead::kernel::identity::NameKind::NativeImplRef
+pub gwead::kernel::identity::NameKind::NativeImplRefSegment
+pub gwead::kernel::identity::NameKind::Plugin
+pub gwead::kernel::identity::NameKind::Role
+pub gwead::kernel::identity::NameKind::StepId
+pub gwead::kernel::identity::NameKind::StepType
+pub gwead::kernel::identity::NameKind::StepTypeSelector
+impl core::clone::Clone for gwead::kernel::identity::NameKind
+pub fn gwead::kernel::identity::NameKind::clone(&self) -> Self
+impl core::cmp::Eq for gwead::kernel::identity::NameKind
+impl core::cmp::PartialEq for gwead::kernel::identity::NameKind
+pub fn gwead::kernel::identity::NameKind::eq(&self, &Self) -> bool
+impl core::fmt::Debug for gwead::kernel::identity::NameKind
+pub fn gwead::kernel::identity::NameKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for gwead::kernel::identity::NameKind
+pub fn gwead::kernel::identity::NameKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for gwead::kernel::identity::NameKind
+impl core::marker::StructuralPartialEq for gwead::kernel::identity::NameKind
+impl core::marker::Freeze for gwead::kernel::identity::NameKind
+impl core::marker::Send for gwead::kernel::identity::NameKind
+impl core::marker::Sync for gwead::kernel::identity::NameKind
+impl core::marker::Unpin for gwead::kernel::identity::NameKind
+impl core::marker::UnsafeUnpin for gwead::kernel::identity::NameKind
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::identity::NameKind
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::identity::NameKind
+pub mod gwead::kernel::native_impls
+#[non_exhaustive] pub enum gwead::kernel::native_impls::NativeImplCollision
+pub gwead::kernel::native_impls::NativeImplCollision::Duplicate
+pub gwead::kernel::native_impls::NativeImplCollision::Duplicate::name: alloc::string::String
+pub gwead::kernel::native_impls::NativeImplCollision::Reserved
+pub gwead::kernel::native_impls::NativeImplCollision::Reserved::name: alloc::string::String
+impl core::error::Error for gwead::kernel::native_impls::NativeImplCollision
+impl core::fmt::Debug for gwead::kernel::native_impls::NativeImplCollision
+pub fn gwead::kernel::native_impls::NativeImplCollision::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for gwead::kernel::native_impls::NativeImplCollision
+pub fn gwead::kernel::native_impls::NativeImplCollision::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::native_impls::NativeImplCollision
+impl core::marker::Send for gwead::kernel::native_impls::NativeImplCollision
+impl core::marker::Sync for gwead::kernel::native_impls::NativeImplCollision
+impl core::marker::Unpin for gwead::kernel::native_impls::NativeImplCollision
+impl core::marker::UnsafeUnpin for gwead::kernel::native_impls::NativeImplCollision
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::native_impls::NativeImplCollision
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::native_impls::NativeImplCollision
+pub struct gwead::kernel::native_impls::NativeStepImplEntry
+impl gwead::kernel::native_impls::NativeStepImplEntry
+pub const fn gwead::kernel::native_impls::NativeStepImplEntry::name(&self) -> &'static str
+pub const fn gwead::kernel::native_impls::NativeStepImplEntry::new(&'static str, gwead::kernel::native_impls::NativeStepImpl) -> Self
+impl inventory::Collect for gwead::kernel::native_impls::NativeStepImplEntry
+impl core::marker::Freeze for gwead::kernel::native_impls::NativeStepImplEntry
+impl core::marker::Send for gwead::kernel::native_impls::NativeStepImplEntry
+impl core::marker::Sync for gwead::kernel::native_impls::NativeStepImplEntry
+impl core::marker::Unpin for gwead::kernel::native_impls::NativeStepImplEntry
+impl core::marker::UnsafeUnpin for gwead::kernel::native_impls::NativeStepImplEntry
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::native_impls::NativeStepImplEntry
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::native_impls::NativeStepImplEntry
+pub struct gwead::kernel::native_impls::NativeStepImplTable
+impl gwead::kernel::native_impls::NativeStepImplTable
+pub fn gwead::kernel::native_impls::NativeStepImplTable::discover() -> core::result::Result<Self, gwead::kernel::native_impls::NativeImplCollision>
+pub fn gwead::kernel::native_impls::NativeStepImplTable::empty() -> Self
+pub fn gwead::kernel::native_impls::NativeStepImplTable::from_entries<'a, I>(I) -> core::result::Result<Self, gwead::kernel::native_impls::NativeImplCollision> where I: core::iter::traits::collect::IntoIterator<Item = &'a gwead::kernel::native_impls::NativeStepImplEntry>
+pub fn gwead::kernel::native_impls::NativeStepImplTable::get(&self, &str) -> core::option::Option<gwead::kernel::native_impls::NativeStepImpl>
+pub fn gwead::kernel::native_impls::NativeStepImplTable::insert(&mut self, &str, gwead::kernel::native_impls::NativeStepImpl) -> core::result::Result<(), gwead::kernel::native_impls::NativeImplCollision>
+pub fn gwead::kernel::native_impls::NativeStepImplTable::is_empty(&self) -> bool
+pub fn gwead::kernel::native_impls::NativeStepImplTable::len(&self) -> usize
+impl core::default::Default for gwead::kernel::native_impls::NativeStepImplTable
+pub fn gwead::kernel::native_impls::NativeStepImplTable::default() -> Self
+impl core::fmt::Debug for gwead::kernel::native_impls::NativeStepImplTable
+pub fn gwead::kernel::native_impls::NativeStepImplTable::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::native_impls::NativeStepImplTable
+impl core::marker::Send for gwead::kernel::native_impls::NativeStepImplTable
+impl core::marker::Sync for gwead::kernel::native_impls::NativeStepImplTable
+impl core::marker::Unpin for gwead::kernel::native_impls::NativeStepImplTable
+impl core::marker::UnsafeUnpin for gwead::kernel::native_impls::NativeStepImplTable
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::native_impls::NativeStepImplTable
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::native_impls::NativeStepImplTable
+pub type gwead::kernel::native_impls::NativeStepImpl = gwead::kernel::runtime::StepFn
+pub mod gwead::kernel::permissions
+#[non_exhaustive] pub enum gwead::kernel::permissions::BlobOp
+pub gwead::kernel::permissions::BlobOp::Delete
+pub gwead::kernel::permissions::BlobOp::List
+pub gwead::kernel::permissions::BlobOp::Read
+pub gwead::kernel::permissions::BlobOp::Stat
+pub gwead::kernel::permissions::BlobOp::Watch
+pub gwead::kernel::permissions::BlobOp::Write
+impl core::clone::Clone for gwead::kernel::permissions::BlobOp
+pub fn gwead::kernel::permissions::BlobOp::clone(&self) -> Self
+impl core::cmp::Eq for gwead::kernel::permissions::BlobOp
+impl core::cmp::PartialEq for gwead::kernel::permissions::BlobOp
+pub fn gwead::kernel::permissions::BlobOp::eq(&self, &Self) -> bool
+impl core::fmt::Debug for gwead::kernel::permissions::BlobOp
+pub fn gwead::kernel::permissions::BlobOp::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for gwead::kernel::permissions::BlobOp
+pub fn gwead::kernel::permissions::BlobOp::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for gwead::kernel::permissions::BlobOp
+impl core::marker::Freeze for gwead::kernel::permissions::BlobOp
+impl core::marker::Send for gwead::kernel::permissions::BlobOp
+impl core::marker::Sync for gwead::kernel::permissions::BlobOp
+impl core::marker::Unpin for gwead::kernel::permissions::BlobOp
+impl core::marker::UnsafeUnpin for gwead::kernel::permissions::BlobOp
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::permissions::BlobOp
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::permissions::BlobOp
+pub struct gwead::kernel::permissions::AppPermissionCategory
+impl gwead::kernel::permissions::AppPermissionCategory
+pub fn gwead::kernel::permissions::AppPermissionCategory::check_value(&self, &str) -> core::result::Result<(), alloc::string::String>
+pub fn gwead::kernel::permissions::AppPermissionCategory::is_value_checked(&self) -> bool
+pub fn gwead::kernel::permissions::AppPermissionCategory::name(&self) -> &str
+pub fn gwead::kernel::permissions::AppPermissionCategory::new(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn gwead::kernel::permissions::AppPermissionCategory::with_validator<F>(self, F) -> Self where F: core::ops::function::Fn(&str) -> core::result::Result<(), alloc::string::String> + core::marker::Send + core::marker::Sync + 'static
+impl core::clone::Clone for gwead::kernel::permissions::AppPermissionCategory
+pub fn gwead::kernel::permissions::AppPermissionCategory::clone(&self) -> Self
+impl core::fmt::Debug for gwead::kernel::permissions::AppPermissionCategory
+pub fn gwead::kernel::permissions::AppPermissionCategory::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::permissions::AppPermissionCategory
+impl core::marker::Send for gwead::kernel::permissions::AppPermissionCategory
+impl core::marker::Sync for gwead::kernel::permissions::AppPermissionCategory
+impl core::marker::Unpin for gwead::kernel::permissions::AppPermissionCategory
+impl core::marker::UnsafeUnpin for gwead::kernel::permissions::AppPermissionCategory
+impl !core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::permissions::AppPermissionCategory
+impl !core::panic::unwind_safe::UnwindSafe for gwead::kernel::permissions::AppPermissionCategory
+pub mod gwead::kernel::registry
+pub struct gwead::kernel::registry::PluginRegistry
+impl gwead::kernel::registry::PluginRegistry
+pub fn gwead::kernel::registry::PluginRegistry::action_names(&self, &str) -> alloc::vec::Vec<alloc::string::String>
+pub fn gwead::kernel::registry::PluginRegistry::get_manifest(&self, &str) -> core::option::Option<&gwead::kernel::types::PluginManifest>
+pub fn gwead::kernel::registry::PluginRegistry::get_step_type_def(&self, &str) -> core::option::Option<(&str, &gwead::kernel::types::StepTypeDef)>
+pub fn gwead::kernel::registry::PluginRegistry::get_tool_descriptors(&self) -> alloc::vec::Vec<gwead::kernel::registry::ToolDescriptor>
+pub fn gwead::kernel::registry::PluginRegistry::has_plugin(&self, &str) -> bool
+pub fn gwead::kernel::registry::PluginRegistry::plugin_names(&self) -> alloc::vec::Vec<&str>
+pub fn gwead::kernel::registry::PluginRegistry::plugins_for_role(&self, &str) -> alloc::vec::Vec<alloc::string::String>
+pub fn gwead::kernel::registry::PluginRegistry::step_type_alias_candidates(&self, &str) -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)>
+pub fn gwead::kernel::registry::PluginRegistry::step_type_aliases_iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&str, &str)>
+pub fn gwead::kernel::registry::PluginRegistry::step_type_def_count(&self) -> usize
+pub fn gwead::kernel::registry::PluginRegistry::step_type_defs_iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&str, &str, &gwead::kernel::types::StepTypeDef)>
+pub fn gwead::kernel::registry::PluginRegistry::subscribers_for(&self, &str) -> &[(alloc::string::String, alloc::string::String)]
+impl core::marker::Freeze for gwead::kernel::registry::PluginRegistry
+impl core::marker::Send for gwead::kernel::registry::PluginRegistry
+impl core::marker::Sync for gwead::kernel::registry::PluginRegistry
+impl core::marker::Unpin for gwead::kernel::registry::PluginRegistry
+impl core::marker::UnsafeUnpin for gwead::kernel::registry::PluginRegistry
+impl !core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::registry::PluginRegistry
+impl !core::panic::unwind_safe::UnwindSafe for gwead::kernel::registry::PluginRegistry
+pub struct gwead::kernel::registry::ToolDescriptor
+pub gwead::kernel::registry::ToolDescriptor::action_name: alloc::string::String
+pub gwead::kernel::registry::ToolDescriptor::description: alloc::string::String
+pub gwead::kernel::registry::ToolDescriptor::parameters: serde_json::value::Value
+pub gwead::kernel::registry::ToolDescriptor::plugin_key: alloc::string::String
+pub gwead::kernel::registry::ToolDescriptor::tool_name: alloc::string::String
+impl core::clone::Clone for gwead::kernel::registry::ToolDescriptor
+pub fn gwead::kernel::registry::ToolDescriptor::clone(&self) -> Self
+impl core::fmt::Debug for gwead::kernel::registry::ToolDescriptor
+pub fn gwead::kernel::registry::ToolDescriptor::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::registry::ToolDescriptor
+impl core::marker::Send for gwead::kernel::registry::ToolDescriptor
+impl core::marker::Sync for gwead::kernel::registry::ToolDescriptor
+impl core::marker::Unpin for gwead::kernel::registry::ToolDescriptor
+impl core::marker::UnsafeUnpin for gwead::kernel::registry::ToolDescriptor
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::registry::ToolDescriptor
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::registry::ToolDescriptor
+pub mod gwead::kernel::runtime
+pub type gwead::kernel::runtime::StepFn = for<'a> fn(&'a mut (dyn gwead::kernel::host_api::PluginExecution + core::marker::Send), &'a serde_json::value::Value) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gwead::kernel::host_api::StepOutput, gwead::kernel::host_api::StepError>> + core::marker::Send + 'a)>>
+pub mod gwead::kernel::secrets
+#[non_exhaustive] pub enum gwead::kernel::secrets::SecretError
+pub gwead::kernel::secrets::SecretError::Unavailable
+pub gwead::kernel::secrets::SecretError::Unavailable::reason: alloc::string::String
+pub gwead::kernel::secrets::SecretError::Unavailable::subject: alloc::string::String
+impl core::error::Error for gwead::kernel::secrets::SecretError
+impl core::fmt::Debug for gwead::kernel::secrets::SecretError
+pub fn gwead::kernel::secrets::SecretError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for gwead::kernel::secrets::SecretError
+pub fn gwead::kernel::secrets::SecretError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::secrets::SecretError
+impl core::marker::Send for gwead::kernel::secrets::SecretError
+impl core::marker::Sync for gwead::kernel::secrets::SecretError
+impl core::marker::Unpin for gwead::kernel::secrets::SecretError
+impl core::marker::UnsafeUnpin for gwead::kernel::secrets::SecretError
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::secrets::SecretError
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::secrets::SecretError
+#[non_exhaustive] pub struct gwead::kernel::secrets::SecretRequest<'a>
+pub gwead::kernel::secrets::SecretRequest::declared_keys: &'a [alloc::string::String]
+pub gwead::kernel::secrets::SecretRequest::exec_ctx: &'a gwead::kernel::exec_context::ExecutionContext
+pub gwead::kernel::secrets::SecretRequest::executing_plugin: &'a str
+pub gwead::kernel::secrets::SecretRequest::overridable_keys: &'a [alloc::string::String]
+pub gwead::kernel::secrets::SecretRequest::subject: &'a str
+impl<'a> core::clone::Clone for gwead::kernel::secrets::SecretRequest<'a>
+pub fn gwead::kernel::secrets::SecretRequest<'a>::clone(&self) -> Self
+impl<'a> core::fmt::Debug for gwead::kernel::secrets::SecretRequest<'a>
+pub fn gwead::kernel::secrets::SecretRequest<'a>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a> core::marker::Freeze for gwead::kernel::secrets::SecretRequest<'a>
+impl<'a> core::marker::Send for gwead::kernel::secrets::SecretRequest<'a>
+impl<'a> core::marker::Sync for gwead::kernel::secrets::SecretRequest<'a>
+impl<'a> core::marker::Unpin for gwead::kernel::secrets::SecretRequest<'a>
+impl<'a> core::marker::UnsafeUnpin for gwead::kernel::secrets::SecretRequest<'a>
+impl<'a> core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::secrets::SecretRequest<'a>
+impl<'a> core::panic::unwind_safe::UnwindSafe for gwead::kernel::secrets::SecretRequest<'a>
+pub struct gwead::kernel::secrets::StaticSecretResolver
+impl gwead::kernel::secrets::StaticSecretResolver
+pub fn gwead::kernel::secrets::StaticSecretResolver::new(impl core::convert::Into<alloc::string::String>, serde_json::value::Value) -> Self
+impl gwead::kernel::secrets::SecretResolver for gwead::kernel::secrets::StaticSecretResolver
+pub fn gwead::kernel::secrets::StaticSecretResolver::resolve<'a>(&'a self, gwead::kernel::secrets::SecretRequest<'a>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<serde_json::value::Value, gwead::kernel::secrets::SecretError>> + core::marker::Send + 'a)>>
+impl core::marker::Freeze for gwead::kernel::secrets::StaticSecretResolver
+impl core::marker::Send for gwead::kernel::secrets::StaticSecretResolver
+impl core::marker::Sync for gwead::kernel::secrets::StaticSecretResolver
+impl core::marker::Unpin for gwead::kernel::secrets::StaticSecretResolver
+impl core::marker::UnsafeUnpin for gwead::kernel::secrets::StaticSecretResolver
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::secrets::StaticSecretResolver
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::secrets::StaticSecretResolver
+pub trait gwead::kernel::secrets::SecretResolver: core::marker::Send + core::marker::Sync
+pub fn gwead::kernel::secrets::SecretResolver::resolve<'a>(&'a self, gwead::kernel::secrets::SecretRequest<'a>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<serde_json::value::Value, gwead::kernel::secrets::SecretError>> + core::marker::Send + 'a)>>
+impl gwead::kernel::secrets::SecretResolver for gwead::kernel::secrets::StaticSecretResolver
+pub fn gwead::kernel::secrets::StaticSecretResolver::resolve<'a>(&'a self, gwead::kernel::secrets::SecretRequest<'a>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<serde_json::value::Value, gwead::kernel::secrets::SecretError>> + core::marker::Send + 'a)>>
+pub mod gwead::kernel::streams
+pub struct gwead::kernel::streams::StreamRegistry
+impl gwead::kernel::streams::StreamRegistry
+pub fn gwead::kernel::streams::StreamRegistry::adopt(&mut self, alloc::rcs::arc::Arc<gwead::kernel::streams::StreamState>) -> gwead::kernel::streams::StreamId
+pub fn gwead::kernel::streams::StreamRegistry::close(&mut self, gwead::kernel::streams::StreamId)
+pub fn gwead::kernel::streams::StreamRegistry::close_handle(&mut self, gwead::kernel::streams::StreamId) -> i32
+pub fn gwead::kernel::streams::StreamRegistry::drain(&mut self)
+pub fn gwead::kernel::streams::StreamRegistry::fan_out_readable_streaming(&mut self, gwead::kernel::streams::StreamId, usize, usize) -> core::result::Result<alloc::vec::Vec<gwead::kernel::streams::StreamId>, &'static str>
+pub fn gwead::kernel::streams::StreamRegistry::get(&self, gwead::kernel::streams::StreamId) -> core::option::Option<alloc::rcs::arc::Arc<gwead::kernel::streams::StreamState>>
+pub fn gwead::kernel::streams::StreamRegistry::is_empty(&self) -> bool
+pub fn gwead::kernel::streams::StreamRegistry::len(&self) -> usize
+pub fn gwead::kernel::streams::StreamRegistry::new() -> Self
+pub fn gwead::kernel::streams::StreamRegistry::register_readable(&mut self, impl core::convert::Into<alloc::string::String>, gwead::kernel::streams::ReadableSource) -> gwead::kernel::streams::StreamId
+pub fn gwead::kernel::streams::StreamRegistry::register_writable(&mut self, impl core::convert::Into<alloc::string::String>, usize) -> (gwead::kernel::streams::StreamId, gwead::kernel::streams::WritableReceiver)
+pub fn gwead::kernel::streams::StreamRegistry::take(&mut self, gwead::kernel::streams::StreamId) -> core::option::Option<alloc::rcs::arc::Arc<gwead::kernel::streams::StreamState>>
+pub fn gwead::kernel::streams::StreamRegistry::take_readable(&mut self, gwead::kernel::streams::StreamId) -> core::option::Option<(alloc::string::String, gwead::kernel::streams::ReadableSource)>
+impl core::default::Default for gwead::kernel::streams::StreamRegistry
+pub fn gwead::kernel::streams::StreamRegistry::default() -> Self
+impl core::marker::Freeze for gwead::kernel::streams::StreamRegistry
+impl core::marker::Send for gwead::kernel::streams::StreamRegistry
+impl core::marker::Sync for gwead::kernel::streams::StreamRegistry
+impl core::marker::Unpin for gwead::kernel::streams::StreamRegistry
+impl core::marker::UnsafeUnpin for gwead::kernel::streams::StreamRegistry
+impl !core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::streams::StreamRegistry
+impl !core::panic::unwind_safe::UnwindSafe for gwead::kernel::streams::StreamRegistry
+pub struct gwead::kernel::streams::StreamState
+pub gwead::kernel::streams::StreamState::content_type: alloc::string::String
+pub gwead::kernel::streams::StreamState::id: gwead::kernel::streams::StreamId
+impl gwead::kernel::streams::StreamState
+pub fn gwead::kernel::streams::StreamState::is_closed(&self) -> bool
+pub fn gwead::kernel::streams::StreamState::is_readable(&self) -> bool
+pub fn gwead::kernel::streams::StreamState::is_writable(&self) -> bool
+pub fn gwead::kernel::streams::StreamState::last_error(&self) -> core::option::Option<alloc::string::String>
+pub fn gwead::kernel::streams::StreamState::with_last_error<R>(&self, impl core::ops::function::FnOnce(core::option::Option<&str>) -> R) -> R
+impl gwead::kernel::streams::StreamState
+pub async fn gwead::kernel::streams::StreamState::read_async(&self, &mut [u8], &tokio_util::sync::cancellation_token::CancellationToken) -> i32
+pub async fn gwead::kernel::streams::StreamState::write_async(&self, &[u8], &tokio_util::sync::cancellation_token::CancellationToken) -> i32
+impl !core::marker::Freeze for gwead::kernel::streams::StreamState
+impl core::marker::Send for gwead::kernel::streams::StreamState
+impl core::marker::Sync for gwead::kernel::streams::StreamState
+impl core::marker::Unpin for gwead::kernel::streams::StreamState
+impl core::marker::UnsafeUnpin for gwead::kernel::streams::StreamState
+impl !core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::streams::StreamState
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::streams::StreamState
+pub const gwead::kernel::streams::EMPTY_ERROR_TEXT: &str
+pub const gwead::kernel::streams::MAX_LAST_ERROR_BYTES: usize
+pub const gwead::kernel::streams::MAX_STREAM_HANDLE: u32
+pub const gwead::kernel::streams::STREAM_CANCELLED: i32
+pub const gwead::kernel::streams::STREAM_CLOSED: i32
+pub const gwead::kernel::streams::STREAM_DIRECTION_MISMATCH: i32
+pub const gwead::kernel::streams::STREAM_EOF: i32
+pub const gwead::kernel::streams::STREAM_FANOUT_CAPACITY: usize
+pub const gwead::kernel::streams::STREAM_INVALID_HANDLE: i32
+pub const gwead::kernel::streams::STREAM_IO_ERROR: i32
+pub const gwead::kernel::streams::STREAM_OOB: i32
+pub const gwead::kernel::streams::STREAM_READ_CANCELLED_TEXT: &str
+pub const gwead::kernel::streams::STREAM_WRITE_CANCELLED_TEXT: &str
+pub async fn gwead::kernel::streams::fan_out_readable_shared(&gwead::kernel::streams::SharedStreamRegistry, gwead::kernel::streams::StreamId, usize) -> core::result::Result<alloc::vec::Vec<gwead::kernel::streams::StreamId>, &'static str>
+pub fn gwead::kernel::streams::lock_shared(&gwead::kernel::streams::SharedStreamRegistry) -> std::sync::poison::mutex::MutexGuard<'_, gwead::kernel::streams::StreamRegistry>
+pub async fn gwead::kernel::streams::read_async_shared(&gwead::kernel::streams::SharedStreamRegistry, gwead::kernel::streams::StreamId, &mut [u8], &tokio_util::sync::cancellation_token::CancellationToken) -> i32
+pub async fn gwead::kernel::streams::write_async_shared(&gwead::kernel::streams::SharedStreamRegistry, gwead::kernel::streams::StreamId, &[u8], &tokio_util::sync::cancellation_token::CancellationToken) -> i32
+pub type gwead::kernel::streams::ReadableSource = futures_core::stream::BoxStream<'static, core::result::Result<bytes::bytes::Bytes, core::io::error::Error>>
+pub type gwead::kernel::streams::SharedStreamRegistry = alloc::rcs::arc::Arc<std::sync::poison::mutex::Mutex<gwead::kernel::streams::StreamRegistry>>
+pub type gwead::kernel::streams::StreamChunk = bytes::bytes::Bytes
+pub type gwead::kernel::streams::StreamId = core::num::nonzero::NonZeroU32
+pub type gwead::kernel::streams::WritableReceiver = tokio::sync::mpsc::bounded::Receiver<core::result::Result<bytes::bytes::Bytes, core::io::error::Error>>
+pub type gwead::kernel::streams::WritableSender = tokio::sync::mpsc::bounded::Sender<core::result::Result<bytes::bytes::Bytes, core::io::error::Error>>
+pub mod gwead::kernel::types
+#[non_exhaustive] pub enum gwead::kernel::types::StepTypeImplKind
+pub gwead::kernel::types::StepTypeImplKind::Intrinsic
+pub gwead::kernel::types::StepTypeImplKind::Native
+pub gwead::kernel::types::StepTypeImplKind::Wasm
+impl core::clone::Clone for gwead::kernel::types::StepTypeImplKind
+pub fn gwead::kernel::types::StepTypeImplKind::clone(&self) -> Self
+impl core::cmp::Eq for gwead::kernel::types::StepTypeImplKind
+impl core::cmp::PartialEq for gwead::kernel::types::StepTypeImplKind
+pub fn gwead::kernel::types::StepTypeImplKind::eq(&self, &Self) -> bool
+impl core::default::Default for gwead::kernel::types::StepTypeImplKind
+pub fn gwead::kernel::types::StepTypeImplKind::default() -> Self
+impl core::fmt::Debug for gwead::kernel::types::StepTypeImplKind
+pub fn gwead::kernel::types::StepTypeImplKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for gwead::kernel::types::StepTypeImplKind
+impl core::marker::StructuralPartialEq for gwead::kernel::types::StepTypeImplKind
+impl serde_core::ser::Serialize for gwead::kernel::types::StepTypeImplKind
+pub fn gwead::kernel::types::StepTypeImplKind::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for gwead::kernel::types::StepTypeImplKind
+pub fn gwead::kernel::types::StepTypeImplKind::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for gwead::kernel::types::StepTypeImplKind
+impl core::marker::Send for gwead::kernel::types::StepTypeImplKind
+impl core::marker::Sync for gwead::kernel::types::StepTypeImplKind
+impl core::marker::Unpin for gwead::kernel::types::StepTypeImplKind
+impl core::marker::UnsafeUnpin for gwead::kernel::types::StepTypeImplKind
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::types::StepTypeImplKind
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::types::StepTypeImplKind
+#[non_exhaustive] pub enum gwead::kernel::types::WasmModuleSpec
+pub gwead::kernel::types::WasmModuleSpec::Inline
+pub gwead::kernel::types::WasmModuleSpec::Inline::base64: alloc::string::String
+pub gwead::kernel::types::WasmModuleSpec::Path
+pub gwead::kernel::types::WasmModuleSpec::Path::path: alloc::string::String
+impl core::clone::Clone for gwead::kernel::types::WasmModuleSpec
+pub fn gwead::kernel::types::WasmModuleSpec::clone(&self) -> Self
+impl core::fmt::Debug for gwead::kernel::types::WasmModuleSpec
+pub fn gwead::kernel::types::WasmModuleSpec::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for gwead::kernel::types::WasmModuleSpec
+pub fn gwead::kernel::types::WasmModuleSpec::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for gwead::kernel::types::WasmModuleSpec
+pub fn gwead::kernel::types::WasmModuleSpec::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for gwead::kernel::types::WasmModuleSpec
+impl core::marker::Send for gwead::kernel::types::WasmModuleSpec
+impl core::marker::Sync for gwead::kernel::types::WasmModuleSpec
+impl core::marker::Unpin for gwead::kernel::types::WasmModuleSpec
+impl core::marker::UnsafeUnpin for gwead::kernel::types::WasmModuleSpec
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::types::WasmModuleSpec
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::types::WasmModuleSpec
+#[non_exhaustive] pub struct gwead::kernel::types::Action
+pub gwead::kernel::types::Action::continuous: bool
+pub gwead::kernel::types::Action::dataflow: bool
+pub gwead::kernel::types::Action::description: core::option::Option<alloc::string::String>
+pub gwead::kernel::types::Action::input_schema: core::option::Option<serde_json::value::Value>
+pub gwead::kernel::types::Action::interval_ms: u64
+pub gwead::kernel::types::Action::output_schema: core::option::Option<serde_json::value::Value>
+pub gwead::kernel::types::Action::parallel_waves: bool
+pub gwead::kernel::types::Action::result_mapping: indexmap::map::IndexMap<alloc::string::String, serde_json::value::Value>
+pub gwead::kernel::types::Action::results_path: core::option::Option<alloc::string::String>
+pub gwead::kernel::types::Action::steps: alloc::vec::Vec<gwead::kernel::types::StepDef>
+pub gwead::kernel::types::Action::subscribes_to: alloc::vec::Vec<alloc::string::String>
+pub gwead::kernel::types::Action::tool: core::option::Option<gwead::kernel::types::ToolDef>
+pub gwead::kernel::types::Action::wallclock_timeout_ms: core::option::Option<u64>
+impl gwead::kernel::types::Action
+pub fn gwead::kernel::types::Action::new(alloc::vec::Vec<gwead::kernel::types::StepDef>) -> Self
+impl core::clone::Clone for gwead::kernel::types::Action
+pub fn gwead::kernel::types::Action::clone(&self) -> Self
+impl core::default::Default for gwead::kernel::types::Action
+pub fn gwead::kernel::types::Action::default() -> Self
+impl core::fmt::Debug for gwead::kernel::types::Action
+pub fn gwead::kernel::types::Action::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for gwead::kernel::types::Action
+pub fn gwead::kernel::types::Action::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for gwead::kernel::types::Action
+pub fn gwead::kernel::types::Action::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for gwead::kernel::types::Action
+impl core::marker::Send for gwead::kernel::types::Action
+impl core::marker::Sync for gwead::kernel::types::Action
+impl core::marker::Unpin for gwead::kernel::types::Action
+impl core::marker::UnsafeUnpin for gwead::kernel::types::Action
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::types::Action
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::types::Action
+pub struct gwead::kernel::types::ActionResult
+pub gwead::kernel::types::ActionResult::output: serde_json::value::Value
+pub gwead::kernel::types::ActionResult::step_results: indexmap::map::IndexMap<alloc::string::String, serde_json::value::Value>
+pub gwead::kernel::types::ActionResult::variables: indexmap::map::IndexMap<alloc::string::String, serde_json::value::Value>
+impl core::clone::Clone for gwead::kernel::types::ActionResult
+pub fn gwead::kernel::types::ActionResult::clone(&self) -> Self
+impl core::fmt::Debug for gwead::kernel::types::ActionResult
+pub fn gwead::kernel::types::ActionResult::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::types::ActionResult
+impl core::marker::Send for gwead::kernel::types::ActionResult
+impl core::marker::Sync for gwead::kernel::types::ActionResult
+impl core::marker::Unpin for gwead::kernel::types::ActionResult
+impl core::marker::UnsafeUnpin for gwead::kernel::types::ActionResult
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::types::ActionResult
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::types::ActionResult
+pub struct gwead::kernel::types::AuthSpec
+pub gwead::kernel::types::AuthSpec::auth_type: alloc::string::String
+pub gwead::kernel::types::AuthSpec::config_key: core::option::Option<alloc::string::String>
+pub gwead::kernel::types::AuthSpec::header_name: core::option::Option<alloc::string::String>
+impl core::clone::Clone for gwead::kernel::types::AuthSpec
+pub fn gwead::kernel::types::AuthSpec::clone(&self) -> Self
+impl core::fmt::Debug for gwead::kernel::types::AuthSpec
+pub fn gwead::kernel::types::AuthSpec::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for gwead::kernel::types::AuthSpec
+pub fn gwead::kernel::types::AuthSpec::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for gwead::kernel::types::AuthSpec
+pub fn gwead::kernel::types::AuthSpec::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for gwead::kernel::types::AuthSpec
+impl core::marker::Send for gwead::kernel::types::AuthSpec
+impl core::marker::Sync for gwead::kernel::types::AuthSpec
+impl core::marker::Unpin for gwead::kernel::types::AuthSpec
+impl core::marker::UnsafeUnpin for gwead::kernel::types::AuthSpec
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::types::AuthSpec
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::types::AuthSpec
+pub struct gwead::kernel::types::ConfigField
+pub gwead::kernel::types::ConfigField::default_value: core::option::Option<serde_json::value::Value>
+pub gwead::kernel::types::ConfigField::description: core::option::Option<alloc::string::String>
+pub gwead::kernel::types::ConfigField::display_name: core::option::Option<alloc::string::String>
+pub gwead::kernel::types::ConfigField::field_type: alloc::string::String
+pub gwead::kernel::types::ConfigField::key: alloc::string::String
+pub gwead::kernel::types::ConfigField::options: alloc::vec::Vec<alloc::string::String>
+pub gwead::kernel::types::ConfigField::required: bool
+pub gwead::kernel::types::ConfigField::secret: bool
+impl core::clone::Clone for gwead::kernel::types::ConfigField
+pub fn gwead::kernel::types::ConfigField::clone(&self) -> Self
+impl core::fmt::Debug for gwead::kernel::types::ConfigField
+pub fn gwead::kernel::types::ConfigField::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for gwead::kernel::types::ConfigField
+pub fn gwead::kernel::types::ConfigField::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for gwead::kernel::types::ConfigField
+pub fn gwead::kernel::types::ConfigField::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for gwead::kernel::types::ConfigField
+impl core::marker::Send for gwead::kernel::types::ConfigField
+impl core::marker::Sync for gwead::kernel::types::ConfigField
+impl core::marker::Unpin for gwead::kernel::types::ConfigField
+impl core::marker::UnsafeUnpin for gwead::kernel::types::ConfigField
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::types::ConfigField
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::types::ConfigField
+pub struct gwead::kernel::types::ConfigSchema
+pub gwead::kernel::types::ConfigSchema::system_fields: alloc::vec::Vec<gwead::kernel::types::ConfigField>
+pub gwead::kernel::types::ConfigSchema::user_fields: alloc::vec::Vec<gwead::kernel::types::ConfigField>
+impl core::clone::Clone for gwead::kernel::types::ConfigSchema
+pub fn gwead::kernel::types::ConfigSchema::clone(&self) -> Self
+impl core::fmt::Debug for gwead::kernel::types::ConfigSchema
+pub fn gwead::kernel::types::ConfigSchema::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for gwead::kernel::types::ConfigSchema
+pub fn gwead::kernel::types::ConfigSchema::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for gwead::kernel::types::ConfigSchema
+pub fn gwead::kernel::types::ConfigSchema::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for gwead::kernel::types::ConfigSchema
+impl core::marker::Send for gwead::kernel::types::ConfigSchema
+impl core::marker::Sync for gwead::kernel::types::ConfigSchema
+impl core::marker::Unpin for gwead::kernel::types::ConfigSchema
+impl core::marker::UnsafeUnpin for gwead::kernel::types::ConfigSchema
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::types::ConfigSchema
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::types::ConfigSchema
+#[non_exhaustive] pub struct gwead::kernel::types::PluginManifest
+pub gwead::kernel::types::PluginManifest::actions: indexmap::map::IndexMap<alloc::string::String, gwead::kernel::types::Action>
+pub gwead::kernel::types::PluginManifest::auth: core::option::Option<gwead::kernel::types::AuthSpec>
+pub gwead::kernel::types::PluginManifest::config_schema: core::option::Option<gwead::kernel::types::ConfigSchema>
+pub gwead::kernel::types::PluginManifest::description: core::option::Option<alloc::string::String>
+pub gwead::kernel::types::PluginManifest::display_name: core::option::Option<alloc::string::String>
+pub gwead::kernel::types::PluginManifest::format_version: core::option::Option<u32>
+pub gwead::kernel::types::PluginManifest::metadata: indexmap::map::IndexMap<alloc::string::String, serde_json::value::Value>
+pub gwead::kernel::types::PluginManifest::name: alloc::string::String
+pub gwead::kernel::types::PluginManifest::permissions: alloc::vec::Vec<alloc::string::String>
+pub gwead::kernel::types::PluginManifest::roles: alloc::vec::Vec<alloc::string::String>
+pub gwead::kernel::types::PluginManifest::step_type_defs: alloc::vec::Vec<gwead::kernel::types::StepTypeDef>
+pub gwead::kernel::types::PluginManifest::step_type_impls: alloc::vec::Vec<gwead::kernel::types::StepTypeImpl>
+pub gwead::kernel::types::PluginManifest::step_types: indexmap::map::IndexMap<alloc::string::String, alloc::string::String>
+pub gwead::kernel::types::PluginManifest::tracking_tag: core::option::Option<alloc::string::String>
+pub gwead::kernel::types::PluginManifest::uses_secrets: alloc::vec::Vec<gwead::kernel::types::SecretDecl>
+pub gwead::kernel::types::PluginManifest::version: core::option::Option<alloc::string::String>
+pub gwead::kernel::types::PluginManifest::wasm_modules: indexmap::map::IndexMap<alloc::string::String, gwead::kernel::types::WasmModuleSpec>
+impl gwead::kernel::types::PluginManifest
+pub fn gwead::kernel::types::PluginManifest::declared_secret_keys(&self) -> alloc::vec::Vec<alloc::string::String>
+pub fn gwead::kernel::types::PluginManifest::overridable_secret_keys(&self) -> alloc::vec::Vec<alloc::string::String>
+impl gwead::kernel::types::PluginManifest
+pub fn gwead::kernel::types::PluginManifest::new(impl core::convert::Into<alloc::string::String>) -> Self
+impl gwead::kernel::types::PluginManifest
+pub fn gwead::kernel::types::PluginManifest::tracking_tag(&self) -> alloc::string::String
+impl core::clone::Clone for gwead::kernel::types::PluginManifest
+pub fn gwead::kernel::types::PluginManifest::clone(&self) -> Self
+impl core::default::Default for gwead::kernel::types::PluginManifest
+pub fn gwead::kernel::types::PluginManifest::default() -> Self
+impl core::fmt::Debug for gwead::kernel::types::PluginManifest
+pub fn gwead::kernel::types::PluginManifest::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for gwead::kernel::types::PluginManifest
+pub fn gwead::kernel::types::PluginManifest::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for gwead::kernel::types::PluginManifest
+pub fn gwead::kernel::types::PluginManifest::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for gwead::kernel::types::PluginManifest
+impl core::marker::Send for gwead::kernel::types::PluginManifest
+impl core::marker::Sync for gwead::kernel::types::PluginManifest
+impl core::marker::Unpin for gwead::kernel::types::PluginManifest
+impl core::marker::UnsafeUnpin for gwead::kernel::types::PluginManifest
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::types::PluginManifest
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::types::PluginManifest
+pub struct gwead::kernel::types::SecretDecl
+pub gwead::kernel::types::SecretDecl::key: alloc::string::String
+pub gwead::kernel::types::SecretDecl::overridable: bool
+impl gwead::kernel::types::SecretDecl
+pub fn gwead::kernel::types::SecretDecl::new(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn gwead::kernel::types::SecretDecl::overridable(impl core::convert::Into<alloc::string::String>) -> Self
+impl core::clone::Clone for gwead::kernel::types::SecretDecl
+pub fn gwead::kernel::types::SecretDecl::clone(&self) -> Self
+impl core::cmp::Eq for gwead::kernel::types::SecretDecl
+impl core::cmp::PartialEq for gwead::kernel::types::SecretDecl
+pub fn gwead::kernel::types::SecretDecl::eq(&self, &Self) -> bool
+impl core::fmt::Debug for gwead::kernel::types::SecretDecl
+pub fn gwead::kernel::types::SecretDecl::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for gwead::kernel::types::SecretDecl
+impl serde_core::ser::Serialize for gwead::kernel::types::SecretDecl
+pub fn gwead::kernel::types::SecretDecl::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for gwead::kernel::types::SecretDecl
+pub fn gwead::kernel::types::SecretDecl::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+impl core::marker::Freeze for gwead::kernel::types::SecretDecl
+impl core::marker::Send for gwead::kernel::types::SecretDecl
+impl core::marker::Sync for gwead::kernel::types::SecretDecl
+impl core::marker::Unpin for gwead::kernel::types::SecretDecl
+impl core::marker::UnsafeUnpin for gwead::kernel::types::SecretDecl
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::types::SecretDecl
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::types::SecretDecl
+#[non_exhaustive] pub struct gwead::kernel::types::StepDef
+pub gwead::kernel::types::StepDef::depends_on: alloc::vec::Vec<alloc::string::String>
+pub gwead::kernel::types::StepDef::id: alloc::string::String
+pub gwead::kernel::types::StepDef::long_running: bool
+pub gwead::kernel::types::StepDef::params: serde_json::value::Value
+pub gwead::kernel::types::StepDef::step_type: alloc::string::String
+pub gwead::kernel::types::StepDef::store_to_variable: core::option::Option<alloc::string::String>
+impl gwead::kernel::types::StepDef
+pub fn gwead::kernel::types::StepDef::from_inner_value(&serde_json::value::Value) -> core::result::Result<Self, serde_json::error::Error>
+pub fn gwead::kernel::types::StepDef::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, serde_json::value::Value) -> Self
+impl core::clone::Clone for gwead::kernel::types::StepDef
+pub fn gwead::kernel::types::StepDef::clone(&self) -> Self
+impl core::default::Default for gwead::kernel::types::StepDef
+pub fn gwead::kernel::types::StepDef::default() -> Self
+impl core::fmt::Debug for gwead::kernel::types::StepDef
+pub fn gwead::kernel::types::StepDef::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for gwead::kernel::types::StepDef
+pub fn gwead::kernel::types::StepDef::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for gwead::kernel::types::StepDef
+pub fn gwead::kernel::types::StepDef::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for gwead::kernel::types::StepDef
+impl core::marker::Send for gwead::kernel::types::StepDef
+impl core::marker::Sync for gwead::kernel::types::StepDef
+impl core::marker::Unpin for gwead::kernel::types::StepDef
+impl core::marker::UnsafeUnpin for gwead::kernel::types::StepDef
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::types::StepDef
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::types::StepDef
+pub struct gwead::kernel::types::StepReference
+pub gwead::kernel::types::StepReference::action: alloc::string::String
+pub gwead::kernel::types::StepReference::plugin: alloc::string::String
+impl core::clone::Clone for gwead::kernel::types::StepReference
+pub fn gwead::kernel::types::StepReference::clone(&self) -> Self
+impl core::fmt::Debug for gwead::kernel::types::StepReference
+pub fn gwead::kernel::types::StepReference::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for gwead::kernel::types::StepReference
+pub fn gwead::kernel::types::StepReference::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for gwead::kernel::types::StepReference
+pub fn gwead::kernel::types::StepReference::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for gwead::kernel::types::StepReference
+impl core::marker::Send for gwead::kernel::types::StepReference
+impl core::marker::Sync for gwead::kernel::types::StepReference
+impl core::marker::Unpin for gwead::kernel::types::StepReference
+impl core::marker::UnsafeUnpin for gwead::kernel::types::StepReference
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::types::StepReference
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::types::StepReference
+#[non_exhaustive] pub struct gwead::kernel::types::StepTypeDef
+pub gwead::kernel::types::StepTypeDef::freely_usable: bool
+pub gwead::kernel::types::StepTypeDef::input_schema: core::option::Option<serde_json::value::Value>
+pub gwead::kernel::types::StepTypeDef::metadata_schema: core::option::Option<serde_json::value::Value>
+pub gwead::kernel::types::StepTypeDef::name: alloc::string::String
+pub gwead::kernel::types::StepTypeDef::output_schema: core::option::Option<serde_json::value::Value>
+pub gwead::kernel::types::StepTypeDef::references: alloc::vec::Vec<gwead::kernel::types::StepReference>
+pub gwead::kernel::types::StepTypeDef::selector: core::option::Option<alloc::string::String>
+impl gwead::kernel::types::StepTypeDef
+pub fn gwead::kernel::types::StepTypeDef::new(impl core::convert::Into<alloc::string::String>) -> Self
+impl core::clone::Clone for gwead::kernel::types::StepTypeDef
+pub fn gwead::kernel::types::StepTypeDef::clone(&self) -> Self
+impl core::default::Default for gwead::kernel::types::StepTypeDef
+pub fn gwead::kernel::types::StepTypeDef::default() -> Self
+impl core::fmt::Debug for gwead::kernel::types::StepTypeDef
+pub fn gwead::kernel::types::StepTypeDef::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for gwead::kernel::types::StepTypeDef
+pub fn gwead::kernel::types::StepTypeDef::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for gwead::kernel::types::StepTypeDef
+pub fn gwead::kernel::types::StepTypeDef::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for gwead::kernel::types::StepTypeDef
+impl core::marker::Send for gwead::kernel::types::StepTypeDef
+impl core::marker::Sync for gwead::kernel::types::StepTypeDef
+impl core::marker::Unpin for gwead::kernel::types::StepTypeDef
+impl core::marker::UnsafeUnpin for gwead::kernel::types::StepTypeDef
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::types::StepTypeDef
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::types::StepTypeDef
+pub struct gwead::kernel::types::StepTypeImpl
+pub gwead::kernel::types::StepTypeImpl::impl_ref: core::option::Option<alloc::string::String>
+pub gwead::kernel::types::StepTypeImpl::kind: gwead::kernel::types::StepTypeImplKind
+pub gwead::kernel::types::StepTypeImpl::matches: core::option::Option<alloc::string::String>
+pub gwead::kernel::types::StepTypeImpl::step_type: alloc::string::String
+pub gwead::kernel::types::StepTypeImpl::wasm_module: core::option::Option<alloc::string::String>
+impl core::clone::Clone for gwead::kernel::types::StepTypeImpl
+pub fn gwead::kernel::types::StepTypeImpl::clone(&self) -> Self
+impl core::fmt::Debug for gwead::kernel::types::StepTypeImpl
+pub fn gwead::kernel::types::StepTypeImpl::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for gwead::kernel::types::StepTypeImpl
+pub fn gwead::kernel::types::StepTypeImpl::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for gwead::kernel::types::StepTypeImpl
+pub fn gwead::kernel::types::StepTypeImpl::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for gwead::kernel::types::StepTypeImpl
+impl core::marker::Send for gwead::kernel::types::StepTypeImpl
+impl core::marker::Sync for gwead::kernel::types::StepTypeImpl
+impl core::marker::Unpin for gwead::kernel::types::StepTypeImpl
+impl core::marker::UnsafeUnpin for gwead::kernel::types::StepTypeImpl
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::types::StepTypeImpl
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::types::StepTypeImpl
+pub struct gwead::kernel::types::ToolDef
+pub gwead::kernel::types::ToolDef::description: alloc::string::String
+pub gwead::kernel::types::ToolDef::name: alloc::string::String
+pub gwead::kernel::types::ToolDef::parameters: serde_json::value::Value
+impl core::clone::Clone for gwead::kernel::types::ToolDef
+pub fn gwead::kernel::types::ToolDef::clone(&self) -> Self
+impl core::fmt::Debug for gwead::kernel::types::ToolDef
+pub fn gwead::kernel::types::ToolDef::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for gwead::kernel::types::ToolDef
+pub fn gwead::kernel::types::ToolDef::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for gwead::kernel::types::ToolDef
+pub fn gwead::kernel::types::ToolDef::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for gwead::kernel::types::ToolDef
+impl core::marker::Send for gwead::kernel::types::ToolDef
+impl core::marker::Sync for gwead::kernel::types::ToolDef
+impl core::marker::Unpin for gwead::kernel::types::ToolDef
+impl core::marker::UnsafeUnpin for gwead::kernel::types::ToolDef
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::types::ToolDef
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::types::ToolDef
+pub const gwead::kernel::types::SUPPORTED_FORMAT_VERSION: u32
+#[non_exhaustive] pub enum gwead::kernel::DataflowEvent
+pub gwead::kernel::DataflowEvent::PipelineCompleted
+pub gwead::kernel::DataflowEvent::PipelineCompleted::ok: bool
+pub gwead::kernel::DataflowEvent::StepCompleted
+pub gwead::kernel::DataflowEvent::StepCompleted::ok: bool
+pub gwead::kernel::DataflowEvent::StepCompleted::step_id: alloc::string::String
+pub gwead::kernel::DataflowEvent::StepFailed
+pub gwead::kernel::DataflowEvent::StepFailed::error: alloc::string::String
+pub gwead::kernel::DataflowEvent::StepFailed::step_id: alloc::string::String
+pub gwead::kernel::DataflowEvent::StepProgress
+pub gwead::kernel::DataflowEvent::StepProgress::payload: serde_json::value::Value
+pub gwead::kernel::DataflowEvent::StepProgress::step_id: alloc::string::String
+pub gwead::kernel::DataflowEvent::StepStarted
+pub gwead::kernel::DataflowEvent::StepStarted::step_id: alloc::string::String
+impl core::clone::Clone for gwead::kernel::DataflowEvent
+pub fn gwead::kernel::DataflowEvent::clone(&self) -> Self
+impl core::fmt::Debug for gwead::kernel::DataflowEvent
+pub fn gwead::kernel::DataflowEvent::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::DataflowEvent
+impl core::marker::Send for gwead::kernel::DataflowEvent
+impl core::marker::Sync for gwead::kernel::DataflowEvent
+impl core::marker::Unpin for gwead::kernel::DataflowEvent
+impl core::marker::UnsafeUnpin for gwead::kernel::DataflowEvent
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::DataflowEvent
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::DataflowEvent
+#[non_exhaustive] pub enum gwead::kernel::KernelError
+pub gwead::kernel::KernelError::Boot(alloc::string::String)
+pub gwead::kernel::KernelError::CalleeFailed
+pub gwead::kernel::KernelError::CalleeFailed::action: alloc::string::String
+pub gwead::kernel::KernelError::CalleeFailed::plugin: alloc::string::String
+pub gwead::kernel::KernelError::CalleeFailed::source: alloc::rcs::arc::Arc<gwead::kernel::KernelError>
+pub gwead::kernel::KernelError::CalleeFailed::step_id: alloc::string::String
+pub gwead::kernel::KernelError::Cancelled
+pub gwead::kernel::KernelError::Cancelled::at_step: alloc::string::String
+pub gwead::kernel::KernelError::Execution(alloc::string::String)
+pub gwead::kernel::KernelError::ExecutionTimeout
+pub gwead::kernel::KernelError::ExecutionTimeout::timeout_ms: u64
+pub gwead::kernel::KernelError::FuelExhausted
+pub gwead::kernel::KernelError::FuelExhausted::budget: u64
+pub gwead::kernel::KernelError::FuelExhausted::detail: alloc::string::String
+pub gwead::kernel::KernelError::MemoryLimitExceeded
+pub gwead::kernel::KernelError::MemoryLimitExceeded::detail: alloc::string::String
+pub gwead::kernel::KernelError::MemoryLimitExceeded::limit_bytes: usize
+pub gwead::kernel::KernelError::NotFound(alloc::string::String)
+pub gwead::kernel::KernelError::PluginError
+pub gwead::kernel::KernelError::PluginError::code: alloc::string::String
+pub gwead::kernel::KernelError::PluginError::message: alloc::string::String
+pub gwead::kernel::KernelError::PluginError::params: serde_json::value::Value
+pub gwead::kernel::KernelError::Runtime(alloc::string::String)
+pub gwead::kernel::KernelError::StepResultsLimitExceeded
+pub gwead::kernel::KernelError::StepResultsLimitExceeded::attempted_bytes: usize
+pub gwead::kernel::KernelError::StepResultsLimitExceeded::limit_bytes: usize
+pub gwead::kernel::KernelError::Validation(alloc::string::String)
+impl core::error::Error for gwead::kernel::KernelError
+pub fn gwead::kernel::KernelError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for gwead::kernel::KernelError
+pub fn gwead::kernel::KernelError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for gwead::kernel::KernelError
+pub fn gwead::kernel::KernelError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::KernelError
+impl core::marker::Send for gwead::kernel::KernelError
+impl core::marker::Sync for gwead::kernel::KernelError
+impl core::marker::Unpin for gwead::kernel::KernelError
+impl core::marker::UnsafeUnpin for gwead::kernel::KernelError
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::KernelError
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::KernelError
+#[non_exhaustive] pub enum gwead::kernel::ManifestKind
+pub gwead::kernel::ManifestKind::Plugin
+pub gwead::kernel::ManifestKind::SpiDef
+impl core::clone::Clone for gwead::kernel::ManifestKind
+pub fn gwead::kernel::ManifestKind::clone(&self) -> Self
+impl core::cmp::Eq for gwead::kernel::ManifestKind
+impl core::cmp::PartialEq for gwead::kernel::ManifestKind
+pub fn gwead::kernel::ManifestKind::eq(&self, &Self) -> bool
+impl core::fmt::Debug for gwead::kernel::ManifestKind
+pub fn gwead::kernel::ManifestKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for gwead::kernel::ManifestKind
+impl core::marker::StructuralPartialEq for gwead::kernel::ManifestKind
+impl core::marker::Freeze for gwead::kernel::ManifestKind
+impl core::marker::Send for gwead::kernel::ManifestKind
+impl core::marker::Sync for gwead::kernel::ManifestKind
+impl core::marker::Unpin for gwead::kernel::ManifestKind
+impl core::marker::UnsafeUnpin for gwead::kernel::ManifestKind
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::ManifestKind
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::ManifestKind
+#[non_exhaustive] pub enum gwead::kernel::StepError
+pub gwead::kernel::StepError::Callee
+pub gwead::kernel::StepError::Callee::action: alloc::string::String
+pub gwead::kernel::StepError::Callee::plugin: alloc::string::String
+pub gwead::kernel::StepError::Callee::source: alloc::rcs::arc::Arc<gwead::kernel::KernelError>
+pub gwead::kernel::StepError::Cancelled
+pub gwead::kernel::StepError::Failed(alloc::string::String)
+pub gwead::kernel::StepError::Thrown(gwead::kernel::host_api::PluginErrorPayload)
+impl gwead::kernel::host_api::StepError
+pub fn gwead::kernel::host_api::StepError::from_callee(&str, &str, gwead::kernel::KernelError) -> Self
+impl core::clone::Clone for gwead::kernel::host_api::StepError
+pub fn gwead::kernel::host_api::StepError::clone(&self) -> Self
+impl core::error::Error for gwead::kernel::host_api::StepError
+impl core::fmt::Debug for gwead::kernel::host_api::StepError
+pub fn gwead::kernel::host_api::StepError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for gwead::kernel::host_api::StepError
+pub fn gwead::kernel::host_api::StepError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::host_api::StepError
+impl core::marker::Send for gwead::kernel::host_api::StepError
+impl core::marker::Sync for gwead::kernel::host_api::StepError
+impl core::marker::Unpin for gwead::kernel::host_api::StepError
+impl core::marker::UnsafeUnpin for gwead::kernel::host_api::StepError
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::host_api::StepError
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::host_api::StepError
+pub struct gwead::kernel::ContinuousHandle
+pub gwead::kernel::ContinuousHandle::events: tokio::sync::mpsc::bounded::Receiver<core::result::Result<gwead::kernel::types::ActionResult, gwead::kernel::KernelError>>
+impl gwead::kernel::ContinuousHandle
+pub fn gwead::kernel::ContinuousHandle::cancel(&self)
+pub fn gwead::kernel::ContinuousHandle::cancel_token(&self) -> tokio_util::sync::cancellation_token::CancellationToken
+pub async fn gwead::kernel::ContinuousHandle::shutdown(self) -> core::result::Result<(), tokio::runtime::task::error::JoinError>
+impl core::marker::Freeze for gwead::kernel::ContinuousHandle
+impl core::marker::Send for gwead::kernel::ContinuousHandle
+impl core::marker::Sync for gwead::kernel::ContinuousHandle
+impl core::marker::Unpin for gwead::kernel::ContinuousHandle
+impl core::marker::UnsafeUnpin for gwead::kernel::ContinuousHandle
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::ContinuousHandle
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::ContinuousHandle
+pub struct gwead::kernel::DataflowHandle
+pub gwead::kernel::DataflowHandle::events: tokio::sync::mpsc::bounded::Receiver<gwead::kernel::DataflowEvent>
+pub gwead::kernel::DataflowHandle::result: tokio::sync::oneshot::Receiver<core::result::Result<gwead::kernel::types::ActionResult, gwead::kernel::KernelError>>
+impl gwead::kernel::DataflowHandle
+pub fn gwead::kernel::DataflowHandle::cancel(&self)
+pub fn gwead::kernel::DataflowHandle::cancel_token(&self) -> tokio_util::sync::cancellation_token::CancellationToken
+pub async fn gwead::kernel::DataflowHandle::shutdown(self) -> core::result::Result<(), tokio::runtime::task::error::JoinError>
+impl core::marker::Freeze for gwead::kernel::DataflowHandle
+impl core::marker::Send for gwead::kernel::DataflowHandle
+impl core::marker::Sync for gwead::kernel::DataflowHandle
+impl core::marker::Unpin for gwead::kernel::DataflowHandle
+impl core::marker::UnsafeUnpin for gwead::kernel::DataflowHandle
+impl !core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::DataflowHandle
+impl !core::panic::unwind_safe::UnwindSafe for gwead::kernel::DataflowHandle
+pub struct gwead::kernel::DataflowStreamingHandle
+pub gwead::kernel::DataflowStreamingHandle::events: tokio::sync::mpsc::bounded::Receiver<gwead::kernel::DataflowEvent>
+pub gwead::kernel::DataflowStreamingHandle::output: gwead::kernel::streams::ReadableSource
+pub gwead::kernel::DataflowStreamingHandle::result: tokio::sync::oneshot::Receiver<core::result::Result<gwead::kernel::types::ActionResult, gwead::kernel::KernelError>>
+impl gwead::kernel::DataflowStreamingHandle
+pub fn gwead::kernel::DataflowStreamingHandle::cancel(&self)
+pub fn gwead::kernel::DataflowStreamingHandle::cancel_token(&self) -> tokio_util::sync::cancellation_token::CancellationToken
+pub async fn gwead::kernel::DataflowStreamingHandle::shutdown(self) -> core::result::Result<(), tokio::runtime::task::error::JoinError>
+impl core::marker::Freeze for gwead::kernel::DataflowStreamingHandle
+impl core::marker::Send for gwead::kernel::DataflowStreamingHandle
+impl !core::marker::Sync for gwead::kernel::DataflowStreamingHandle
+impl core::marker::Unpin for gwead::kernel::DataflowStreamingHandle
+impl core::marker::UnsafeUnpin for gwead::kernel::DataflowStreamingHandle
+impl !core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::DataflowStreamingHandle
+impl !core::panic::unwind_safe::UnwindSafe for gwead::kernel::DataflowStreamingHandle
+pub struct gwead::kernel::DispatchedActionResult
+pub gwead::kernel::DispatchedActionResult::action: alloc::string::String
+pub gwead::kernel::DispatchedActionResult::plugin: alloc::string::String
+pub gwead::kernel::DispatchedActionResult::result: core::result::Result<gwead::kernel::types::ActionResult, gwead::kernel::KernelError>
+impl core::fmt::Debug for gwead::kernel::DispatchedActionResult
+pub fn gwead::kernel::DispatchedActionResult::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::DispatchedActionResult
+impl core::marker::Send for gwead::kernel::DispatchedActionResult
+impl core::marker::Sync for gwead::kernel::DispatchedActionResult
+impl core::marker::Unpin for gwead::kernel::DispatchedActionResult
+impl core::marker::UnsafeUnpin for gwead::kernel::DispatchedActionResult
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::DispatchedActionResult
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::DispatchedActionResult
+pub struct gwead::kernel::ExecutionContext(_)
+impl gwead::kernel::exec_context::ExecutionContext
+pub fn gwead::kernel::exec_context::ExecutionContext::as_value(&self) -> &serde_json::value::Value
+pub fn gwead::kernel::exec_context::ExecutionContext::empty() -> Self
+pub fn gwead::kernel::exec_context::ExecutionContext::is_empty(&self) -> bool
+pub fn gwead::kernel::exec_context::ExecutionContext::new(serde_json::value::Value) -> Self
+impl core::clone::Clone for gwead::kernel::exec_context::ExecutionContext
+pub fn gwead::kernel::exec_context::ExecutionContext::clone(&self) -> Self
+impl core::default::Default for gwead::kernel::exec_context::ExecutionContext
+pub fn gwead::kernel::exec_context::ExecutionContext::default() -> Self
+impl core::fmt::Debug for gwead::kernel::exec_context::ExecutionContext
+pub fn gwead::kernel::exec_context::ExecutionContext::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::exec_context::ExecutionContext
+impl core::marker::Send for gwead::kernel::exec_context::ExecutionContext
+impl core::marker::Sync for gwead::kernel::exec_context::ExecutionContext
+impl core::marker::Unpin for gwead::kernel::exec_context::ExecutionContext
+impl core::marker::UnsafeUnpin for gwead::kernel::exec_context::ExecutionContext
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::exec_context::ExecutionContext
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::exec_context::ExecutionContext
+pub struct gwead::kernel::Kernel
+impl gwead::kernel::Kernel
+pub fn gwead::kernel::Kernel::boot(gwead::kernel::KernelConfig) -> core::result::Result<Self, gwead::kernel::KernelError>
+pub async fn gwead::kernel::Kernel::dispatch_event(&self, &str, alloc::rcs::arc::Arc<serde_json::value::Value>, &serde_json::value::Value, &gwead::kernel::exec_context::ExecutionContext, u32) -> alloc::vec::Vec<gwead::kernel::DispatchedActionResult>
+pub fn gwead::kernel::Kernel::dispatch_orchestrator(&self) -> &alloc::rcs::arc::Arc<dyn gwead::kernel::dispatch::DispatchOrchestrator>
+pub fn gwead::kernel::Kernel::dispatch_role<'a>(&'a self, &dyn gwead::kernel::host_api::PluginExecution, &str, &str, serde_json::value::Value, serde_json::value::Value) -> impl core::future::future::Future<Output = core::result::Result<gwead::kernel::types::ActionResult, gwead::kernel::KernelError>> + core::marker::Send + 'a
+pub fn gwead::kernel::Kernel::execute<'a>(&'a self, &'a str, &'a str, serde_json::value::Value) -> gwead::kernel::execute_request::ExecuteActionRequest<'a>
+pub async fn gwead::kernel::Kernel::execute_by_role(&self, &str, &str, serde_json::value::Value, &serde_json::value::Value) -> core::result::Result<gwead::kernel::types::ActionResult, gwead::kernel::KernelError>
+pub fn gwead::kernel::Kernel::into_arc(self) -> alloc::rcs::arc::Arc<Self>
+pub fn gwead::kernel::Kernel::load_manifest<'k, 'j>(&'k mut self, &'j str) -> gwead::kernel::ManifestLoad<'k, 'j>
+pub fn gwead::kernel::Kernel::manifest_kind(&str) -> core::result::Result<gwead::kernel::ManifestKind, gwead::kernel::KernelError>
+pub fn gwead::kernel::Kernel::register_plugin(&mut self, gwead::kernel::types::PluginManifest) -> core::result::Result<(), gwead::kernel::KernelError>
+pub fn gwead::kernel::Kernel::register_plugin_from_json(&mut self, &str) -> core::result::Result<(), gwead::kernel::KernelError>
+pub fn gwead::kernel::Kernel::register_spi_from_json(&mut self, &str, &str) -> core::result::Result<(), gwead::kernel::KernelError>
+pub fn gwead::kernel::Kernel::registry(&self) -> &gwead::kernel::registry::PluginRegistry
+pub fn gwead::kernel::Kernel::reload_manifest(&mut self, gwead::kernel::ManifestHandle, &str) -> core::result::Result<(), gwead::kernel::KernelError>
+pub fn gwead::kernel::Kernel::resolve_plugin_reference(&self, &str, &str) -> core::result::Result<alloc::string::String, gwead::kernel::identity::NameError>
+pub fn gwead::kernel::Kernel::role_candidates(&self, core::option::Option<&str>, &str) -> alloc::vec::Vec<alloc::string::String>
+pub fn gwead::kernel::Kernel::secret_resolver(&self) -> core::option::Option<&alloc::rcs::arc::Arc<dyn gwead::kernel::secrets::SecretResolver>>
+pub fn gwead::kernel::Kernel::spi_registry(&self) -> &gwead::spi::loader::SpiRegistry
+pub fn gwead::kernel::Kernel::unload_manifest(&mut self, gwead::kernel::ManifestHandle) -> core::result::Result<(), gwead::kernel::KernelError>
+impl !core::marker::Freeze for gwead::kernel::Kernel
+impl core::marker::Send for gwead::kernel::Kernel
+impl core::marker::Sync for gwead::kernel::Kernel
+impl core::marker::Unpin for gwead::kernel::Kernel
+impl core::marker::UnsafeUnpin for gwead::kernel::Kernel
+impl !core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::Kernel
+impl !core::panic::unwind_safe::UnwindSafe for gwead::kernel::Kernel
+#[non_exhaustive] pub struct gwead::kernel::KernelConfig
+pub gwead::kernel::KernelConfig::app_permission_categories: alloc::vec::Vec<gwead::kernel::permissions::AppPermissionCategory>
+pub gwead::kernel::KernelConfig::dispatch_orchestrator: core::option::Option<alloc::rcs::arc::Arc<dyn gwead::kernel::dispatch::DispatchOrchestrator>>
+pub gwead::kernel::KernelConfig::limits: gwead::kernel::RuntimeLimits
+pub gwead::kernel::KernelConfig::native_impl_bindings: alloc::vec::Vec<gwead::kernel::NativeImplBinding>
+pub gwead::kernel::KernelConfig::native_step_impls: gwead::kernel::native_impls::NativeStepImplTable
+pub gwead::kernel::KernelConfig::secret_resolver: core::option::Option<alloc::rcs::arc::Arc<dyn gwead::kernel::secrets::SecretResolver>>
+pub gwead::kernel::KernelConfig::settings: core::option::Option<serde_json::value::Value>
+pub gwead::kernel::KernelConfig::trusted_step_type_providers: alloc::vec::Vec<gwead::kernel::TrustedProvider>
+impl gwead::kernel::KernelConfig
+pub fn gwead::kernel::KernelConfig::allowing_native_impl_binding(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn gwead::kernel::KernelConfig::defining_app_permission_category(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn gwead::kernel::KernelConfig::defining_app_permission_category_as(self, gwead::kernel::permissions::AppPermissionCategory) -> Self
+pub fn gwead::kernel::KernelConfig::trusting_step_type_provider(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn gwead::kernel::KernelConfig::trusting_step_type_provider_in(self, impl core::convert::AsRef<str>, impl core::convert::AsRef<str>) -> Self
+pub fn gwead::kernel::KernelConfig::with_dispatch_orchestrator(self, alloc::rcs::arc::Arc<dyn gwead::kernel::dispatch::DispatchOrchestrator>) -> Self
+pub fn gwead::kernel::KernelConfig::with_limits(self, gwead::kernel::RuntimeLimits) -> Self
+pub fn gwead::kernel::KernelConfig::with_native_step_impls(self, gwead::kernel::native_impls::NativeStepImplTable) -> Self
+pub fn gwead::kernel::KernelConfig::with_secret_resolver(self, alloc::rcs::arc::Arc<dyn gwead::kernel::secrets::SecretResolver>) -> Self
+pub fn gwead::kernel::KernelConfig::with_settings(self, serde_json::value::Value) -> Self
+pub fn gwead::kernel::KernelConfig::with_trusted_step_type_providers(self, impl core::iter::traits::collect::IntoIterator<Item = gwead::kernel::TrustedProvider>) -> Self
+impl core::default::Default for gwead::kernel::KernelConfig
+pub fn gwead::kernel::KernelConfig::default() -> Self
+impl core::marker::Freeze for gwead::kernel::KernelConfig
+impl core::marker::Send for gwead::kernel::KernelConfig
+impl core::marker::Sync for gwead::kernel::KernelConfig
+impl core::marker::Unpin for gwead::kernel::KernelConfig
+impl core::marker::UnsafeUnpin for gwead::kernel::KernelConfig
+impl !core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::KernelConfig
+impl !core::panic::unwind_safe::UnwindSafe for gwead::kernel::KernelConfig
+pub struct gwead::kernel::ManifestHandle(_)
+impl core::clone::Clone for gwead::kernel::ManifestHandle
+pub fn gwead::kernel::ManifestHandle::clone(&self) -> Self
+impl core::cmp::Eq for gwead::kernel::ManifestHandle
+impl core::cmp::PartialEq for gwead::kernel::ManifestHandle
+pub fn gwead::kernel::ManifestHandle::eq(&self, &Self) -> bool
+impl core::fmt::Debug for gwead::kernel::ManifestHandle
+pub fn gwead::kernel::ManifestHandle::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for gwead::kernel::ManifestHandle
+pub fn gwead::kernel::ManifestHandle::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for gwead::kernel::ManifestHandle
+impl core::marker::StructuralPartialEq for gwead::kernel::ManifestHandle
+impl core::marker::Freeze for gwead::kernel::ManifestHandle
+impl core::marker::Send for gwead::kernel::ManifestHandle
+impl core::marker::Sync for gwead::kernel::ManifestHandle
+impl core::marker::Unpin for gwead::kernel::ManifestHandle
+impl core::marker::UnsafeUnpin for gwead::kernel::ManifestHandle
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::ManifestHandle
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::ManifestHandle
+pub struct gwead::kernel::ManifestLoad<'k, 'j>
+impl<'k, 'j> gwead::kernel::ManifestLoad<'k, 'j>
+pub fn gwead::kernel::ManifestLoad<'k, 'j>::in_namespace(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn gwead::kernel::ManifestLoad<'k, 'j>::register(self) -> core::result::Result<gwead::kernel::ManifestHandle, gwead::kernel::KernelError>
+impl<'k, 'j> core::marker::Freeze for gwead::kernel::ManifestLoad<'k, 'j>
+impl<'k, 'j> core::marker::Send for gwead::kernel::ManifestLoad<'k, 'j>
+impl<'k, 'j> core::marker::Sync for gwead::kernel::ManifestLoad<'k, 'j>
+impl<'k, 'j> core::marker::Unpin for gwead::kernel::ManifestLoad<'k, 'j>
+impl<'k, 'j> core::marker::UnsafeUnpin for gwead::kernel::ManifestLoad<'k, 'j>
+impl<'k, 'j> !core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::ManifestLoad<'k, 'j>
+impl<'k, 'j> !core::panic::unwind_safe::UnwindSafe for gwead::kernel::ManifestLoad<'k, 'j>
+#[non_exhaustive] pub struct gwead::kernel::NativeImplBinding
+pub gwead::kernel::NativeImplBinding::binder: alloc::string::String
+pub gwead::kernel::NativeImplBinding::impl_ref: alloc::string::String
+impl gwead::kernel::NativeImplBinding
+pub fn gwead::kernel::NativeImplBinding::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+impl core::clone::Clone for gwead::kernel::NativeImplBinding
+pub fn gwead::kernel::NativeImplBinding::clone(&self) -> Self
+impl core::cmp::Eq for gwead::kernel::NativeImplBinding
+impl core::cmp::PartialEq for gwead::kernel::NativeImplBinding
+pub fn gwead::kernel::NativeImplBinding::eq(&self, &Self) -> bool
+impl core::fmt::Debug for gwead::kernel::NativeImplBinding
+pub fn gwead::kernel::NativeImplBinding::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for gwead::kernel::NativeImplBinding
+impl core::marker::Freeze for gwead::kernel::NativeImplBinding
+impl core::marker::Send for gwead::kernel::NativeImplBinding
+impl core::marker::Sync for gwead::kernel::NativeImplBinding
+impl core::marker::Unpin for gwead::kernel::NativeImplBinding
+impl core::marker::UnsafeUnpin for gwead::kernel::NativeImplBinding
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::NativeImplBinding
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::NativeImplBinding
+#[non_exhaustive] pub struct gwead::kernel::RuntimeLimits
+pub gwead::kernel::RuntimeLimits::dataflow_events_capacity: usize
+pub gwead::kernel::RuntimeLimits::default_wallclock_timeout: core::time::Duration
+pub gwead::kernel::RuntimeLimits::fuel_budget: u64
+pub gwead::kernel::RuntimeLimits::max_instances: usize
+pub gwead::kernel::RuntimeLimits::max_memories: usize
+pub gwead::kernel::RuntimeLimits::max_memory_bytes: usize
+pub gwead::kernel::RuntimeLimits::max_parallel_branches: usize
+pub gwead::kernel::RuntimeLimits::max_step_results_bytes: usize
+pub gwead::kernel::RuntimeLimits::max_table_elements: usize
+pub gwead::kernel::RuntimeLimits::max_tables: usize
+pub gwead::kernel::RuntimeLimits::max_wallclock_timeout: core::option::Option<core::time::Duration>
+impl gwead::kernel::RuntimeLimits
+pub fn gwead::kernel::RuntimeLimits::with_dataflow_events_capacity(self, usize) -> Self
+pub fn gwead::kernel::RuntimeLimits::with_default_wallclock_timeout(self, core::time::Duration) -> Self
+pub fn gwead::kernel::RuntimeLimits::with_fuel_budget(self, u64) -> Self
+pub fn gwead::kernel::RuntimeLimits::with_max_instances(self, usize) -> Self
+pub fn gwead::kernel::RuntimeLimits::with_max_memories(self, usize) -> Self
+pub fn gwead::kernel::RuntimeLimits::with_max_memory_bytes(self, usize) -> Self
+pub fn gwead::kernel::RuntimeLimits::with_max_parallel_branches(self, usize) -> Self
+pub fn gwead::kernel::RuntimeLimits::with_max_step_results_bytes(self, usize) -> Self
+pub fn gwead::kernel::RuntimeLimits::with_max_table_elements(self, usize) -> Self
+pub fn gwead::kernel::RuntimeLimits::with_max_tables(self, usize) -> Self
+pub fn gwead::kernel::RuntimeLimits::with_max_wallclock_timeout(self, core::time::Duration) -> Self
+impl core::clone::Clone for gwead::kernel::RuntimeLimits
+pub fn gwead::kernel::RuntimeLimits::clone(&self) -> Self
+impl core::default::Default for gwead::kernel::RuntimeLimits
+pub fn gwead::kernel::RuntimeLimits::default() -> Self
+impl core::fmt::Debug for gwead::kernel::RuntimeLimits
+pub fn gwead::kernel::RuntimeLimits::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::RuntimeLimits
+impl core::marker::Send for gwead::kernel::RuntimeLimits
+impl core::marker::Sync for gwead::kernel::RuntimeLimits
+impl core::marker::Unpin for gwead::kernel::RuntimeLimits
+impl core::marker::UnsafeUnpin for gwead::kernel::RuntimeLimits
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::RuntimeLimits
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::RuntimeLimits
+pub struct gwead::kernel::StepOutput
+pub gwead::kernel::StepOutput::metadata: indexmap::map::IndexMap<alloc::string::String, serde_json::value::Value>
+pub gwead::kernel::StepOutput::value: serde_json::value::Value
+impl gwead::kernel::host_api::StepOutput
+pub fn gwead::kernel::host_api::StepOutput::with_metadata(serde_json::value::Value, indexmap::map::IndexMap<alloc::string::String, serde_json::value::Value>) -> Self
+impl core::clone::Clone for gwead::kernel::host_api::StepOutput
+pub fn gwead::kernel::host_api::StepOutput::clone(&self) -> Self
+impl core::convert::From<serde_json::value::Value> for gwead::kernel::host_api::StepOutput
+pub fn gwead::kernel::host_api::StepOutput::from(serde_json::value::Value) -> Self
+impl core::default::Default for gwead::kernel::host_api::StepOutput
+pub fn gwead::kernel::host_api::StepOutput::default() -> Self
+impl core::fmt::Debug for gwead::kernel::host_api::StepOutput
+pub fn gwead::kernel::host_api::StepOutput::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::kernel::host_api::StepOutput
+impl core::marker::Send for gwead::kernel::host_api::StepOutput
+impl core::marker::Sync for gwead::kernel::host_api::StepOutput
+impl core::marker::Unpin for gwead::kernel::host_api::StepOutput
+impl core::marker::UnsafeUnpin for gwead::kernel::host_api::StepOutput
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::host_api::StepOutput
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::host_api::StepOutput
+#[non_exhaustive] pub struct gwead::kernel::TrustedProvider
+pub gwead::kernel::TrustedProvider::identity: alloc::string::String
+impl gwead::kernel::TrustedProvider
+pub fn gwead::kernel::TrustedProvider::new(impl core::convert::Into<alloc::string::String>) -> Self
+impl core::clone::Clone for gwead::kernel::TrustedProvider
+pub fn gwead::kernel::TrustedProvider::clone(&self) -> Self
+impl core::cmp::Eq for gwead::kernel::TrustedProvider
+impl core::cmp::PartialEq for gwead::kernel::TrustedProvider
+pub fn gwead::kernel::TrustedProvider::eq(&self, &Self) -> bool
+impl core::fmt::Debug for gwead::kernel::TrustedProvider
+pub fn gwead::kernel::TrustedProvider::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for gwead::kernel::TrustedProvider
+impl core::marker::Freeze for gwead::kernel::TrustedProvider
+impl core::marker::Send for gwead::kernel::TrustedProvider
+impl core::marker::Sync for gwead::kernel::TrustedProvider
+impl core::marker::Unpin for gwead::kernel::TrustedProvider
+impl core::marker::UnsafeUnpin for gwead::kernel::TrustedProvider
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::kernel::TrustedProvider
+impl core::panic::unwind_safe::UnwindSafe for gwead::kernel::TrustedProvider
+pub const gwead::kernel::DISPATCH_MAX_DEPTH: u32
+pub trait gwead::kernel::PluginExecution: gwead::kernel::host_api::sealed::Sealed + core::marker::Send
+pub fn gwead::kernel::PluginExecution::cancel_token(&self) -> tokio_util::sync::cancellation_token::CancellationToken
+pub fn gwead::kernel::PluginExecution::caught_error(&self) -> core::option::Option<&str>
+pub fn gwead::kernel::PluginExecution::check_blobs(&self, gwead::kernel::permissions::BlobOp, &str) -> core::result::Result<(), alloc::string::String>
+pub fn gwead::kernel::PluginExecution::check_network_egress(&self, &str) -> core::result::Result<(), alloc::string::String>
+pub fn gwead::kernel::PluginExecution::config(&self) -> &serde_json::value::Value
+pub fn gwead::kernel::PluginExecution::current_step_id(&self) -> &str
+pub fn gwead::kernel::PluginExecution::current_step_type(&self) -> &str
+pub fn gwead::kernel::PluginExecution::dataflow_outputs(&self) -> &alloc::rcs::arc::Arc<std::collections::hash::map::HashMap<alloc::string::String, gwead::kernel::streams::StreamId>>
+pub fn gwead::kernel::PluginExecution::dispatch_depth(&self) -> u32
+pub fn gwead::kernel::PluginExecution::dispatch_role(&self, &str, &str, serde_json::value::Value, serde_json::value::Value) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gwead::kernel::types::ActionResult, gwead::kernel::KernelError>> + core::marker::Send + 'static)>>
+pub fn gwead::kernel::PluginExecution::emit_progress(&self, &str, serde_json::value::Value)
+pub fn gwead::kernel::PluginExecution::eval_path(&self, &str) -> serde_json::value::Value
+pub fn gwead::kernel::PluginExecution::eval_path_with_source(&self, &str, core::option::Option<&serde_json::value::Value>) -> serde_json::value::Value
+pub fn gwead::kernel::PluginExecution::exec_ctx(&self) -> &gwead::kernel::exec_context::ExecutionContext
+pub fn gwead::kernel::PluginExecution::get_source_result(&self, core::option::Option<&str>) -> core::option::Option<serde_json::value::Value>
+pub fn gwead::kernel::PluginExecution::get_variable(&self, &str) -> core::option::Option<&serde_json::value::Value>
+pub fn gwead::kernel::PluginExecution::input(&self) -> &serde_json::value::Value
+pub fn gwead::kernel::PluginExecution::invoke_depth(&self) -> u32
+pub fn gwead::kernel::PluginExecution::iteration_item(&self) -> core::option::Option<&serde_json::value::Value>
+pub fn gwead::kernel::PluginExecution::limits(&self) -> gwead::kernel::RuntimeLimits
+pub fn gwead::kernel::PluginExecution::plugin_name(&self) -> &str
+pub fn gwead::kernel::PluginExecution::resolution_context(&self) -> serde_json::value::Value
+pub fn gwead::kernel::PluginExecution::resolve_template(&self, &str, &serde_json::value::Value) -> alloc::string::String
+pub fn gwead::kernel::PluginExecution::resolve_value_with(&self, &serde_json::value::Value, &serde_json::value::Value) -> serde_json::value::Value
+pub fn gwead::kernel::PluginExecution::secret_resolver(&self) -> core::option::Option<&alloc::rcs::arc::Arc<dyn gwead::kernel::secrets::SecretResolver>>
+pub fn gwead::kernel::PluginExecution::secrets(&self) -> &serde_json::value::Value
+pub fn gwead::kernel::PluginExecution::set_variable(&mut self, alloc::string::String, serde_json::value::Value)
+pub fn gwead::kernel::PluginExecution::step_result(&self, &str) -> core::option::Option<serde_json::value::Value>
+pub fn gwead::kernel::PluginExecution::streams(&self) -> &gwead::kernel::streams::SharedStreamRegistry
+pub fn gwead::kernel::PluginExecution::take_readable_stream(&mut self, core::num::nonzero::NonZeroU32) -> core::option::Option<(alloc::string::String, gwead::kernel::streams::ReadableSource)>
+pub fn gwead::kernel::PluginExecution::trigger(&self) -> core::option::Option<&serde_json::value::Value>
+pub fn gwead::kernel::PluginExecution::wallclock_deadline(&self) -> core::option::Option<tokio::time::instant::Instant>
+pub mod gwead::spi
+pub mod gwead::spi::definition
+pub struct gwead::spi::definition::SpiAction
+pub gwead::spi::definition::SpiAction::description: core::option::Option<alloc::string::String>
+pub gwead::spi::definition::SpiAction::input: serde_json::value::Value
+pub gwead::spi::definition::SpiAction::optional: bool
+pub gwead::spi::definition::SpiAction::output: serde_json::value::Value
+impl core::clone::Clone for gwead::spi::definition::SpiAction
+pub fn gwead::spi::definition::SpiAction::clone(&self) -> Self
+impl core::cmp::PartialEq for gwead::spi::definition::SpiAction
+pub fn gwead::spi::definition::SpiAction::eq(&self, &Self) -> bool
+impl core::fmt::Debug for gwead::spi::definition::SpiAction
+pub fn gwead::spi::definition::SpiAction::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for gwead::spi::definition::SpiAction
+impl serde_core::ser::Serialize for gwead::spi::definition::SpiAction
+pub fn gwead::spi::definition::SpiAction::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for gwead::spi::definition::SpiAction
+pub fn gwead::spi::definition::SpiAction::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for gwead::spi::definition::SpiAction
+impl core::marker::Send for gwead::spi::definition::SpiAction
+impl core::marker::Sync for gwead::spi::definition::SpiAction
+impl core::marker::Unpin for gwead::spi::definition::SpiAction
+impl core::marker::UnsafeUnpin for gwead::spi::definition::SpiAction
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::spi::definition::SpiAction
+impl core::panic::unwind_safe::UnwindSafe for gwead::spi::definition::SpiAction
+pub struct gwead::spi::definition::SpiDefinition
+pub gwead::spi::definition::SpiDefinition::actions: indexmap::map::IndexMap<alloc::string::String, gwead::spi::definition::SpiAction>
+pub gwead::spi::definition::SpiDefinition::definitions: indexmap::map::IndexMap<alloc::string::String, serde_json::value::Value>
+pub gwead::spi::definition::SpiDefinition::description: core::option::Option<alloc::string::String>
+pub gwead::spi::definition::SpiDefinition::display_name: core::option::Option<alloc::string::String>
+pub gwead::spi::definition::SpiDefinition::format_version: core::option::Option<u32>
+pub gwead::spi::definition::SpiDefinition::name: alloc::string::String
+pub gwead::spi::definition::SpiDefinition::stream_event_shape: core::option::Option<serde_json::value::Value>
+pub gwead::spi::definition::SpiDefinition::version: core::option::Option<alloc::string::String>
+impl core::clone::Clone for gwead::spi::definition::SpiDefinition
+pub fn gwead::spi::definition::SpiDefinition::clone(&self) -> Self
+impl core::cmp::PartialEq for gwead::spi::definition::SpiDefinition
+pub fn gwead::spi::definition::SpiDefinition::eq(&self, &Self) -> bool
+impl core::fmt::Debug for gwead::spi::definition::SpiDefinition
+pub fn gwead::spi::definition::SpiDefinition::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for gwead::spi::definition::SpiDefinition
+impl serde_core::ser::Serialize for gwead::spi::definition::SpiDefinition
+pub fn gwead::spi::definition::SpiDefinition::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for gwead::spi::definition::SpiDefinition
+pub fn gwead::spi::definition::SpiDefinition::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for gwead::spi::definition::SpiDefinition
+impl core::marker::Send for gwead::spi::definition::SpiDefinition
+impl core::marker::Sync for gwead::spi::definition::SpiDefinition
+impl core::marker::Unpin for gwead::spi::definition::SpiDefinition
+impl core::marker::UnsafeUnpin for gwead::spi::definition::SpiDefinition
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::spi::definition::SpiDefinition
+impl core::panic::unwind_safe::UnwindSafe for gwead::spi::definition::SpiDefinition
+pub mod gwead::spi::loader
+pub struct gwead::spi::loader::SpiRegistry
+impl gwead::spi::loader::SpiRegistry
+pub fn gwead::spi::loader::SpiRegistry::get(&self, &str) -> core::option::Option<&gwead::spi::definition::SpiDefinition>
+pub fn gwead::spi::loader::SpiRegistry::is_empty(&self) -> bool
+pub fn gwead::spi::loader::SpiRegistry::len(&self) -> usize
+pub fn gwead::spi::loader::SpiRegistry::resolve(&self, &str, &str) -> core::option::Option<(alloc::string::String, &gwead::spi::definition::SpiDefinition)>
+pub fn gwead::spi::loader::SpiRegistry::roles(&self) -> alloc::vec::Vec<&str>
+impl core::fmt::Debug for gwead::spi::loader::SpiRegistry
+pub fn gwead::spi::loader::SpiRegistry::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for gwead::spi::loader::SpiRegistry
+impl core::marker::Send for gwead::spi::loader::SpiRegistry
+impl core::marker::Sync for gwead::spi::loader::SpiRegistry
+impl core::marker::Unpin for gwead::spi::loader::SpiRegistry
+impl core::marker::UnsafeUnpin for gwead::spi::loader::SpiRegistry
+impl core::panic::unwind_safe::RefUnwindSafe for gwead::spi::loader::SpiRegistry
+impl core::panic::unwind_safe::UnwindSafe for gwead::spi::loader::SpiRegistry
+pub macro gwead::native_step_impl!

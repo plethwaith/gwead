@@ -5,13 +5,13 @@
 ## How the version is carried
 
 The version is **in-band**, not a number in this document. Every host
-function is registered under the wasm import module name `"gwead1"` —
-the literal `"gwead"` with the ABI version appended — exposed in Rust
+function is registered under the wasm import module name `"gwead@1"` —
+the literal `"gwead@"` followed by the ABI version — exposed in Rust
 as [`gwead::kernel::abi::ABI_MODULE`](abi.rs) alongside
 [`ABI_VERSION`](abi.rs). A guest imports from that exact name:
 
 ```wat
-(import "gwead1" "host_set_result" (func (param i32 i32)))
+(import "gwead@1" "host_set_result" (func (param i32 i32)))
 ```
 
 That is the whole handshake, and it is what a machine checks. A module
@@ -20,7 +20,7 @@ kernel never registers, so it fails deterministically at
 instantiation with an unknown-import error naming what it asked for —
 rather than trapping, or silently misbehaving, partway through
 execution. Because the version is a module name, a future kernel could
-register `gwead1` and `gwead2` shims side by side and run a mixed fleet
+register `gwead@1` and `gwead@2` shims side by side and run a mixed fleet
 through a migration.
 
 `formatVersion` on the plugin manifest does **not** cover this. The
@@ -104,7 +104,7 @@ implementation details.
   receiver). One direction per handle — the reverse call returns
   `DIRECTION_MISMATCH`.
 
-## Host functions (wasm imports, `"gwead1"` module)
+## Host functions (wasm imports, `"gwead@1"` module)
 
 The complete script-runtime import set for ABI 1. This list is pinned
 against the linker by `streams_abi_doc_matches_registered_imports` —

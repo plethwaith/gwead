@@ -43,7 +43,7 @@ pub struct PluginManifest {
     /// Constrained to the identifier grammar in
     /// [`kernel::identity`](crate::kernel::identity) — ASCII letters,
     /// digits, `_` and `-`, not leading `-`, at most
-    /// [`MAX_NAME_LEN`](crate::kernel::identity::MAX_NAME_LEN) bytes —
+    /// `MAX_NAME_LEN` bytes —
     /// because it is the registry key *and* appears verbatim inside
     /// permission strings. `/` is rejected as reserved namespace
     /// syntax.
@@ -116,7 +116,7 @@ pub struct PluginManifest {
     /// plugin can never see a key it did not declare, even if the
     /// resolver hands over more and even if the embedder's bag holds a
     /// whole tenant's credentials. See
-    /// [`intersect_declared`](super::secrets::intersect_declared).
+    /// `intersect_declared`.
     ///
     /// Declaring nothing means seeing nothing, and costs no resolver
     /// round trip. That is the safe default and it is also the honest
@@ -230,7 +230,7 @@ pub struct StepTypeDef {
     /// A plugin may always use step types it defined itself, and the
     /// kernel's own reserved intrinsics (`let`, `ifs`, `script`, …) are
     /// usable by everyone regardless of this flag — see
-    /// [`super::host_api::RESERVED_STEP_TYPE_NAMES`].
+    /// `super::host_api::RESERVED_STEP_TYPE_NAMES`.
     #[serde(default)]
     pub freely_usable: bool,
 
@@ -280,7 +280,7 @@ pub struct StepTypeDef {
     /// other to that plugin's action name. The kernel walks them at
     /// registration: if both keys are present as literal
     /// strings (not templates), the kernel rejects registration when
-    /// the target doesn't exist, and emits an [`super::invoke::InvokeEdge`]
+    /// the target doesn't exist, and emits an `super::invoke::InvokeEdge`
     /// for cycle detection — same shape the hardcoded `invoke`
     /// walker emits for `{type: "invoke", plugin: …, action: …}`.
     /// Generalises that walker to custom step types whose authors
@@ -288,7 +288,7 @@ pub struct StepTypeDef {
     ///
     /// Templated values (`{plugin: "{{$vars.x}}", action: "foo"}`) and
     /// missing keys are skipped — those are runtime-resolvable and
-    /// fall under [`super::host_api::INVOKE_MAX_DEPTH`].
+    /// fall under `super::host_api::INVOKE_MAX_DEPTH`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<StepReference>,
 }
@@ -344,7 +344,7 @@ pub struct StepReference {
 ///
 /// `step_type` is validated as a step type *reference*: a bare kernel
 /// name, or a well-formed `<plugin>.<name>` — see
-/// [`identity::validate_step_type_reference`](super::identity::validate_step_type_reference).
+/// `identity::validate_step_type_reference`.
 /// Ownership of the claim is checked separately at registration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -758,155 +758,8 @@ pub struct StepDef {
 }
 
 // ---------------------------------------------------------------------------
-// Step type parameters (well-known step types)
+// Secret declarations
 // ---------------------------------------------------------------------------
-
-/// Parameters for the `http_call` step type. `http_call` is an
-/// embedder-provided step type — the kernel ships only its intrinsics —
-/// but the parameter shape is defined here so embedder impls and the
-/// kernel agree on it.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HttpCallParams {
-    pub url: String,
-    #[serde(default = "default_get")]
-    pub method: String,
-    #[serde(default)]
-    pub query_params: IndexMap<String, String>,
-    #[serde(default)]
-    pub headers: IndexMap<String, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub body: Option<Value>,
-}
-
-fn default_get() -> String {
-    "GET".to_string()
-}
-
-/// Parameters for the `for_each` step type.
-///
-/// **Inner step result lifecycle.** The runtime clears each inner
-/// step's `step_results` / metadata entry at the top of every
-/// iteration, so an iteration body that skips a step (a step inside an
-/// `ifs` branch not taken this time, a `try` body that failed early)
-/// sees a clean slate rather than the previous iteration's
-/// value. The **last** iteration's inner step results survive the
-/// loop — they're never cleared by a next-iteration top-of-loop
-/// because no next iteration runs — and outer-scope steps and
-/// `resultMapping` can read them like any other step output. Use
-/// `collect` (below) when you need every iteration's values, not
-/// just the last one.
-///
-/// **`collect`.** When set, each iteration evaluates the DSL
-/// expression and pushes the value onto a per-loop accumulator.
-/// Once the loop exits, the for_each step's own result is set to the
-/// assembled array (readable via `$steps.<for_each_id>.result`).
-/// Without `collect`, the for_each step's own result is an empty
-/// array — reach for the last iteration's inner-step results
-/// directly, or add a `collect` expression.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ForEachParams {
-    /// DSL path expression to extract iteration items.
-    pub path: String,
-    /// Source step ID to iterate over. Defaults to first step.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    /// Steps to execute for each item.
-    pub steps: Vec<StepDef>,
-    /// Optional DSL expression evaluated after each iteration's body.
-    /// The resulting value is pushed onto an accumulator; the
-    /// for_each step's own result becomes the assembled array.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub collect: Option<String>,
-}
-
-/// Parameters for the `repeat` step type. Executes `steps` `count`
-/// times. The current iteration number (0-based) is bound to `{{$item}}`
-/// in inner steps, reusing the same surface `for_each` exposes.
-///
-/// When `until` is set, after each iteration body runs the DSL
-/// expression is evaluated against the action's full resolution
-/// context (input, config, steps, vars, secrets). If truthy, the loop
-/// exits early — `count` keeps acting as the safety cap. The body
-/// always runs at least once (unless `count` is 0): `until` is a
-/// do-until, not a while.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RepeatParams {
-    /// Number of iterations. May be a JSON number or a string template
-    /// (e.g. `"{{$config.iterations}}"`) that resolves to a non-negative
-    /// integer at execution time.
-    pub count: Value,
-    /// Steps to execute on each iteration.
-    pub steps: Vec<StepDef>,
-    /// Optional DSL expression evaluated after each iteration's body.
-    /// If truthy, the loop exits before the next iteration. References
-    /// to inner-step results (e.g., `$steps.last_inner.result.done`)
-    /// resolve against the just-completed iteration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub until: Option<String>,
-    /// Optional DSL expression evaluated after each iteration's body
-    /// (mirrors `ForEachParams.collect`). The value is pushed onto a
-    /// per-loop accumulator; the repeat step's own result becomes the
-    /// assembled array, readable via `$steps.<id>.result`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub collect: Option<String>,
-}
-
-/// Parameters for the `extract` step type. `extract` (like the
-/// `transform` pipeline it can carry) is an embedder-provided step
-/// type — the kernel ships only its intrinsics — but the parameter
-/// shape is defined here so embedder impls and the kernel agree on it.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExtractParams {
-    /// DSL path expression.
-    pub path: String,
-    /// Source step ID. Defaults to first step.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    /// Transforms to apply after extraction.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub transforms: Vec<TransformDef>,
-    /// Fallback extraction if primary path returns null.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback: Option<Box<ExtractParams>>,
-}
-
-/// A transform in the extraction pipeline.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TransformDef {
-    #[serde(rename = "type")]
-    pub transform_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub separator: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replacement: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub template: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub field: Option<String>,
-}
-
-/// Parameters for the `set_var` step type — embedder-provided, like
-/// `extract`; the kernel's own variable-write primitive is `let` with
-/// `storeToVariable`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetVarParams {
-    /// Variable name to set.
-    pub name: String,
-    /// Value expression (supports `{{template}}` resolution).
-    pub value: Value,
-}
 
 /// One entry of a manifest's `usesSecrets`.
 ///
@@ -1018,47 +871,6 @@ impl PluginManifest {
             .map(|d| d.key.clone())
             .collect()
     }
-}
-
-/// Parameters for the `ifs` step type.
-///
-/// Shaped like a `match`: an ordered list of branches, the first whose
-/// `test` is truthy runs. A branch with no `test` always matches, so an
-/// "else" is simply a final untested branch; manifest validation
-/// requires such a branch to be last, since anything after it would be
-/// unreachable.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IfsParams {
-    /// Branches evaluated in order. First matching branch executes.
-    pub ifs: Vec<IfBranch>,
-}
-
-/// A single branch in an `ifs` step.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IfBranch {
-    /// Bare DSL condition. `None` (omitted or `null`) always matches —
-    /// the "else" branch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub test: Option<String>,
-    /// Steps to execute when the branch is chosen.
-    #[serde(rename = "then")]
-    pub then_steps: Vec<StepDef>,
-}
-
-/// Parameters for the `log` step type (embedder-provided, like
-/// `extract`).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LogParams {
-    #[serde(default = "default_info")]
-    pub level: String,
-    pub message: String,
-}
-
-fn default_info() -> String {
-    "info".to_string()
 }
 
 // ---------------------------------------------------------------------------

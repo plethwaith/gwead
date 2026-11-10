@@ -27,7 +27,6 @@ use crate::kernel::types::PluginManifest;
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct ValidationResult {
-    pub plugin_name: String,
     pub errors: Vec<ValidationError>,
     pub warnings: Vec<ValidationWarning>,
     /// Actions the plugin provides that none of its *resolved* roles
@@ -136,7 +135,6 @@ pub fn validate_manifest(
     }
 
     ValidationResult {
-        plugin_name: manifest.name.clone(),
         errors,
         warnings,
         extra_actions: extra_actions(manifest, &resolved),

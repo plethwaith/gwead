@@ -681,7 +681,7 @@ async fn script_host_import_oob_pointer_traps_cleanly() {
     use base64::Engine as _;
     let evil_wat = r#"
         (module
-          (import "gwead1" "host_set_result" (func $host_set_result (param i32 i32)))
+          (import "gwead@1" "host_set_result" (func $host_set_result (param i32 i32)))
           (memory (export "memory") 1)
           (global $next (mut i32) (i32.const 32))
           (func (export "alloc") (param $len i32) (result i32)

@@ -1,6 +1,6 @@
 [package]
 name = "gwead"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Gwead — a WebAssembly plugin microkernel: a data-driven engine that loads plugin manifests and executes capability steps in sandboxed wasm."
@@ -28,16 +28,15 @@ tracing = "0.1"
 regex = "1"
 
 # Gwead follows wasmtime's long-term-support releases. wasmtime 48 is an
-# LTS line, supported by wasmtime for 24 months from its release, and takes
-# its security fixes as 48.0.x patches that keep the API compatible and aim
-# to keep the MSRV; Gwead picks those up in patch releases. Gwead moves to
-# the next LTS line only in a minor release, and raises its MSRV only then,
-# never in a patch release.
-# 48.0.3 is the first 48.x clear of RUSTSEC-2026-0314 (wasmtime-wasi),
-# RUSTSEC-2026-0315 and RUSTSEC-2026-0316. wasmtime sets the crate's MSRV:
-# 48 requires Rust 1.95.
-wasmtime = "48.0.3"
-wasmtime-wasi = "48.0.3"
+# LTS line, supported by wasmtime for 24 months from its release, with
+# security fixes as 48.0.x patches. wasmtime is not part of Gwead's public
+# API, so those patches reach an embedder through its own `cargo update`.
+# The requirement below is the oldest 48.x Gwead accepts: it rises, in a
+# Gwead patch release, when an advisory makes an older 48.x unsafe. Gwead
+# moves to the next LTS line, and raises its MSRV (set by wasmtime: 1.95
+# for 48), only in a minor release.
+wasmtime = "48.0.8"
+wasmtime-wasi = "48.0.8"
 base64 = "0.22"
 
 # JSON Schema (Draft 2020-12) validation of manifests against the published

@@ -129,14 +129,14 @@ fn register_plugin_with_single_action() {
     assert!(
         kernel
             .registry()
-            .get_action("test_plugin", "search")
-            .is_some()
+            .action_names("test_plugin")
+            .contains(&"search".to_string())
     );
     assert!(
-        kernel
+        !kernel
             .registry()
-            .get_action("test_plugin", "nonexistent")
-            .is_none()
+            .action_names("test_plugin")
+            .contains(&"nonexistent".to_string())
     );
 }
 
@@ -159,14 +159,14 @@ fn register_plugin_with_multiple_actions() {
     assert!(
         kernel
             .registry()
-            .get_action("multi_action", "search")
-            .is_some()
+            .action_names("multi_action")
+            .contains(&"search".to_string())
     );
     assert!(
         kernel
             .registry()
-            .get_action("multi_action", "fetch")
-            .is_some()
+            .action_names("multi_action")
+            .contains(&"fetch".to_string())
     );
 }
 

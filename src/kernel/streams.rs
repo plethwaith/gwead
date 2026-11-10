@@ -32,9 +32,9 @@
 //!
 //! ## Direction
 //!
-//! A stream is either [`StreamDirection::Readable`] (host provides a
+//! A stream is either `StreamDirection::Readable` (host provides a
 //! source, plugin pulls via `stream_read`) or
-//! [`StreamDirection::Writable`] (plugin pushes via `stream_write`,
+//! `StreamDirection::Writable` (plugin pushes via `stream_write`,
 //! host consumes from a receiver). One direction per handle — attempting
 //! `stream_write` on a readable returns `DIRECTION_MISMATCH`.
 
@@ -124,7 +124,7 @@ pub type WritableReceiver = mpsc::Receiver<Result<Bytes, std::io::Error>>;
 /// stays additive) and per variant (the cursor fields are kernel
 /// bookkeeping; nothing outside the kernel should be building one).
 #[non_exhaustive]
-pub enum StreamDirection {
+pub(crate) enum StreamDirection {
     /// Host → plugin. The plugin calls `stream_read` to pull bytes.
     #[non_exhaustive]
     Readable {
@@ -184,7 +184,7 @@ pub struct StreamState {
 /// caller from accidentally holding the per-stream mutex across an
 /// await.
 #[non_exhaustive]
-pub struct StreamInner {
+pub(crate) struct StreamInner {
     pub direction: StreamDirection,
     /// True once closed by either side. Both reads and writes past
     /// close return `STREAM_CLOSED` (-4) — *not* `STREAM_EOF`. EOF
@@ -224,7 +224,7 @@ impl StreamState {
 
     /// Lock the per-stream inner state. Recovers from poisoning rather
     /// than panicking — see the rationale on [`lock_shared`].
-    pub fn lock_inner(&self) -> MutexGuard<'_, StreamInner> {
+    pub(crate) fn lock_inner(&self) -> MutexGuard<'_, StreamInner> {
         self.inner
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -313,7 +313,7 @@ impl StreamState {
 /// The registry-wide outer mutex (via [`SharedStreamRegistry`]) is
 /// held only briefly for HashMap insert / lookup / clear ops. All
 /// stream-state mutation goes through the per-stream
-/// [`StreamState::lock_inner`] mutex, so a slow read on one stream
+/// `StreamState::lock_inner` mutex, so a slow read on one stream
 /// never blocks operations on another.
 pub struct StreamRegistry {
     streams: HashMap<StreamId, Arc<StreamState>>,
@@ -549,7 +549,7 @@ impl StreamRegistry {
     /// The producer stream's source is taken (subsequent reads on the
     /// original handle return EOF). Used by the DAG scheduler when a
     /// stream-producing step has more than one consumer in
-    /// [`super::dag::DagPlan::consumers`]. Each consumer's reference to
+    /// `super::dag::DagPlan::consumers`. Each consumer's reference to
     /// the producer is rewritten to point at its own branch.
     ///
     /// Spawns a forwarder task that pulls one chunk at a time from the
@@ -1113,7 +1113,7 @@ impl StreamState {
 ///
 /// - **Outer** (`SharedStreamRegistry`): held only for the HashMap
 ///   lookup. Synchronous, no `.await` underneath.
-/// - **Inner** ([`StreamState::lock_inner`]): held only across the
+/// - **Inner** (`StreamState::lock_inner`): held only across the
 ///   swap-out / put-back of the `source` cursor, never across the
 ///   `source.next().await`.
 ///

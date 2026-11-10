@@ -94,7 +94,9 @@ fn a_failed_registration_leaves_no_executable_actions() {
         .expect_err("rejected");
 
     assert!(
-        k.registry().get_action("ghost", "go").is_none(),
+        !k.registry()
+            .action_names("ghost")
+            .contains(&"go".to_string()),
         "a rejected manifest must not leave live actions behind"
     );
     assert!(
@@ -170,7 +172,9 @@ fn a_failed_reload_leaves_the_original_plugin_intact() {
         "a failed reload must not destroy the healthy plugin"
     );
     assert!(
-        k.registry().get_action("live", "go").is_some(),
+        k.registry()
+            .action_names("live")
+            .contains(&"go".to_string()),
         "the original's actions survive"
     );
     assert!(

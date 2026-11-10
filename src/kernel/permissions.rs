@@ -30,7 +30,7 @@
 //!   such as `script` — insufficient on its own: the plugin must also
 //!   appear in the embedder's
 //!   [`KernelConfig::trusted_step_type_providers`](super::KernelConfig::trusted_step_type_providers).
-//!   See [`Permission::ProvideStepType`].
+//!   See `Permission::ProvideStepType`.
 //! - `bind:native_impl:<implRef>` — declares intent to *bind* a native
 //!   step body shipped by another plugin. The mirror image of
 //!   `provide:`: that one supplies code others run, this one runs code
@@ -38,18 +38,18 @@
 //!   like `provide:step_type:` — insufficient on its own: the embedder
 //!   must authorise the exact pair via
 //!   [`KernelConfig::native_impl_bindings`](super::KernelConfig::native_impl_bindings).
-//!   See [`Permission::BindNativeImpl`].
+//!   See `Permission::BindNativeImpl`.
 //!
 //! ## Category reservation
 //!
 //! **Dot-free category names are reserved for the kernel.** An
 //! unrecognised dot-free category is rejected at parse time
-//! ([`PermissionParseError::ReservedCategory`]) rather than silently
-//! landing as [`Permission::AppDefined`].
+//! (`PermissionParseError::ReservedCategory`) rather than silently
+//! landing as `Permission::AppDefined`.
 //!
 //! Embedder categories must carry a dot-namespaced prefix:
 //! `acme.events:publish:catalog.item.created`, not
-//! `events:publish:...`. Those parse to [`Permission::AppDefined`],
+//! `events:publish:...`. Those parse to `Permission::AppDefined`,
 //! where the kernel stores the raw `(kind, value)` pair and the
 //! embedder enforces it in its own layer. The kernel does NOT know
 //! about events / audit / storage / etc. — those concerns belong to
@@ -78,8 +78,8 @@
 //!
 //! ## Pattern syntax
 //!
-//! [`HostPattern`] and [`PathPattern`] support exactly three shapes,
-//! and [`NamePattern`] two:
+//! `HostPattern` and `PathPattern` support exactly three shapes,
+//! and `NamePattern` two:
 //!
 //! - `*` — match anything
 //! - `*.<suffix>` (host) — match anything ending in `.suffix` or
@@ -104,7 +104,7 @@
 //! itself, on its own dispatch surfaces.
 //!
 //! `network:egress` and `blobs` are **advisory**. The kernel has zero
-//! call sites for [`check_network_egress`] and [`check_blobs`] — it
+//! call sites for `check_network_egress` and `check_blobs` — it
 //! ships no HTTP client and no blob store, so there is no boundary
 //! for it to gate. They are parsed, stored, and offered to the
 //! embedder. **If your step type performs network or blob I/O, it
@@ -148,7 +148,7 @@ use serde_json::Value;
 /// own layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Permission {
+pub(crate) enum Permission {
     NetworkEgress(HostPattern),
     Blobs(BlobOp, PathPattern),
     /// Permission to **use** a custom step type, checked at step
@@ -292,7 +292,7 @@ impl fmt::Display for BlobOp {
 /// prefix shapes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum NamePattern {
+pub(crate) enum NamePattern {
     Any,
     Exact(String),
 }
@@ -309,7 +309,7 @@ impl NamePattern {
 /// Host-name match pattern. See module docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum HostPattern {
+pub(crate) enum HostPattern {
     Any,
     /// `*.suffix` — matches `host == suffix` or `host.ends_with(".suffix")`.
     Suffix(String),
@@ -337,7 +337,7 @@ impl HostPattern {
 /// Path-prefix match pattern. See module docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum PathPattern {
+pub(crate) enum PathPattern {
     Any,
     /// `prefix/*` — matches `key == prefix` or `key.starts_with("prefix/")`.
     Prefix(String),
@@ -465,7 +465,7 @@ impl fmt::Debug for AppPermissionCategory {
 /// Errors from parsing a `permissions` entry.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum PermissionParseError {
+pub(crate) enum PermissionParseError {
     #[error("empty permission entry")]
     Empty,
     /// A dot-free category the kernel does not define. Dot-free names
@@ -554,7 +554,7 @@ fn validate_permission_name(
 }
 
 /// Parse a permission string into a structured [`Permission`].
-pub fn parse_permission(raw: &str) -> Result<Permission, PermissionParseError> {
+pub(crate) fn parse_permission(raw: &str) -> Result<Permission, PermissionParseError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(PermissionParseError::Empty);
@@ -844,16 +844,6 @@ fn parse_provide(raw: &str, rest: &str) -> Result<Permission, PermissionParseErr
     })
 }
 
-/// Parse every entry in a manifest's `permissions` list.
-///
-/// This checks the *kernel's* half of the grammar only. Embedder
-/// categories land as [`Permission::AppDefined`] without anyone asking
-/// whether that category exists — use [`parse_manifest_permissions`]
-/// for the load path, which is the version that does.
-pub fn parse_permission_list(raw: &[String]) -> Result<Vec<Permission>, PermissionParseError> {
-    raw.iter().map(|s| parse_permission(s)).collect()
-}
-
 /// Parse a manifest's `permissions` list and hold every embedder
 /// category in it to the set the embedder declared.
 ///
@@ -862,7 +852,7 @@ pub fn parse_permission_list(raw: &[String]) -> Result<Vec<Permission>, Permissi
 /// checking reintroduces exactly the silent never-matching grant this
 /// exists to stop. The kernel's registration path calls this and
 /// nothing else.
-pub fn parse_manifest_permissions(
+pub(crate) fn parse_manifest_permissions(
     raw: &[String],
     categories: &[AppPermissionCategory],
 ) -> Result<Vec<Permission>, PermissionParseError> {
@@ -952,7 +942,7 @@ pub(crate) fn validate_app_category_name(name: &str) -> Result<(), String> {
 /// carries the requested permission for error reporting.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum PermissionCheck {
+pub(crate) enum PermissionCheck {
     Granted,
     Denied { requested: String },
 }
@@ -974,7 +964,7 @@ impl PermissionCheck {
 /// that called it and was allowed, which is why the call shape is
 /// provisional — see
 /// [`PluginExecution::check_network_egress`](super::host_api::PluginExecution::check_network_egress).
-pub fn check_network_egress(grants: &[Permission], host: &str) -> PermissionCheck {
+pub(crate) fn check_network_egress(grants: &[Permission], host: &str) -> PermissionCheck {
     for grant in grants {
         if let Permission::NetworkEgress(pat) = grant
             && pat.matches(host)
@@ -991,7 +981,7 @@ pub fn check_network_egress(grants: &[Permission], host: &str) -> PermissionChec
 ///
 /// **Advisory — the kernel never calls this**, for the same reason as
 /// [`check_network_egress`]. Your step type owns the gate.
-pub fn check_blobs(grants: &[Permission], op: BlobOp, key: &str) -> PermissionCheck {
+pub(crate) fn check_blobs(grants: &[Permission], op: BlobOp, key: &str) -> PermissionCheck {
     for grant in grants {
         if let Permission::Blobs(grant_op, pattern) = grant
             && *grant_op == op
@@ -1013,7 +1003,7 @@ pub fn check_blobs(grants: &[Permission], op: BlobOp, key: &str) -> PermissionCh
 // bare names (which denote whichever chain candidate is registered).
 
 /// Does the granted set authorise dispatching by the named SPI role?
-pub fn check_invoke_role(grants: &[Permission], role: &str) -> PermissionCheck {
+pub(crate) fn check_invoke_role(grants: &[Permission], role: &str) -> PermissionCheck {
     for grant in grants {
         if let Permission::InvokeRole(pat) = grant
             && pat.matches(role)
@@ -1027,7 +1017,7 @@ pub fn check_invoke_role(grants: &[Permission], role: &str) -> PermissionCheck {
 }
 
 /// Does the granted set authorise use of the named custom step type?
-pub fn check_step_type(grants: &[Permission], step_type: &str) -> PermissionCheck {
+pub(crate) fn check_step_type(grants: &[Permission], step_type: &str) -> PermissionCheck {
     for grant in grants {
         if let Permission::StepType(name) = grant
             && name == step_type
@@ -1395,18 +1385,5 @@ mod tests {
         assert!(check_blobs(&grants, BlobOp::Read, "media/x").is_granted());
         // Write isn't granted just because Read is.
         assert!(!check_blobs(&grants, BlobOp::Write, "media/x").is_granted());
-    }
-
-    #[test]
-    fn parse_list_collects_errors_on_first_bad_entry() {
-        // The list parser fails on the first bad entry; an empty entry
-        // in the middle fails the whole list.
-        let raw = vec![
-            "network:egress:*".to_string(),
-            "".to_string(),
-            "blobs:read:*".to_string(),
-        ];
-        let err = parse_permission_list(&raw).unwrap_err();
-        assert!(matches!(err, PermissionParseError::Empty));
     }
 }

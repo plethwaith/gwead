@@ -16,13 +16,13 @@
 //!   `invoke:plugin:a:b` would have two readings and the parser would
 //!   silently pick one.
 //!
-//! Neither is expressible under [`validate_name`]. Both are ruled out
+//! Neither is expressible under `validate_name`. Both are ruled out
 //! by the grammar from the start: tightening a name grammar later
 //! would reject manifests that previously loaded.
 //!
 //! ## The reserved separator
 //!
-//! [`NAMESPACE_SEPARATOR`] (`/`) divides a plugin's embedder-supplied
+//! `NAMESPACE_SEPARATOR` (`/`) divides a plugin's embedder-supplied
 //! namespace from its manifest-declared local name. The root namespace
 //! is spelled as the empty string, so a root-namespace identity is
 //! exactly the local name with no prefix and no separator — so a
@@ -35,7 +35,7 @@
 //!
 //! References that already carry a separator are rejected as **reserved
 //! syntax** rather than accepted as literals — see
-//! [`validate_reference`]. This is the same discipline the permission
+//! `validate_reference`. This is the same discipline the permission
 //! grammar applies to glob characters and to dot-free categories:
 //! reserve the syntax while it still means nothing, so that giving it a
 //! meaning later cannot silently reinterpret a grant somebody already
@@ -47,7 +47,7 @@ use std::fmt;
 ///
 /// Reserved: [`validate_name`] rejects it in every manifest-declared
 /// name, so the qualified form has exactly one reading.
-pub const NAMESPACE_SEPARATOR: char = '/';
+pub(crate) const NAMESPACE_SEPARATOR: char = '/';
 
 /// Maximum length of a manifest-declared name, in bytes.
 ///
@@ -56,7 +56,7 @@ pub const NAMESPACE_SEPARATOR: char = '/';
 /// nuisance with no legitimate use. The cap is deliberately generous —
 /// no plausible name approaches it — but it exists now because raising
 /// a limit later is additive while introducing one is breaking.
-pub const MAX_NAME_LEN: usize = 128;
+pub(crate) const MAX_NAME_LEN: usize = 128;
 
 /// What kind of identifier failed validation. Carried in [`NameError`]
 /// so the message names the manifest field the author has to fix,
@@ -110,7 +110,7 @@ impl fmt::Display for NameKind {
     }
 }
 
-/// Rejection reasons from [`validate_name`] / [`validate_reference`].
+/// Rejection reasons from `validate_name` / `validate_reference`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum NameError {
@@ -145,7 +145,7 @@ pub enum NameError {
     )]
     LeadingDigit { kind: NameKind, name: String },
 
-    /// The name or reference carries [`NAMESPACE_SEPARATOR`].
+    /// The name or reference carries `NAMESPACE_SEPARATOR`.
     ///
     /// Split out from [`NameError::InvalidChar`] because the fix is
     /// different in kind: this character is not merely disallowed, it
@@ -184,7 +184,7 @@ pub enum NameError {
 ///
 /// Leading `-` is excluded so a name can never be mistaken for a flag
 /// by an embedder's own tooling; `_` leads fine.
-pub fn validate_name(kind: NameKind, name: &str) -> Result<(), NameError> {
+pub(crate) fn validate_name(kind: NameKind, name: &str) -> Result<(), NameError> {
     if name.is_empty() {
         return Err(NameError::Empty { kind });
     }
@@ -238,7 +238,7 @@ pub fn validate_name(kind: NameKind, name: &str) -> Result<(), NameError> {
 /// resolves along the declarer's ancestor chain. Callers asking "am I
 /// allowed to *say* this name here" should use this one, so the
 /// distinction has a single home.
-pub fn validate_reference(kind: NameKind, reference: &str) -> Result<(), NameError> {
+pub(crate) fn validate_reference(kind: NameKind, reference: &str) -> Result<(), NameError> {
     validate_name(kind, reference)
 }
 
@@ -251,7 +251,7 @@ pub fn validate_reference(kind: NameKind, reference: &str) -> Result<(), NameErr
 /// supported, so a namespace has no internal structure to parse and
 /// [`namespace_of`] / [`local_name_of`] can split on the single
 /// separator without ambiguity.
-pub fn validate_namespace(namespace: &str) -> Result<(), NameError> {
+pub(crate) fn validate_namespace(namespace: &str) -> Result<(), NameError> {
     if namespace.is_empty() {
         return Ok(());
     }
@@ -270,7 +270,7 @@ pub fn validate_namespace(namespace: &str) -> Result<(), NameError> {
 /// Both halves are assumed already validated. Because neither may
 /// contain [`NAMESPACE_SEPARATOR`], the result has at most one
 /// separator and decomposes unambiguously.
-pub fn qualify(namespace: &str, name: &str) -> String {
+pub(crate) fn qualify(namespace: &str, name: &str) -> String {
     if namespace.is_empty() {
         return name.to_string();
     }
@@ -282,7 +282,7 @@ pub fn qualify(namespace: &str, name: &str) -> String {
 /// Total by construction: an identity with no separator is a root-
 /// namespace identity, which is the correct reading rather than a
 /// parse failure.
-pub fn namespace_of(identity: &str) -> &str {
+pub(crate) fn namespace_of(identity: &str) -> &str {
     // `rsplit_once`, not `split_once`. The grammar allows exactly one
     // separator, so the two are byte-identical here — but nesting is a
     // *reserved* syntax, not a forbidden one, and if
@@ -305,7 +305,7 @@ pub fn namespace_of(identity: &str) -> &str {
 /// rather than from the manifest, so they are reading an *authenticated*
 /// name: the embedder chose the namespace, and the grammar guarantees
 /// the split is unique.
-pub fn local_name_of(identity: &str) -> &str {
+pub(crate) fn local_name_of(identity: &str) -> &str {
     // Splits from the right — see [`namespace_of`] for why.
     match identity.rsplit_once(NAMESPACE_SEPARATOR) {
         Some((_, name)) => name,
@@ -314,7 +314,7 @@ pub fn local_name_of(identity: &str) -> &str {
 }
 
 /// Whether two identities live in the same namespace.
-pub fn same_namespace(a: &str, b: &str) -> bool {
+pub(crate) fn same_namespace(a: &str, b: &str) -> bool {
     namespace_of(a) == namespace_of(b)
 }
 
@@ -326,7 +326,7 @@ pub fn same_namespace(a: &str, b: &str) -> bool {
 /// two items; it is written as a walk so that a deeper namespace, if
 /// the grammar ever admits one, resolves without anyone revisiting the
 /// callers.
-pub fn ancestor_namespaces(namespace: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn ancestor_namespaces(namespace: &str) -> impl Iterator<Item = &str> {
     let mut current = Some(namespace);
     std::iter::from_fn(move || {
         let here = current?;
@@ -358,7 +358,7 @@ pub fn ancestor_namespaces(namespace: &str) -> impl Iterator<Item = &str> {
 ///
 /// Prefix matching respects the separator: `tenant_a` is an ancestor
 /// of `tenant_a/team`, and `tenant_a2` is not.
-pub fn is_on_chain(target: &str, of: &str) -> bool {
+pub(crate) fn is_on_chain(target: &str, of: &str) -> bool {
     let target_ns = namespace_of(target);
     ancestor_namespaces(namespace_of(of)).any(|ns| ns == target_ns)
 }
@@ -383,7 +383,7 @@ pub fn is_on_chain(target: &str, of: &str) -> bool {
 /// values computed at execution time — which is the point. A dynamic
 /// target is exactly where an unvalidated name would otherwise reach
 /// the registry.
-pub fn plugin_reference_candidates(
+pub(crate) fn plugin_reference_candidates(
     caller_identity: &str,
     reference: &str,
 ) -> Result<impl Iterator<Item = String>, NameError> {
@@ -397,7 +397,7 @@ pub fn plugin_reference_candidates(
 
 /// The separator between a plugin-defined step type's owner segment
 /// and its local name: `vault.sign`.
-pub const STEP_TYPE_SEPARATOR: char = '.';
+pub(crate) const STEP_TYPE_SEPARATOR: char = '.';
 
 /// Validate a step type name as it appears in a manifest, and say
 /// who it belongs to.
@@ -421,7 +421,7 @@ pub const STEP_TYPE_SEPARATOR: char = '.';
 /// `declaring_plugin` is the local name of the manifest declaring or
 /// implementing this step type; `kernel_owned` is true only for the
 /// engine's own intrinsics manifest.
-pub fn validate_step_type_name(
+pub(crate) fn validate_step_type_name(
     name: &str,
     declaring_plugin: &str,
     kernel_owned: bool,
@@ -457,7 +457,7 @@ pub fn validate_step_type_name(
 /// a grant: a bare kernel name, or a well-formed `<plugin>.<name>`.
 /// Ownership is not checked here — a user names someone else's step
 /// type by design — only the shape.
-pub fn validate_step_type_reference(name: &str) -> Result<(), NameError> {
+pub(crate) fn validate_step_type_reference(name: &str) -> Result<(), NameError> {
     match name.split_once(STEP_TYPE_SEPARATOR) {
         None => validate_name(NameKind::StepType, name),
         Some((owner, local)) => {
@@ -485,7 +485,7 @@ const IMPL_REF_SEGMENTS: usize = 3;
 /// closed. Requiring it would turn a naming convention into a grammar
 /// rule, and the grammar's job here is to keep the string parseable,
 /// not to police convention.
-pub fn validate_impl_ref(reference: &str) -> Result<(), NameError> {
+pub(crate) fn validate_impl_ref(reference: &str) -> Result<(), NameError> {
     if reference.is_empty() {
         return Err(NameError::Empty {
             kind: NameKind::NativeImplRef,
@@ -519,80 +519,12 @@ pub fn validate_impl_ref(reference: &str) -> Result<(), NameError> {
 /// and the manifest cannot declare its own. Otherwise a plugin could
 /// simply call itself `vault` and own `myapp.vault.*` by assertion.
 #[must_use]
-pub fn impl_ref_owner(reference: &str) -> Option<&str> {
+pub(crate) fn impl_ref_owner(reference: &str) -> Option<&str> {
     let segments: Vec<&str> = reference.split('.').collect();
     if segments.len() != IMPL_REF_SEGMENTS {
         return None;
     }
     Some(segments[1])
-}
-
-/// A registered plugin's authenticated identity.
-///
-/// "Authenticated" is the entire point. A manifest is a self-describing
-/// document, so the name inside it proves only what its author chose to
-/// write. The namespace is supplied by the **embedder** at registration
-/// and cannot be influenced by the manifest, which is what lets the
-/// kernel key authorization decisions on identity at all — including
-/// [`KernelConfig::trusted_step_type_providers`](super::KernelConfig::trusted_step_type_providers),
-/// whose guarantee is exactly as strong as the embedder's control over
-/// which manifests land in which namespace.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PluginIdentity {
-    namespace: String,
-    name: String,
-}
-
-impl PluginIdentity {
-    /// Build an identity from an embedder-supplied namespace and a
-    /// manifest-declared local name, validating both.
-    pub fn new(namespace: impl Into<String>, name: impl Into<String>) -> Result<Self, NameError> {
-        let namespace = namespace.into();
-        let name = name.into();
-        validate_namespace(&namespace)?;
-        validate_name(NameKind::Plugin, &name)?;
-        Ok(Self { namespace, name })
-    }
-
-    /// Build a root-namespace identity — the single-namespace embedder's
-    /// case, where the identity is just the name.
-    pub fn root(name: impl Into<String>) -> Result<Self, NameError> {
-        Self::new(String::new(), name)
-    }
-
-    /// The embedder-supplied namespace; `""` for root.
-    #[must_use]
-    pub fn namespace(&self) -> &str {
-        &self.namespace
-    }
-
-    /// The manifest-declared local name.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Whether this identity is in the root namespace.
-    #[must_use]
-    pub fn is_root(&self) -> bool {
-        self.namespace.is_empty()
-    }
-
-    /// The registry key: `name` in root, `namespace/name` otherwise.
-    #[must_use]
-    pub fn qualified(&self) -> String {
-        qualify(&self.namespace, &self.name)
-    }
-}
-
-impl fmt::Display for PluginIdentity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.namespace.is_empty() {
-            f.write_str(&self.name)
-        } else {
-            write!(f, "{}{NAMESPACE_SEPARATOR}{}", self.namespace, self.name)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -711,16 +643,11 @@ mod tests {
     #[test]
     fn root_namespace_qualification_is_a_true_no_op() {
         assert_eq!(qualify("", "vault"), "vault");
-        assert_eq!(PluginIdentity::root("vault").unwrap().qualified(), "vault");
-        assert_eq!(PluginIdentity::root("vault").unwrap().to_string(), "vault");
     }
 
     #[test]
     fn namespaced_qualification_uses_one_separator() {
-        let id = PluginIdentity::new("tenant42", "billing").unwrap();
-        assert_eq!(id.qualified(), "tenant42/billing");
-        assert_eq!(id.to_string(), "tenant42/billing");
-        assert!(!id.is_root());
+        assert_eq!(qualify("tenant42", "billing"), "tenant42/billing");
     }
 
     /// Decomposition has to be exact, because `implRef` ownership is
@@ -740,11 +667,11 @@ mod tests {
     /// registry keys.
     #[test]
     fn the_same_local_name_in_two_namespaces_is_two_identities() {
-        let a = PluginIdentity::new("tenant_a", "inventory").unwrap();
-        let b = PluginIdentity::new("tenant_b", "inventory").unwrap();
-        assert_ne!(a.qualified(), b.qualified());
-        assert_eq!(a.name(), b.name());
-        assert!(!same_namespace(&a.qualified(), &b.qualified()));
+        let a = qualify("tenant_a", "inventory");
+        let b = qualify("tenant_b", "inventory");
+        assert_ne!(a, b);
+        assert_eq!(local_name_of(&a), local_name_of(&b));
+        assert!(!same_namespace(&a, &b));
     }
 
     /// The decomposition splits from the RIGHT. At depth two the two
@@ -834,7 +761,7 @@ mod tests {
     /// qualification happens.
     #[test]
     fn a_manifest_cannot_forge_a_namespace_via_its_name() {
-        assert!(PluginIdentity::root("tenant42/billing").is_err());
-        assert!(PluginIdentity::new("tenant_a", "tenant_b/billing").is_err());
+        assert!(validate_name(NameKind::Plugin, "tenant42/billing").is_err());
+        assert!(validate_name(NameKind::Plugin, "tenant_b/billing").is_err());
     }
 }

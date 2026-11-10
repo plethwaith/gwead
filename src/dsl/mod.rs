@@ -18,6 +18,5 @@ pub mod eval;
 pub mod lexer;
 pub mod parser;
 
-pub use ast::{BinaryOp, Expression, Literal, PathSegment, Reference, Root, UnaryOp};
 pub use eval::{EvalContext, eval_expression, eval_reference, is_truthy};
-pub use parser::{ParseError, parse_expression, parse_reference};
+pub use parser::{parse_expression, parse_reference};
