@@ -28,6 +28,6 @@ if grep -nE '(^|[^A-Za-z0-9_])(wasmtime[a-z_]*|boon|regex[a-z_]*|base64)(::|$)' 
 fi
 if grep -nE '^pub use gwead::' public-api.txt \
     | grep -vE ':pub use gwead::(bytes|futures|indexmap|serde_json|tokio|tokio_util)$'; then
-    echo "the public API re-exports a crate outside the vocabulary list (above)" >&2
+    echo "the public API has a \`pub use gwead::\` line naming anything other than the six vocabulary crates (above)" >&2
     exit 1
 fi

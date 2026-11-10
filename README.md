@@ -22,8 +22,8 @@ module is `gwead@1`, and the set of wasm features is pinned); manifest
 JSON written for 0.2.0 loads unchanged, but a guest in it that imports host
 functions from `gwead1` fails to instantiate and must be rebuilt against
 `gwead@1`.
-The manifest format is half of Gwead's public API; the Rust API in
-[`public-api.txt`](public-api.txt) is the other. The manifest contract
+The manifest format is part of Gwead's public API, and so is the Rust API in
+[`public-api.txt`](public-api.txt). The manifest contract
 is the pair of meta-schemas in [`schemas/`](schemas/) (JSON Schema
 Draft 2020-12), and every manifest loaded from JSON (`Kernel::load_manifest`,
 `register_plugin_from_json`, `register_spi_from_json`) is validated against

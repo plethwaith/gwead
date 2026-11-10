@@ -142,7 +142,7 @@ use serde_json::Value;
 /// `StepType`, the two `Invoke*` grants, `ProvideStepType`, and
 /// `BindNativeImpl`. Everything else lands as
 /// [`Permission::AppDefined`] so the kernel doesn't bake in any
-/// app-shaped concepts. Embedders enforce AppDefined entries in their
+/// app-shaped concepts. Embedders enforce these categories in their
 /// own layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -248,8 +248,7 @@ pub(crate) enum Permission {
     /// category cannot land here silently.
     ///
     /// `value` is intentionally schemaless: the kernel stores
-    /// everything after the first `:` as a JSON string and embedders
-    /// re-split / re-parse it themselves in their enforcement layer.
+    /// everything after the first `:` as a JSON string.
     /// The kernel does not validate the part after the namespace
     /// prefix, so `acme.evnets:publish:x` still parses fine and then
     /// silently never matches the embedder's gates —
@@ -697,8 +696,7 @@ pub(crate) fn parse_permission(raw: &str) -> Result<Permission, PermissionParseE
         // Dot-namespaced categories land as AppDefined; dot-free ones
         // are reserved for the kernel and rejected here. See the
         // module docs on category reservation for why the split
-        // exists. The embedder pattern-matches on `kind` and parses
-        // `value` in its own enforcement layer.
+        // exists.
         other => {
             if other.is_empty() {
                 return Err(PermissionParseError::Empty);
