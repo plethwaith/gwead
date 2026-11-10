@@ -157,8 +157,7 @@ impl InvocationContext {
 /// `Result<StepOutput, StepError>`. Sync bodies just don't `.await`;
 /// the engine drives every step through the same async path.
 ///
-/// The wasmtime-side adapter (the closure built in
-/// `WasmRuntime::register_linker_imports`) handles step lookup,
+/// The wasmtime-side adapter handles step lookup,
 /// `store_to_variable` mirroring, [`StepOutput::metadata`](super::host_api::StepOutput::metadata) routing into
 /// the sidecar maps, and [`StepError`](super::host_api::StepError) → engine i32 translation — step
 /// bodies never touch that machinery directly.

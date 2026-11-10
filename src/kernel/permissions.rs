@@ -1395,5 +1395,9 @@ mod tests {
         ];
         let err = parse_manifest_permissions(&raw, &[]).unwrap_err();
         assert!(matches!(err, PermissionParseError::Empty));
+
+        // An entry whose category is empty reaches the other `Empty` return.
+        let err = parse_permission(":read:*").unwrap_err();
+        assert!(matches!(err, PermissionParseError::Empty));
     }
 }

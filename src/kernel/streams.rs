@@ -48,8 +48,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Default per-branch chunk-count capacity for the streaming fan-out
 /// tee (`fan_out_readable_streaming`) and for the writable→
-/// readable pipes pre-provisioned by the dataflow scheduler
-/// (`runtime_dataflow::provision_dataflow_streams`).
+/// readable pipes pre-provisioned by the dataflow scheduler.
 ///
 /// 16 chunks at typical media chunk sizes (64 KiB-ish) buffers around
 /// 1 MiB per consumer — small enough to apply backpressure quickly,
@@ -542,8 +541,7 @@ impl StreamRegistry {
     ///
     /// The producer stream's source is taken (subsequent reads on the
     /// original handle return EOF). Used by the DAG scheduler when a
-    /// stream-producing step has more than one consumer in
-    /// `super::dag::DagPlan::consumers`. Each consumer's reference to
+    /// stream-producing step has more than one consumer. Each consumer's reference to
     /// the producer is rewritten to point at its own branch.
     ///
     /// Spawns a forwarder task that pulls one chunk at a time from the
@@ -1107,7 +1105,7 @@ impl StreamState {
 ///
 /// - **Outer** (`SharedStreamRegistry`): held only for the HashMap
 ///   lookup. Synchronous, no `.await` underneath.
-/// - **Inner** (`StreamState::lock_inner`): held only across the
+/// - **Inner** (the per-stream lock): held only across the
 ///   swap-out / put-back of the `source` cursor, never across the
 ///   `source.next().await`.
 ///

@@ -37,8 +37,10 @@ scripts/public-api.sh
 The script pins the nightly toolchain that rustdoc's JSON output needs
 and the cargo-public-api version, installs the nightly if it is missing,
 and prints the `cargo install` command if the cargo-public-api version is
-wrong. It also fails if the listing names an implementation dependency
-(wasmtime, boon, regex, base64) in a public signature. The `Public API`
+wrong. It also fails if any line of the listing names an implementation
+dependency (wasmtime, boon, regex, base64), or if the listing re-exports
+a crate outside the vocabulary list (bytes, futures, indexmap,
+serde_json, tokio, tokio_util). The `Public API`
 CI job runs the script and fails if the committed file differs.
 
 To decide whether a release is a patch or a minor release (Gwead is

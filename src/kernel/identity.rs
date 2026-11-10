@@ -144,7 +144,7 @@ pub enum NameError {
     )]
     LeadingDigit { kind: NameKind, name: String },
 
-    /// The name or reference carries `NAMESPACE_SEPARATOR`.
+    /// The name or reference contains the reserved namespace separator, `/`.
     ///
     /// Split out from [`NameError::InvalidChar`] because the fix is
     /// different in kind: this character is not merely disallowed, it

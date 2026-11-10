@@ -40,10 +40,8 @@ pub struct PluginManifest {
 
     /// The plugin's local name.
     ///
-    /// Constrained to the identifier grammar in
-    /// [`kernel::identity`](crate::kernel::identity) — ASCII letters,
-    /// digits, `_` and `-`, not leading `-`, at most
-    /// 128 bytes —
+    /// Constrained to an identifier grammar — ASCII letters,
+    /// digits, `_` and `-`, not leading `-`, at most 128 bytes —
     /// because it is the registry key *and* appears verbatim inside
     /// permission strings. `/` is rejected as reserved namespace
     /// syntax.
