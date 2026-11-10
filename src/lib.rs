@@ -150,11 +150,9 @@ pub mod spi;
 // `mpsc` / `oneshot` receivers as the pub fields of the dataflow handles.
 // Re-exporting them lets embedders and plugin crates name exactly the
 // versions the kernel was built against instead of pinning their own
-// copies and hitting an incompatible-types error on every major bump. The
-// rule: anything that appears in a public signature is re-exported here,
-// so the kernel and its embedders bump together. wasmtime is deliberately
-// absent: no public signature names it, so a wasmtime release never
-// changes Gwead's API.
+// copies and hitting an incompatible-types error on every major bump.
+// wasmtime is deliberately absent: no public signature names it, so a
+// wasmtime release never changes Gwead's API.
 // ---------------------------------------------------------------------------
 pub use bytes;
 pub use futures;

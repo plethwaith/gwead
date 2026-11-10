@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 const SECRET: &str = "ANOTHER-PLUGINS-PRIVATE-BYTES";
 
 /// A guest that reads handle 1 — a handle no param ever gave it — and
-/// closes it, then stores the read's byte count and returns. When the read
+/// closes it, then returns the bytes it read, quoted, as its result. When the read
 /// is refused, the store that follows faults and the guest traps.
 const THIEF_WAT: &str = r#"
 (module
@@ -134,13 +134,6 @@ async fn a_callee_cannot_read_the_callers_handles() {
         Ok(r) => serde_json::to_string(&r.output).expect("json"),
         Err(e) => e.to_string(),
     };
-    // The thief's read of handle 1 is refused, and the store that follows
-    // faults, so a run that reached the guest ends in a trap. Any other
-    // outcome means the guest never ran and nothing was tested.
-    assert!(
-        rendered.contains("script runtime trapped"),
-        "the thief never ran, so nothing was tested: {rendered}"
-    );
     assert!(
         !rendered.contains(SECRET),
         "callee read the caller's stream: {rendered}"
@@ -151,6 +144,12 @@ async fn a_callee_cannot_read_the_callers_handles() {
             .map(|s| !s.is_closed())
             .unwrap_or(false),
         "callee closed a stream belonging to the caller"
+    );
+    // The thief's read of handle 1 is refused, and the store that follows
+    // faults, so a run that reached the guest ends in a trap.
+    assert!(
+        rendered.contains("script runtime trapped"),
+        "the thief did not trap: {rendered}"
     );
 }
 

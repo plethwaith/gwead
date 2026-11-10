@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Regenerates public-api.txt, the reviewed listing of Gwead's public
 # API, and fails if the listing names wasmtime, boon, regex or base64,
-# or re-exports a crate other than the six vocabulary crates.
+# or has a `pub use gwead::` line naming anything other than the six
+# vocabulary crates.
 # CI runs this, then fails on any difference from the committed file.
 set -euo pipefail
 
