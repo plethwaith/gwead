@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, so a new advisory against an unchanged lockfile, or a new
+  # stable toolchain's lints, turn CI red without a push.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -67,6 +72,19 @@ jobs:
       - run: cargo doc --locked --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  public-api:
+    name: Public API
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # scripts/public-api.sh refuses any other cargo-public-api version, so
+      # a bump goes in both places.
+      - run: cargo install cargo-public-api --version 0.52.0 --locked
+      - run: scripts/public-api.sh
+      - run: git diff --exit-code -- public-api.txt
 
   audit:
     name: Dependency audit

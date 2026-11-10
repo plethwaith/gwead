@@ -27,12 +27,13 @@ use serde_json::{Value, json};
 const SECRET: &str = "ANOTHER-PLUGINS-PRIVATE-BYTES";
 
 /// A guest that reads handle 1 — a handle no param ever gave it — and
-/// closes it, then returns whatever bytes it got.
+/// closes it, then returns the bytes it read, quoted, as its result. When the read
+/// is refused, the store that follows faults and the guest traps.
 const THIEF_WAT: &str = r#"
 (module
-  (import "gwead1" "stream_read"      (func $read (param i32 i32 i32) (result i32)))
-  (import "gwead1" "stream_close"     (func $close (param i32) (result i32)))
-  (import "gwead1" "host_set_result"  (func $set_result (param i32 i32)))
+  (import "gwead@1" "stream_read"      (func $read (param i32 i32 i32) (result i32)))
+  (import "gwead@1" "stream_close"     (func $close (param i32) (result i32)))
+  (import "gwead@1" "host_set_result"  (func $set_result (param i32 i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "\"")
   (global $next (mut i32) (i32.const 4096))
@@ -143,6 +144,12 @@ async fn a_callee_cannot_read_the_callers_handles() {
             .map(|s| !s.is_closed())
             .unwrap_or(false),
         "callee closed a stream belonging to the caller"
+    );
+    // The thief's read of handle 1 is refused, and the store that follows
+    // faults, so a run that reached the guest ends in a trap.
+    assert!(
+        rendered.contains("script runtime trapped"),
+        "the thief did not trap: {rendered}"
     );
 }
 

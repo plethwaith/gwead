@@ -22,11 +22,10 @@
 //!
 //! That second case makes load order matter, and it is not re-checked:
 //! register the SPI *before* the plugins that claim its role, or a
-//! contract violation downgrades from a rejection to a log line. See
-//! [`validator`] for the implementation.
+//! contract violation downgrades from a rejection to a log line.
 //!
-//! Actions beyond a plugin's roles are neither case; see
-//! [`validator::ValidationResult::extra_actions`].
+//! Actions beyond a plugin's roles are neither case: they are neither
+//! rejected nor warned about.
 //!
 //! ## No wire types here
 //!
@@ -41,4 +40,4 @@
 
 pub mod definition;
 pub mod loader;
-pub mod validator;
+pub(crate) mod validator;

@@ -2,11 +2,14 @@
 //!
 //! Guest modules reach the host through wasm imports. The module name
 //! those imports carry **is** the ABI version handshake: a module
-//! compiled against ABI 1 imports from [`ABI_MODULE`] (`"gwead1"`), and
+//! compiled against ABI 1 imports from [`ABI_MODULE`] (`"gwead@1"`), and
 //! a kernel that speaks a different ABI registers a different module
 //! name, so the mismatch surfaces as a deterministic
 //! `unknown import` failure at instantiation rather than as a trap or a
-//! silent misbehaviour partway through execution.
+//! silent misbehaviour partway through execution. The `@` separates the
+//! name from the version, as in WIT package names (`wasi:http@0.2.0`); a
+//! guest built against another ABI version names a module this kernel
+//! does not register.
 //!
 //! This is the only version signal the wasm layer has.
 //! `formatVersion` on the plugin manifest does not cover it: the
@@ -42,8 +45,8 @@
 //! old modules simply don't import it. **Removing** an import, changing
 //! a signature, or changing the meaning of a return code requires a new
 //! [`ABI_VERSION`] and a new [`ABI_MODULE`]. Because the module name is
-//! part of the guest's compiled bytes, a kernel can register `gwead1`
-//! and `gwead2` shims side by side and run a mixed fleet through one
+//! part of the guest's compiled bytes, a kernel can register `gwead@1`
+//! and `gwead@2` shims side by side and run a mixed fleet through one
 //! migration, which is the property the bare `"gwead"` name could never
 //! provide.
 //!
@@ -112,9 +115,9 @@
 
 /// The current wasm ABI version.
 ///
-/// Paired with [`ABI_MODULE`], which is `"gwead"` with this number
-/// appended. Bump both together — see the module docs for what
-/// requires a bump.
+/// Paired with [`ABI_MODULE`], which is `"gwead@"` followed by this
+/// number. Bump both together — see the module docs for what requires a
+/// bump.
 pub const ABI_VERSION: u32 = 1;
 
 /// The wasm import module name every Gwead host function is registered
@@ -123,13 +126,13 @@ pub const ABI_VERSION: u32 = 1;
 /// Guest modules must import from this exact name:
 ///
 /// ```wat
-/// (import "gwead1" "host_set_result" (func (param i32 i32)))
+/// (import "gwead@1" "host_set_result" (func (param i32 i32)))
 /// ```
 ///
 /// A module importing any other module name fails at instantiation
 /// with an unknown-import error naming the module it asked for, which
 /// is the intended diagnostic for an ABI mismatch.
-pub const ABI_MODULE: &str = "gwead1";
+pub const ABI_MODULE: &str = "gwead@1";
 
 #[cfg(test)]
 mod tests {
@@ -144,7 +147,7 @@ mod tests {
     /// against.
     #[test]
     fn abi_module_name_encodes_the_abi_version() {
-        assert_eq!(ABI_MODULE, format!("gwead{ABI_VERSION}"));
+        assert_eq!(ABI_MODULE, format!("gwead@{ABI_VERSION}"));
     }
 
     /// The whole point of the versioned namespace is that the

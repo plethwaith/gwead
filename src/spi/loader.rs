@@ -18,14 +18,14 @@ use crate::kernel::KernelError;
 /// `namespace/ROLE` for one a tenant defined. A role is named the way a
 /// plugin is, and it resolves the same way: along the referring
 /// plugin's ancestor chain, nearest first. See [`Self::resolve`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SpiRegistry {
     definitions: HashMap<String, SpiDefinition>,
 }
 
 impl SpiRegistry {
     /// Empty registry.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             definitions: HashMap::new(),
         }
@@ -42,7 +42,7 @@ impl SpiRegistry {
     /// with a *different* definition is rejected — a role's contract can
     /// only change through the explicit unregister/reload path, never by
     /// silent overwrite.
-    pub fn register(&mut self, role: &str, json: &str) -> Result<(), KernelError> {
+    pub(crate) fn register(&mut self, role: &str, json: &str) -> Result<(), KernelError> {
         let def: SpiDefinition = serde_json::from_str(json).map_err(|e| {
             KernelError::Runtime(format!("Failed to parse SPI definition {role:?}: {e}"))
         })?;
@@ -102,7 +102,7 @@ impl SpiRegistry {
     /// loaded plugins claiming an undefined contract — this method is
     /// the storage-side primitive only. Returns `false` when the role
     /// wasn't registered.
-    pub fn unregister(&mut self, role: &str) -> bool {
+    pub(crate) fn unregister(&mut self, role: &str) -> bool {
         self.definitions.remove(role).is_some()
     }
 }

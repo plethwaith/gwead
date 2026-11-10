@@ -14,15 +14,14 @@
 //!
 //! - **`kernel`**: The Gwead microkernel — types, runtime, registry,
 //!   host API, streams.
-//! - **`spi`**: the SPI (Service Provider Interface) machinery — types and
-//!   validator for the role contracts embedders register and plugin
-//!   manifests are validated against. The kernel ships no role
+//! - **`spi`**: the SPI (Service Provider Interface) machinery — the
+//!   definition and registry types for the role contracts embedders
+//!   register and plugin manifests are validated against. The kernel ships no role
 //!   definitions of its own.
-//! - **`dsl`**: Reference DSL — path/expression language used inside plugin
-//!   manifests. See `dsl/README.md`.
-//! - **`domain`**: the `{{var}}` template resolver (`domain::resolve`)
-//!   every step type uses for param interpolation; it delegates to the
-//!   DSL.
+//!
+//! The manifest expression DSL and the `{{var}}` template resolver are
+//! internal; native step bodies reach them through
+//! `PluginExecution::eval_path` and `resolve_template`.
 //!
 //! ## Uniform-registration invariant
 //!
@@ -132,29 +131,28 @@
 //! ## wasm ABI version
 //!
 //! Guest modules import host functions from the module name
-//! [`kernel::abi::ABI_MODULE`] (`"gwead1"`) — the version is in-band,
+//! [`kernel::abi::ABI_MODULE`] (`"gwead@1"`) — the version is in-band,
 //! and a module built against a different one fails at instantiation
 //! rather than misbehaving at runtime.
 //!
-pub mod domain;
-pub mod dsl;
+pub(crate) mod domain;
+pub(crate) mod dsl;
 pub mod kernel;
 pub mod spi;
 
 // ---------------------------------------------------------------------------
 // Dependency re-exports
 //
-// These crates appear in Gwead's public API signatures — `wasmtime::Engine`
-// and `Arc<wasmtime::Module>` around module registration, `indexmap::IndexMap`
-// throughout the manifest types, tokio-util's `CancellationToken` on the
+// These crates appear in Gwead's public API signatures — `indexmap::IndexMap`
+// in the manifest types, tokio-util's `CancellationToken` on the
 // cancellation surface, `bytes::Bytes` and `serde_json::Value` everywhere,
 // `futures::stream::BoxStream` behind `ReadableSource`, and tokio's
 // `mpsc` / `oneshot` receivers as the pub fields of the dataflow handles.
 // Re-exporting them lets embedders and plugin crates name exactly the
-// versions the kernel was built against (`gwead::wasmtime::…`) instead of
-// pinning their own copies and hitting an incompatible-types error on every
-// major bump. The rule: anything that appears in a public signature is
-// re-exported here, so the kernel and its embedders bump together.
+// versions the kernel was built against instead of pinning their own
+// copies and hitting an incompatible-types error on every major bump.
+// wasmtime is deliberately absent: no public signature names it, so a
+// wasmtime release never changes Gwead's API.
 // ---------------------------------------------------------------------------
 pub use bytes;
 pub use futures;
@@ -162,7 +160,6 @@ pub use indexmap;
 pub use serde_json;
 pub use tokio;
 pub use tokio_util;
-pub use wasmtime;
 
 /// Implementation details reachable from Gwead's exported macros.
 ///

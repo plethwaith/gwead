@@ -154,7 +154,7 @@ pub struct NativeStepImplEntry {
 }
 
 /// The implRef prefix reserved for the engine's own bodies.
-pub const KERNEL_IMPL_REF_PREFIX: &str = "gwead.";
+pub(crate) const KERNEL_IMPL_REF_PREFIX: &str = "gwead.";
 
 impl NativeStepImplEntry {
     /// Build an entry. Prefer

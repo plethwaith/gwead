@@ -13,7 +13,7 @@
 //! From a wasm module's perspective they're imports.
 
 pub mod abi;
-pub mod dag;
+pub(crate) mod dag;
 pub mod dispatch;
 #[cfg(test)]
 mod dispatch_role_tests;
@@ -23,15 +23,15 @@ pub mod exec_context;
 pub mod execute_request;
 pub mod host_api;
 pub mod identity;
-pub mod invoke;
+pub(crate) mod invoke;
 mod manifest_schema;
 pub mod native_impls;
 pub mod permissions;
 pub mod registry;
 pub(crate) mod resource_budget;
 pub mod runtime;
-pub mod runtime_dataflow;
-pub mod script_runtime_host;
+pub(crate) mod runtime_dataflow;
+pub(crate) mod script_runtime_host;
 pub mod secrets;
 pub mod streams;
 pub mod types;
@@ -400,7 +400,7 @@ impl DataflowStreamingHandle {
 
 /// Hard cap on event-dispatch cascade depth.
 ///
-/// Mirrors [`host_api::INVOKE_MAX_DEPTH`] but tracks a different
+/// Mirrors the invoke depth cap (also 16) but tracks a different
 /// recursion shape: explicit `invoke` calls (`invoke_depth`) versus
 /// event-driven cascades (`dispatch_depth`). Both can coexist in the
 /// same execution chain.
@@ -2101,8 +2101,8 @@ impl Kernel {
     ///
     /// Each action's step graph is validated for unique ids,
     /// resolvable references, and acyclic shape, then layered into topological
-    /// waves. The plan is stored in the registry and consumed by
-    /// [`WasmRuntime::execute_dag`] at invocation time.
+    /// waves. The plan is stored in the registry and consumed at
+    /// invocation time.
     ///
     /// Registers into the **root namespace**, so the plugin's identity
     /// is exactly its manifest name. This is the right entry point for
@@ -2272,7 +2272,7 @@ impl Kernel {
         // time, not at first http_call. The parsed list is stored in
         // the registry below alongside the actions.
         //
-        // `parse_manifest_permissions`, not `parse_permission_list`:
+        // `parse_manifest_permissions`, not `parse_permission` per entry:
         // the second checks only the kernel's own categories and lets
         // any dot-namespaced one through unexamined. Every registration
         // funnels through here, so this one call site is the whole

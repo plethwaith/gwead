@@ -283,7 +283,7 @@ pub(crate) struct ExecutionState {
 /// site that forgets to populate it fails closed and shows up as a
 /// denied step rather than an open door.
 #[derive(Debug, Clone, Default)]
-pub struct StepTypeAccess {
+pub(crate) struct StepTypeAccess {
     /// Written step type name → the registry key it resolves to for
     /// this invocation. A plugin-defined name (`vault.sign`) resolves
     /// its owner segment along the executing plugin's ancestor chain,
@@ -488,7 +488,7 @@ pub(crate) struct CalleeError {
 /// huge count costs eight bytes and fails on time rather than on
 /// memory.
 #[derive(Debug, Clone)]
-pub enum ForEachItems {
+pub(crate) enum ForEachItems {
     /// `for_each` — a list the manifest supplied.
     Values(Vec<Value>),
     /// `repeat` — item *i* is the integer *i*, never materialised.
@@ -505,10 +505,6 @@ impl ForEachItems {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     /// The item at `idx`, or `None` past the end. Owned: a counted range
     /// has nothing to borrow.
     pub fn item_at(&self, idx: usize) -> Option<Value> {
@@ -522,7 +518,7 @@ impl ForEachItems {
 
 /// State for an active forEach iteration.
 #[derive(Clone)]
-pub struct ForEachState {
+pub(crate) struct ForEachState {
     /// Where the items come from. See [`ForEachItems`].
     pub items: ForEachItems,
     /// The item at [`Self::current`], materialised by `next_foreach`.
@@ -550,7 +546,7 @@ pub struct ForEachState {
 }
 
 /// Parameters for constructing an `ExecutionState`.
-pub struct ExecutionStateParams {
+pub(crate) struct ExecutionStateParams {
     pub(crate) plugin_name: String,
     pub action: Action,
     pub input: Value,
@@ -1024,7 +1020,7 @@ pub trait PluginExecution: sealed::Sealed + Send {
     fn dataflow_outputs(&self) -> &std::sync::Arc<HashMap<String, super::streams::StreamId>>;
 
     /// Recursion depth for nested `invoke` chains. Used by the
-    /// `invoke` step body to enforce [`INVOKE_MAX_DEPTH`].
+    /// `invoke` step body to enforce the invoke depth cap of 16.
     fn invoke_depth(&self) -> u32;
 
     /// Event-dispatch cascade depth.
@@ -2054,7 +2050,7 @@ fn step_let<'a>(
 /// Recursion cap for `invoke` chains. Catches by-role cycles that the
 /// structural registration-time check can't see, plus deeply nested but
 /// legitimate compositions that almost certainly indicate a manifest bug.
-pub const INVOKE_MAX_DEPTH: u32 = 16;
+pub(crate) const INVOKE_MAX_DEPTH: u32 = 16;
 
 /// The kernel's step types — the names that are always permitted
 /// without a grant and always resolve to themselves.
@@ -2075,7 +2071,7 @@ pub const INVOKE_MAX_DEPTH: u32 = 16;
 /// `inventory::submit!` and the intrinsics manifest. Single source of
 /// truth for the names a plugin manifest's `step_types` aliases cannot
 /// take over.
-pub const RESERVED_STEP_TYPE_NAMES: &[&str] = &[
+pub(crate) const RESERVED_STEP_TYPE_NAMES: &[&str] = &[
     "ifs",
     "for_each",
     "repeat",

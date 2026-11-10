@@ -87,7 +87,7 @@ pub struct SecretRequest<'a> {
     ///
     /// Guaranteed by the kernel to be the executing plugin itself or
     /// one of its ancestors, so a resolver is never asked for a sibling
-    /// tenant's secrets — see [`subject_is_on_chain`].
+    /// tenant's secrets.
     pub subject: &'a str,
     /// The plugin whose execution this is running inside.
     ///
@@ -101,7 +101,7 @@ pub struct SecretRequest<'a> {
     /// everything it holds. **The kernel intersects the result with
     /// this list regardless**, so honouring it is an optimisation rather
     /// than a security obligation, and a resolver bug cannot widen what
-    /// a manifest declared. See [`intersect_declared`].
+    /// a manifest declared.
     pub declared_keys: &'a [String],
     /// The subset of [`Self::declared_keys`] that `subject`'s manifest
     /// marked `overridable` in `usesSecrets` — keys a level *below* the subject
@@ -262,11 +262,7 @@ pub(crate) async fn pull(
 /// containment rule, [`is_on_chain`](super::identity::is_on_chain) —
 /// asking for secrets is reaching for a capability, and it points the
 /// same way.
-///
-/// Public because it is part of the contract, not an implementation
-/// detail: a resolver that wants to assert the same invariant, or a test
-/// that wants to pin it, should not have to reimplement it.
-pub fn subject_is_on_chain(subject: &str, executing_plugin: &str) -> bool {
+pub(crate) fn subject_is_on_chain(subject: &str, executing_plugin: &str) -> bool {
     super::identity::is_on_chain(subject, executing_plugin)
 }
 
@@ -275,10 +271,7 @@ pub fn subject_is_on_chain(subject: &str, executing_plugin: &str) -> bool {
 /// Applied to every resolver answer. See
 /// [`SecretRequest::declared_keys`] for why it runs even though the
 /// resolver was told what to fetch.
-///
-/// Public for the same reason as [`subject_is_on_chain`]: an embedder
-/// may want to apply it at the source rather than return a superset.
-pub fn intersect_declared(secrets: Value, declared: &[String]) -> Value {
+pub(crate) fn intersect_declared(secrets: Value, declared: &[String]) -> Value {
     let Value::Object(map) = secrets else {
         // A non-object answer declares nothing usable. `Null` is the
         // honest reading of "no secrets" and keeps `{{$secrets.x}}`

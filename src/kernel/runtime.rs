@@ -41,7 +41,7 @@ use super::types::{Action, ActionResult, StepDef};
 /// `invoke` builds a child context that inherits the parent's depth and
 /// cancel token but gets a stream table of its own.
 #[derive(Clone, Default)]
-pub struct InvocationContext {
+pub(crate) struct InvocationContext {
     /// Stream registry to run against. `None` triggers fresh
     /// allocation — the case for top-level and nested-`invoke`
     /// executions alike; a caller-owned table is `Some`.
@@ -157,8 +157,7 @@ impl InvocationContext {
 /// `Result<StepOutput, StepError>`. Sync bodies just don't `.await`;
 /// the engine drives every step through the same async path.
 ///
-/// The wasmtime-side adapter (the closure built in
-/// `WasmRuntime::register_linker_imports`) handles step lookup,
+/// The wasmtime-side adapter handles step lookup,
 /// `store_to_variable` mirroring, [`StepOutput::metadata`](super::host_api::StepOutput::metadata) routing into
 /// the sidecar maps, and [`StepError`](super::host_api::StepError) → engine i32 translation — step
 /// bodies never touch that machinery directly.
@@ -505,7 +504,7 @@ pub(crate) fn engine_config() -> wasmtime::Config {
 }
 
 /// The wasmtime runtime wrapper.
-pub struct WasmRuntime {
+pub(crate) struct WasmRuntime {
     engine: Engine,
     /// Step types registered for linker dispatch — host-pluggable
     /// [`StepFn`] bodies and kernel-internal [`IntrinsicStepFn`] bodies,
@@ -607,12 +606,6 @@ impl WasmRuntime {
                 })?;
         }
         Ok(())
-    }
-
-    /// Load a wasm module from bytes.
-    pub fn load_module(&self, wasm_bytes: &[u8]) -> Result<Module, KernelError> {
-        Module::new(&self.engine, wasm_bytes)
-            .map_err(|e| KernelError::Runtime(format!("Failed to load wasm module: {e}")))
     }
 
     /// Execute an action via its precomputed DAG plan.

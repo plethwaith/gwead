@@ -32,9 +32,8 @@
 //!
 //! ## Direction
 //!
-//! A stream is either [`StreamDirection::Readable`] (host provides a
-//! source, plugin pulls via `stream_read`) or
-//! [`StreamDirection::Writable`] (plugin pushes via `stream_write`,
+//! A stream is either readable (host provides a source, plugin pulls
+//! via `stream_read`) or writable (plugin pushes via `stream_write`,
 //! host consumes from a receiver). One direction per handle — attempting
 //! `stream_write` on a readable returns `DIRECTION_MISMATCH`.
 
@@ -49,8 +48,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Default per-branch chunk-count capacity for the streaming fan-out
 /// tee (`fan_out_readable_streaming`) and for the writable→
-/// readable pipes pre-provisioned by the dataflow scheduler
-/// (`runtime_dataflow::provision_dataflow_streams`).
+/// readable pipes pre-provisioned by the dataflow scheduler.
 ///
 /// 16 chunks at typical media chunk sizes (64 KiB-ish) buffers around
 /// 1 MiB per consumer — small enough to apply backpressure quickly,
@@ -118,13 +116,8 @@ pub type WritableSender = mpsc::Sender<Result<Bytes, std::io::Error>>;
 pub type WritableReceiver = mpsc::Receiver<Result<Bytes, std::io::Error>>;
 
 /// Direction-specific state for a stream.
-///
-/// Publicly reachable via [`StreamRegistry::get`], so it is
-/// `#[non_exhaustive]` — both at the enum level (a third direction
-/// stays additive) and per variant (the cursor fields are kernel
-/// bookkeeping; nothing outside the kernel should be building one).
 #[non_exhaustive]
-pub enum StreamDirection {
+pub(crate) enum StreamDirection {
     /// Host → plugin. The plugin calls `stream_read` to pull bytes.
     #[non_exhaustive]
     Readable {
@@ -184,7 +177,7 @@ pub struct StreamState {
 /// caller from accidentally holding the per-stream mutex across an
 /// await.
 #[non_exhaustive]
-pub struct StreamInner {
+pub(crate) struct StreamInner {
     pub direction: StreamDirection,
     /// True once closed by either side. Both reads and writes past
     /// close return `STREAM_CLOSED` (-4) — *not* `STREAM_EOF`. EOF
@@ -224,7 +217,7 @@ impl StreamState {
 
     /// Lock the per-stream inner state. Recovers from poisoning rather
     /// than panicking — see the rationale on [`lock_shared`].
-    pub fn lock_inner(&self) -> MutexGuard<'_, StreamInner> {
+    pub(crate) fn lock_inner(&self) -> MutexGuard<'_, StreamInner> {
         self.inner
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -313,7 +306,7 @@ impl StreamState {
 /// The registry-wide outer mutex (via [`SharedStreamRegistry`]) is
 /// held only briefly for HashMap insert / lookup / clear ops. All
 /// stream-state mutation goes through the per-stream
-/// [`StreamState::lock_inner`] mutex, so a slow read on one stream
+/// mutex, so a slow read on one stream
 /// never blocks operations on another.
 pub struct StreamRegistry {
     streams: HashMap<StreamId, Arc<StreamState>>,
@@ -548,8 +541,7 @@ impl StreamRegistry {
     ///
     /// The producer stream's source is taken (subsequent reads on the
     /// original handle return EOF). Used by the DAG scheduler when a
-    /// stream-producing step has more than one consumer in
-    /// [`super::dag::DagPlan::consumers`]. Each consumer's reference to
+    /// stream-producing step has more than one consumer. Each consumer's reference to
     /// the producer is rewritten to point at its own branch.
     ///
     /// Spawns a forwarder task that pulls one chunk at a time from the
@@ -1113,7 +1105,7 @@ impl StreamState {
 ///
 /// - **Outer** (`SharedStreamRegistry`): held only for the HashMap
 ///   lookup. Synchronous, no `.await` underneath.
-/// - **Inner** ([`StreamState::lock_inner`]): held only across the
+/// - **Inner** (the per-stream lock): held only across the
 ///   swap-out / put-back of the `source` cursor, never across the
 ///   `source.next().await`.
 ///

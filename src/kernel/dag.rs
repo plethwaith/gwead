@@ -95,14 +95,9 @@ pub struct DagPlan {
 }
 
 impl DagPlan {
-    /// Number of steps in the plan.
-    pub fn step_count(&self) -> usize {
-        self.deps.len()
-    }
-
     /// True when the plan executes strictly one step at a time — i.e., every
-    /// wave has exactly one step. Useful for opting out of parallel scheduling
-    /// overhead when nothing in the manifest can actually run in parallel.
+    /// wave has exactly one step.
+    #[cfg(test)]
     pub fn is_linear(&self) -> bool {
         self.waves.iter().all(|w| w.len() == 1)
     }

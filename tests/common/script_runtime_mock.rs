@@ -17,7 +17,7 @@
 //! source; a real language runtime lives in its own crate.
 //!
 //! - The standard mock ([`build_wasm_bytes`], what [`register`]
-//!   installs) imports only `gwead1.host_set_result`, writes a
+//!   installs) imports only `gwead@1.host_set_result`, writes a
 //!   fixed "mock-script-result" string back, and always returns `1`
 //!   (success). Host-import behaviour is NOT exercised — tests that
 //!   care about that have to use a real runtime plugin.
@@ -69,7 +69,7 @@ use gwead::kernel::{Kernel, KernelConfig, KernelError};
 /// honestly returns `"mock-script-result"`.
 const MOCK_WAT: &str = r#"
 (module
-  (import "gwead1" "host_set_result" (func $host_set_result (param i32 i32)))
+  (import "gwead@1" "host_set_result" (func $host_set_result (param i32 i32)))
   (memory (export "memory") 1)
   ;; "\"mock-script-result\"" — 20 bytes, valid JSON string
   (data (i32.const 0) "\"mock-script-result\"")
@@ -180,10 +180,10 @@ pub enum OnCancelled {
 /// and `"other"` for any other negative code.
 const WRITE_UNTIL_REFUSED_WAT: &str = r#"
 (module
-  (import "gwead1" "host_set_result" (func $host_set_result (param i32 i32)))
-  (import "gwead1" "host_set_error" (func $host_set_error (param i32 i32)))
-  (import "gwead1" "stream_output" (func $stream_output (result i32)))
-  (import "gwead1" "stream_write" (func $stream_write (param i32 i32 i32) (result i32)))
+  (import "gwead@1" "host_set_result" (func $host_set_result (param i32 i32)))
+  (import "gwead@1" "host_set_error" (func $host_set_error (param i32 i32)))
+  (import "gwead@1" "stream_output" (func $stream_output (result i32)))
+  (import "gwead@1" "stream_write" (func $stream_write (param i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
   ;; The chunk, then the JSON string results and the error text.
   (data (i32.const 0) "chunk")
@@ -259,13 +259,13 @@ pub fn build_write_until_refused_wasm_bytes(on_cancelled: OnCancelled) -> Vec<u8
 /// and `"other"` for any other negative code.
 const READ_UNTIL_REFUSED_WAT: &str = r#"
 (module
-  (import "gwead1" "host_set_result" (func $host_set_result (param i32 i32)))
-  (import "gwead1" "host_set_error" (func $host_set_error (param i32 i32)))
-  (import "gwead1" "host_call_result_size" (func $call_result_size (result i32)))
-  (import "gwead1" "host_call_result_read" (func $call_result_read (param i32 i32) (result i32)))
-  (import "gwead1" "host_invoke_streaming"
+  (import "gwead@1" "host_set_result" (func $host_set_result (param i32 i32)))
+  (import "gwead@1" "host_set_error" (func $host_set_error (param i32 i32)))
+  (import "gwead@1" "host_call_result_size" (func $call_result_size (result i32)))
+  (import "gwead@1" "host_call_result_read" (func $call_result_read (param i32 i32) (result i32)))
+  (import "gwead@1" "host_invoke_streaming"
     (func $invoke_streaming (param i32 i32 i32 i32 i32 i32) (result i32)))
-  (import "gwead1" "stream_read" (func $stream_read (param i32 i32 i32) (result i32)))
+  (import "gwead@1" "stream_read" (func $stream_read (param i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{\"plugin\": \"p\"}")
   (data (i32.const 16) "stall")
